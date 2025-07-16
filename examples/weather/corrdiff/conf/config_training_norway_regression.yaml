@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: hrrr_mini_diffusion
+          name: norway_regression
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -26,7 +26,7 @@ hydra:
 # Base parameters for dataset, model, training, and validation
 defaults:
 
-    - dataset: hrrr_mini 
+    - dataset: custom 
     # The dataset type for training.
     # Accepted values:
     #   `gefs_hrrr`: full GEFS-HRRR dataset for continental US.
@@ -34,7 +34,7 @@ defaults:
     #   `cwb`: full CWB dataset for Taiwan.
     #   `custom`: user-defined dataset. Parameters need to be specified below.
 
-    - model: diffusion
+    - model: regression
     # The model type.
     # Accepted values:
     #     `regression`: a regression UNet for deterministic predictions
@@ -59,23 +59,29 @@ defaults:
 # Modify or add below parameters that should be passed as argument to the
 # user-defined dataset class.
 dataset:
-    data_path: /data/corrdiff_mini/hrrr-mini/hrrr_mini_train.nc
-    # Path to .nc data file
-    stats_path: /data/corrdiff_mini/hrrr-mini/stats.json
+    type: norway #datasets/norway.py::NorwayDatasetH5
+    data_path: /data/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+    
+    # data_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    # stats_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    # invariant_variables_path: /Users/simon/Datasets/Norway/
+    
     # Path to json stats file
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
 
 # Training parameters
 training:
     hp:
-        training_duration: 8000000
+        training_duration: 2000000
+        total_batch_size: 26
         # Training duration based on the number of processed samples
     io:
         print_progress_freq: 10000
-        regression_checkpoint_path: /checkpoints/checkpoints_regression/UNet.0.2000128.mdlus
-        # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/
-        save_n_recent_checkpoints: 5
-        # Set to a positive integer to only keep the most recent n checkpoints
+        checkpoint_dir: /checkpoints/norway
 
 # Parameters for wandb logging
 wandb:

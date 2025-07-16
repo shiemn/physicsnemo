@@ -37,7 +37,12 @@ def get_dataset_and_sampler(dataset_cfg, times, has_lead_time=False):
             for time in times
         ]
     all_times = dataset.time()
-    time_indices = [all_times.index(t) for t in plot_times]
+    time_indices = []
+    for t in plot_times:
+        try:
+            time_indices.append(all_times.index(t))
+        except ValueError:
+            continue
     sampler = time_indices
 
     return dataset, sampler
@@ -95,7 +100,9 @@ def save_images(
         image_out2 = image_out2.cpu().numpy()
         image_out2 = dataset.denormalize_output(image_out2)
 
+
         time = times[t_index]
+        print(f"Saving image for t_index {t_index}, time {time}")
         writer.write_time(time_index, time)
         for channel_idx in range(image_out2.shape[1]):
             info = dataset.output_channels()[channel_idx]

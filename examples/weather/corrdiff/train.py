@@ -116,8 +116,8 @@ def main(cfg: DictConfig) -> None:
     logger = PythonLogger("main")  # General python logger
     logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
     initialize_wandb(
-        project="Modulus-Launch",
-        entity="Modulus",
+        project="CorrDiff",
+        entity="shiemn",
         name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
         group="CorrDiff-DDP-Group",
         mode=cfg.wandb.mode,

@@ -59,9 +59,11 @@ defaults:
 # Modify or add below parameters that should be passed as argument to the
 # user-defined dataset class.
 dataset:
-    data_path: ./data/corrdiff-mini/hrrr_mini_train.nc
+    # data_path: /Users/simon/Datasets/CorrDiff/hrrr-mini/hrrr_mini_train.nc
+    data_path: /data/corrdiff_mini/hrrr-mini/hrrr_mini_train.nc
     # Path to .nc data file
-    stats_path: ./data/corrdiff-mini/stats.json
+    stats_path: /data/corrdiff_mini/hrrr-mini/stats.json
+    # stats_path: /Users/simon/Datasets/CorrDiff/hrrr-mini/stats.json
     # Path to json stats file
 
 # Training parameters
@@ -74,7 +76,7 @@ training:
 
 # Parameters for wandb logging
 wandb:
-    mode: offline
+    mode: online
     # Configure whether to use wandb: "offline", "online", "disabled"
     results_dir: "./wandb"
     # Directory to store wandb results

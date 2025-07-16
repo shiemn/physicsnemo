@@ -77,12 +77,17 @@ def main(cfg: DictConfig) -> None:
         torch.distributed.barrier()
 
     # Parse the inference input times
-    if cfg.generation.times_range and cfg.generation.times:
+    has_times_range = hasattr(cfg.generation, 'times_range') and cfg.generation.times_range is not None
+    has_times = hasattr(cfg.generation, 'times') and cfg.generation.times is not None
+    
+    if has_times_range and has_times:
         raise ValueError("Either times_range or times must be provided, but not both")
-    if cfg.generation.times_range:
+    elif has_times_range:
         times = get_time_from_range(cfg.generation.times_range)
-    else:
+    elif has_times:
         times = cfg.generation.times
+    else:
+        raise ValueError("Either times_range or times must be provided in the configuration")
 
     # Create dataset object
     dataset_cfg = OmegaConf.to_container(cfg.dataset)
@@ -98,6 +103,10 @@ def main(cfg: DictConfig) -> None:
     dataset, sampler = get_dataset_and_sampler(
         dataset_cfg=dataset_cfg, times=times, has_lead_time=has_lead_time
     )
+
+    print(f"Dataset initialized with {len(dataset)} samples.")
+    print(f"Sample Values: {sampler[0]} - {sampler[-1]}")
+
     img_shape = dataset.image_shape()
     img_out_channels = len(dataset.output_channels())
 
@@ -282,7 +291,7 @@ def main(cfg: DictConfig) -> None:
     )
     with torch_cuda_profiler:
         with torch_nvtx_profiler:
-
+            
             data_loader = torch.utils.data.DataLoader(
                 dataset=dataset, sampler=sampler, batch_size=1, pin_memory=True
             )
@@ -322,7 +331,8 @@ def main(cfg: DictConfig) -> None:
 
                 start = end = DummyEvent()
 
-            times = dataset.time()
+            all_times = dataset.time()
+            times = [all_times[i] for i in sampler] if sampler else all_times
             for index, (image_tar, image_lr, *lead_time_label) in enumerate(
                 iter(data_loader)
             ):
