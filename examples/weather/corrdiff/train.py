@@ -52,6 +52,8 @@ from helpers.train_helpers import (
     is_time_for_periodic_task,
 )
 
+from helpers.custom_losses import IntensityResidualLoss
+
 torch._dynamo.reset()
 # Increase the cache size limit
 torch._dynamo.config.cache_size_limit = 264  # Set to a higher value
@@ -113,9 +115,8 @@ def main(cfg: DictConfig) -> None:
     # Initialize loggers
     if dist.rank == 0:
         writer = SummaryWriter(log_dir="tensorboard")
-    logger = PythonLogger("main")  # General python logger
-    logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
-    initialize_wandb(
+
+        initialize_wandb(
         project="CorrDiff",
         entity="shiemn",
         name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
@@ -125,6 +126,9 @@ def main(cfg: DictConfig) -> None:
         results_dir=cfg.wandb.results_dir,
     )
 
+        logger = PythonLogger("main")  # General python logger
+        logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
+    
     # Resolve and parse configs
     OmegaConf.resolve(cfg)
     dataset_cfg = OmegaConf.to_container(cfg.dataset)  # TODO needs better handling
@@ -430,10 +434,20 @@ def main(cfg: DictConfig) -> None:
         "patched_diffusion",
         "lt_aware_patched_diffusion",
     ):
-        loss_fn = ResidualLoss(
-            regression_net=regression_net,
-            hr_mean_conditioning=cfg.model.hr_mean_conditioning,
-        )
+        loss_function = cfg.model.get("hp", {}).get("loss_function", None)
+        if loss_function == None:
+            loss_fn = ResidualLoss(
+                regression_net=regression_net,
+                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+            )
+        elif loss_function == "IntensityResidualLoss":
+            print("Using custom IntensityResidualLoss")
+            loss_fn = IntensityResidualLoss(
+                regression_net=regression_net,
+                hr_mean_conditioning= cfg.model.hr_mean_conditioning,
+                average_intensity_weight=cfg.model.hp.get("average_intensity_weight", None),
+                maximum_intensity_weight=cfg.model.hp.get("maximum_intensity_weight", None),
+            )
     elif cfg.model.name == "regression" or cfg.model.name == "lt_aware_regression":
         loss_fn = RegressionLoss()
     elif cfg.model.name == "lt_aware_ce_regression":
@@ -736,6 +750,12 @@ def main(cfg: DictConfig) -> None:
                                     writer.add_scalar(
                                         "validation_loss", average_valid_loss, cur_nimg
                                     )
+                                    wandb.log({
+                                        "validation_loss": average_valid_loss,
+                                        "learning_rate": current_lr,
+                                        "training_loss": average_loss,
+                                        "training_loss_running_mean": average_loss_running_mean
+                                    }, step=cur_nimg)
 
                 if is_time_for_periodic_task(
                     cur_nimg,

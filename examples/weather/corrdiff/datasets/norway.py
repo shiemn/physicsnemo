@@ -31,6 +31,19 @@ from datasets.base import ChannelMetadata, DownscalingDataset
 import torch
 import h5py
 
+norway_bounds_small = {
+    "selected_area": [250, 30],
+    "selected_area_size": 256,
+    "selected_area_small": [250 + 32, 30 + 32],
+    "selected_area_size_small": 256 - 64
+}
+norway_bounds_large = {
+    "selected_area": [265, 60],
+    "selected_area_size": 512,
+    "selected_area_small": [265, 60],
+    "selected_area_size_small": 512
+}
+
 
 class NorwayDatasetH5(DownscalingDataset):
     def __init__(
@@ -41,6 +54,8 @@ class NorwayDatasetH5(DownscalingDataset):
         output_variables: Union[List[str], None] = ['precipitation'],
         invariant_variables: Union[List[str], None] = [], #("elevation"),
         invariant_variables_path: Union[str, None] = None,
+        years: Union[List[int], None] = None,
+        bounds: str = "small",
     ):
         self.data_path = data_path
 
@@ -49,17 +64,29 @@ class NorwayDatasetH5(DownscalingDataset):
         self.invariant_variables = invariant_variables
 
         self.coarsening_factor = 1
-        self.selected_area = [250, 30]
-        self.selected_area_size = 256
-        self.selected_area_small = [self.selected_area[0] + 32, self.selected_area[1] + 32]
-        self.selected_area_size_small = 256 - 64
+        self.bounds = bounds
+        if bounds == "small":
+            print("Using the small crop over eastern Norway.")
+            bounds_dict = norway_bounds_small
+        elif bounds == "large":
+            print("Using the large crop over southern Norway.")
+            bounds_dict = norway_bounds_large
+        else:
+            raise ValueError(f"Unknown bounds: {bounds}")
+
+
+        self.selected_area = bounds_dict['selected_area']
+        self.selected_area_size = bounds_dict['selected_area_size']
+        self.selected_area_small = bounds_dict['selected_area_small']
+        self.selected_area_size_small = bounds_dict['selected_area_size_small']
+        
         self.normalize = True
 
         self.lat = None
         self.lon = None
 
         stage = 'all'
-        self.years = None
+        self.years = years
         
 
         self.train_years = list(range(1986,2002))
@@ -70,7 +97,7 @@ class NorwayDatasetH5(DownscalingDataset):
             if not os.path.exists(invariant_variables_path):
                 raise ValueError(f"Static orography (and lat/lon) data not found at {invariant_variables_path}. Please provide the correct path.")
             print(f"Found static orography data. Loading orography, lat, and lon from {invariant_variables_path}.")
-            self.static_variables, self.lat, self.lon = self._prepare_static_data(invariant_variables_path)
+            self.static_variables, self.lat, self.lon = self._prepare_static_data(invariant_variables_path, bounds_dict)
 
 
         else:
@@ -108,7 +135,7 @@ class NorwayDatasetH5(DownscalingDataset):
                 print("Return dataset in full stage. All years")
                 self.years = list(range(1986,2006))
         else:
-            self.years = list(range(self.years[0], self.years[1] + 1))
+            self.years = list(self.years)
             print(f"Return dataset in custom stage. Years {self.years}")
 
 
@@ -145,7 +172,7 @@ class NorwayDatasetH5(DownscalingDataset):
         - lead_time_label: Lead time (None for now)
         """
 
-        print(f"Getting item at index {idx}.")
+        # print(f"Getting item at index {idx}.")
 
         if torch.is_tensor(idx):
             idx = idx.tolist()
@@ -174,10 +201,14 @@ class NorwayDatasetH5(DownscalingDataset):
         if self.static_variables is not None:
             predictor = np.concatenate((predictor, self.static_variables), axis=0)
 
+        if self.bounds == 'small':
+            predictor = predictor[:, 32:-32, 32:-32]
+
         # print(f"Predictor shape: {predictor.shape}, Target shape: {target.shape}")
         # print(f"Predictor dtype: {predictor.dtype}, Target dtype: {target.dtype}")
 
-        return target[None, :], predictor[:, 32:-32, 32:-32]
+
+        return target[None, :], predictor
         
     def upsample(self, x: np.ndarray) -> np.ndarray:
         """
@@ -252,13 +283,18 @@ class NorwayDatasetH5(DownscalingDataset):
 
     def image_shape(self) -> Tuple[int, int]:
         """Get the (height, width) of the data (same for input and output)."""
-        return 192, 192
+        if self.bounds == "small":
+            return 192, 192
+        elif self.bounds == "large":
+            return 512, 512
+        else:
+            raise ValueError('Unknown value for bounds')
     
-    def _prepare_static_data(self, orography_path):
-        selected_area = [250, 30]
-        selected_area_size = 256
-        selected_area_small = [selected_area[0] + 32, selected_area[1] + 32]
-        selected_area_size_small = 256 - 64
+    def _prepare_static_data(self, orography_path, bounds: dict):
+        selected_area = bounds['selected_area']
+        selected_area_size = bounds["selected_area_size"]
+        selected_area_small = bounds['selected_area_small']
+        selected_area_size_small = bounds['selected_area_size_small']
 
         static = xr.open_dataset(os.path.join(orography_path, 'orog_NEU-3_ECMWF-ERAINT_evaluation_r1i1p1_HCLIMcom-HCLIM38-AROME_x2yn2v1_fx.nc'))
         orography = static['orog'][selected_area[0]:selected_area[0]+selected_area_size, selected_area[1]:selected_area[1]+selected_area_size]
@@ -271,3 +307,7 @@ class NorwayDatasetH5(DownscalingDataset):
         orography = np.array(orography.values).astype(np.float32)[None, :, :]
         return orography, lat, lon
     
+
+    def denormalize_output(self, x: np.ndarray) -> np.ndarray:
+        """Convert output from normalized data to physical units."""
+        return (x * self.target_std) + self.target_mean
