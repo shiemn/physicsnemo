@@ -29,3 +29,5 @@ srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/d
                         --bind $WORK/checkpoints:/checkpoints/ \
                         $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/train.py --config-name $1 \
 
+
+#srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/data/ --bind $WORK/checkpoints:/checkpoints/ $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/generate.py --config-name 

@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: gefs_hrrr_diffusion
+          name: norway_diffusion
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -26,7 +26,7 @@ hydra:
 # Base parameters for dataset, model, training, and validation
 defaults:
 
-    - dataset: gefs_hrrr
+    - dataset: custom 
     # The dataset type for training.
     # Accepted values:
     #   `gefs_hrrr`: full GEFS-HRRR dataset for continental US.
@@ -34,7 +34,7 @@ defaults:
     #   `cwb`: full CWB dataset for Taiwan.
     #   `custom`: user-defined dataset. Parameters need to be specified below.
 
-    - model: lt_aware_patched_diffusion
+    - model: diffusion
     # The model type.
     # Accepted values:
     #     `regression`: a regression UNet for deterministic predictions
@@ -59,30 +59,46 @@ defaults:
 # Modify or add below parameters that should be passed as argument to the
 # user-defined dataset class.
 dataset:
-    data_path: ./data
-    # Path to .nc data file
-    stats_path: ./data/stats.json
+    type: norway #datasets/norway.py::NorwayDatasetH5
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+    
+    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+        
+    # data_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    # stats_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
+    # invariant_variables_path: /Users/simon/Datasets/Norway/
+    
     # Path to json stats file
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+
+validation:
+    years: [2003, 2004]
+    # List[int], years to use for validation. Replace with desired years.
 
 # Training parameters
 training:
     hp:
-        training_duration: 10 000 000
+        training_duration: 10000000
+        batch_size_per_gpu: 4
         # Training duration based on the number of processed samples
-        patch_shape_x: 448
-        patch_shape_y: 448
-        # Patch size. Patch training is used if these dimensions differ from
-        # img_shape_x and img_shape_y.
-        patch_num: 4
-        # Number of patches from a single sample. Total number of patches is
-            # patch_num * batch_size_global.
     io:
-        regression_checkpoint_path: <path/to/checkpoint.mdlus>
+        print_progress_freq: 100000
+        regression_checkpoint_path: /checkpoints/norway_whole_large2/checkpoints_regression/UNet.0.5800192.mdlus
+         #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus #### TODO: Change this to the correct checkpoint
         # Path to load the regression checkpoint
+        checkpoint_dir: /checkpoints/norway_whole_large2
+        save_checkpoint_freq: 1000000
+        save_n_recent_checkpoints: 5
+        # Set to a positive integer to only keep the most recent n checkpoints
 
 # Parameters for wandb logging
 wandb:
-    mode: offline
+    mode: online
     # Configure whether to use wandb: "offline", "online", "disabled"
     results_dir: "./wandb"
     # Directory to store wandb results

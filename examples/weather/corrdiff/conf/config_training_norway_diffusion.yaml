@@ -45,7 +45,7 @@ defaults:
     #     `lt_aware_patched_diffusion`: similar to `patched_diffusion` but
     #       with lead time conditioning
 
-    - model_size: mini
+    - model_size: normal
     # The model size configuration.
     # Accepted values:
     #     `normal`: normal model size
@@ -64,6 +64,8 @@ dataset:
     stats_path: /data/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
     invariant_variables_path: /data/Norway/HCLIM3/
     
+    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+        
     # data_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
     # stats_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
     # invariant_variables_path: /Users/simon/Datasets/Norway/
@@ -73,17 +75,23 @@ dataset:
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
 
+validation:
+    years: [2003, 2004]
+    # List[int], years to use for validation. Replace with desired years.
+
 # Training parameters
 training:
     hp:
-        training_duration: 8000000
-        total_batch_size: 48
+        training_duration: 40000000
+        batch_size_per_gpu: 16
         # Training duration based on the number of processed samples
     io:
         print_progress_freq: 10000
-        regression_checkpoint_path: /checkpoints/norway/checkpoints_regression/UNet.0.2000024.mdlus
+        regression_checkpoint_path: /checkpoints/norway_large3/checkpoints_regression/UNet.0.10000128.mdlus
+         #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus #### TODO: Change this to the correct checkpoint
         # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/norway
+        checkpoint_dir: /checkpoints/norway_large3
+        save_checkpoint_freq: 50000
         save_n_recent_checkpoints: 5
         # Set to a positive integer to only keep the most recent n checkpoints
 

@@ -26,3 +26,5 @@ input_variables: ???
 output_variables: ???
 # Names of invariants variables. Optional.
 invariant_variables: ???
+# Size of the input patch. Optional.
+bounds: ???

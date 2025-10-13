@@ -1,14 +1,14 @@
 #!/bin/bash -l
 #SBATCH -J CorrDiff
-#SBATCH --ntasks=1
+#SBATCH --ntasks=4
+#SBATCH --ntasks-per-node=4
 #SBATCH --time=24:00:00
-#SBATCH --gres=gpu:100:1
+#SBATCH --gres=gpu:a100:4
 #SBATCH --partition=a100
 #SBATCH --output=output/job-%j.out
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
-
-# #SBATCH --constraint=a100_80
+#SBATCH --constraint=a100_80
 
 
 # Set up environment
@@ -19,14 +19,14 @@ export https_proxy=http://proxy:80
 
 export WANDB__SERVICE_WAIT=300
 export APPTAINERENV_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+export HYDRA_FULL_ERROR=1
+
 echo ${CUDA_VISIBLE_DEVICES}
 
+bash $HOME/bjerknes/corrdiff/jobs/copy_norway_data.sh
 
 
-
-
-export HYDRA_FULL_ERROR=1
-srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/data/ \
+# SLURM-based multi-GPU training
+srun apptainer run --nv --bind /scratch/:/data/ \
                         --bind $WORK/checkpoints:/checkpoints/ \
-                        $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/generate.py --config-name $1 \
-
+                        $WORK/own_corrdiff.sif python $HOME/bjerknes/corrdiff/train.py --config-name $1
