@@ -16,14 +16,14 @@
 
 """
 This code provides the datapipe for reading the processed npy files,
-generating multi-res grids, calculating signed distance fields, 
-positional encodings, sampling random points in the volume and on surface, 
+generating multi-res grids, calculating signed distance fields,
+positional encodings, sampling random points in the volume and on surface,
 normalizing fields and returning the output tensors as a dictionary.
 
-This datapipe also non-dimensionalizes the fields, so the order in which the variables should 
-be fixed: velocity, pressure, turbulent viscosity for volume variables and 
-pressure, wall-shear-stress for surface variables. The different parameters such as 
-variable names, domain resolution, sampling size etc. are configurable in config.yaml. 
+This datapipe also non-dimensionalizes the fields, so the order in which the variables should
+be fixed: velocity, pressure, turbulent viscosity for volume variables and
+pressure, wall-shear-stress for surface variables. The different parameters such as
+variable names, domain resolution, sampling size etc. are configurable in config.yaml.
 """
 
 import os
@@ -58,10 +58,36 @@ from physicsnemo.utils.domino.utils import (
     pad,
     # sample_array,
     shuffle_array,
+    solution_weighted_shuffle_array,
     standardize,
 )
 from physicsnemo.utils.profiling import profile
 from physicsnemo.utils.sdf import signed_distance_field
+
+"""
+These functions, below, are to handle the SDF calculation which only 
+accepts torch tensors.  The entire pipeline is moving to torch, so
+these aren't necessary after that.
+"""
+
+
+def _convert_array_to_torch(array: cp.ndarray | np.ndarray) -> torch.Tensor:
+    """
+    TEMPORARY function to convert cupy and numpy arrays to torch tensors.
+    """
+    if isinstance(array, cp.ndarray):
+        return torch.utils.dlpack.from_dlpack(array)
+    elif isinstance(array, np.ndarray):
+        return torch.from_numpy(array)
+    else:
+        raise ValueError(f"Unsupported array type: {type(array)}")
+
+
+def _convert_torch_to_array(array: torch.Tensor, provider) -> cp.ndarray | np.ndarray:
+    """
+    TEMPORARY function to convert torch tensors to cupy arrays.
+    """
+    return provider.from_dlpack(array)
 
 
 def domino_collate_fn(batch):
@@ -107,7 +133,7 @@ class DoMINODataConfig:
         phase: Which phase of data to load ("train", "val", or "test").
         surface_variables: (Surface specific) Names of surface variables.
         surface_points_sample: (Surface specific) Number of surface points to sample per batch.
-        num__surface_neighbors: (Surface specific) Number of surface neighbors to consider for nearest neighbors approach.
+        num_surface_neighbors: (Surface specific) Number of surface neighbors to consider for nearest neighbors approach.
         resample_surfaces: (Surface specific) Whether to resample the surface before kdtree/knn. Not available if caching.
         resampling_points: (Surface specific) Number of points to resample the surface to.
         surface_sampling_algorithm: (Surface specific) Algorithm to use for surface sampling ("area_weighted" or "random").
@@ -323,8 +349,8 @@ class DoMINODataPipe(Dataset):
         with self.device_context:
             xp = self.array_provider
             self.keys_to_read_if_available = {
-                "stream_velocity": xp.asarray(30.00),
-                "air_density": xp.asarray(1.205),
+                "global_params_values": xp.asarray([30.0, 1.226]),
+                "global_params_reference": xp.asarray([30.0, 1.226]),
             }
         self.volume_keys = ["volume_mesh_centers", "volume_fields"]
         self.surface_keys = [
@@ -346,7 +372,6 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def read_data_zarr(self, filepath):
-
         # def create_pinned_streaming_space(shape, dtype):
         #     # TODO - this function could boost performance a little, but
         #     # the pinned memory pool seems too small.
@@ -386,7 +411,6 @@ class DoMINODataPipe(Dataset):
             return result
 
         with zarr.open_group(filepath, mode="r") as z:
-
             data = {}
             futures = []
             if "volume_fields" in z.keys():
@@ -458,7 +482,6 @@ class DoMINODataPipe(Dataset):
         filepath,
         max_workers=None,
     ):
-
         if max_workers is not None:
             self.max_workers = max_workers
 
@@ -500,13 +523,14 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def preprocess_combined(self, data_dict):
-
         # Pull these out and force to fp32:
         with self.device_context:
-            STREAM_VELOCITY = data_dict["stream_velocity"].astype(
+            global_params_values = data_dict["global_params_values"].astype(
                 self.array_provider.float32
             )
-            AIR_DENSITY = data_dict["air_density"].astype(self.array_provider.float32)
+            global_params_reference = data_dict["global_params_reference"].astype(
+                self.array_provider.float32
+            )
 
         # Pull these pieces out of the data_dict for manipulation
         stl_vertices = data_dict["stl_coordinates"]
@@ -523,8 +547,6 @@ class DoMINODataPipe(Dataset):
         if mesh_indices_flattened.dtype != xp.int32:
             mesh_indices_flattened = mesh_indices_flattened.astype(xp.int32)
 
-        length_scale = xp.amax(xp.amax(stl_vertices, 0) - xp.amin(stl_vertices, 0))
-
         center_of_mass = calculate_center_of_mass(stl_centers, stl_sizes)
 
         if self.config.bounding_box_dims_surf is None:
@@ -536,17 +558,18 @@ class DoMINODataPipe(Dataset):
 
         # SDF calculation on the grid using WARP
         if not self.config.compute_scaling_factors:
-
             nx, ny, nz = self.config.grid_resolution
             surf_grid = create_grid(s_max, s_min, [nx, ny, nz])
             surf_grid_reshaped = surf_grid.reshape(nx * ny * nz, 3)
 
-            sdf_surf_grid = signed_distance_field(
-                stl_vertices,
-                mesh_indices_flattened,
-                surf_grid_reshaped,
+            sdf_surf_grid, _ = signed_distance_field(
+                _convert_array_to_torch(stl_vertices),
+                _convert_array_to_torch(mesh_indices_flattened),
+                _convert_array_to_torch(surf_grid_reshaped),
                 use_sign_winding_number=True,
-            ).reshape(nx, ny, nz)
+            )
+            sdf_surf_grid = sdf_surf_grid.reshape(nx, ny, nz)
+            sdf_surf_grid = _convert_torch_to_array(sdf_surf_grid, self.array_provider)
 
         else:
             surf_grid = None
@@ -572,14 +595,15 @@ class DoMINODataPipe(Dataset):
         surf_grid_max_min = xp.stack([s_min, s_max])
 
         return_dict = {
-            "length_scale": length_scale,
             "surf_grid": surf_grid,
             "sdf_surf_grid": sdf_surf_grid,
             "surface_min_max": surf_grid_max_min,
-            "stream_velocity": xp.expand_dims(
-                xp.array(STREAM_VELOCITY, dtype=xp.float32), -1
+            "global_params_values": xp.expand_dims(
+                xp.array(global_params_values, dtype=xp.float32), -1
             ),
-            "air_density": xp.expand_dims(xp.array(AIR_DENSITY, dtype=xp.float32), -1),
+            "global_params_reference": xp.expand_dims(
+                xp.array(global_params_reference, dtype=xp.float32), -1
+            ),
             "geometry_coordinates": geom_centers,
         }
 
@@ -594,7 +618,6 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def preprocess_surface(self, data_dict, core_dict, center_of_mass, s_min, s_max):
-
         nx, ny, nz = self.config.grid_resolution
 
         return_dict = {}
@@ -625,7 +648,6 @@ class DoMINODataPipe(Dataset):
             surface_fields = surface_fields[idx_s]
 
         if not self.config.compute_scaling_factors:
-
             c_max = self.config.bounding_box_dims[0]
             c_min = self.config.bounding_box_dims[1]
 
@@ -653,7 +675,7 @@ class DoMINODataPipe(Dataset):
                     (s_max[2] - s_min[2]) / nz,
                 )
                 pos_normals_com_surface = calculate_normal_positional_encoding(
-                    surface_coordinates, center_of_mass, cell_length=[dx, dy, dz]
+                    surface_coordinates, center_of_mass, cell_dimensions=[dx, dy, dz]
                 )
             else:
                 pos_normals_com_surface = surface_coordinates - xp.asarray(
@@ -661,16 +683,17 @@ class DoMINODataPipe(Dataset):
                 )
 
             # Fit the kNN (or KDTree, if CPU) on ALL points:
-            if self.array_provider == cp:
-                knn = cuml.neighbors.NearestNeighbors(
-                    n_neighbors=self.config.num_surface_neighbors,
-                    algorithm="rbc",
-                )
-                knn.fit(surface_coordinates)
-            else:
-                # Under the hood this is instantiating a KDTree.
-                # aka here knn is a type, not a class, technically.
-                interp_func = KDTree(surface_coordinates)
+            if self.config.num_surface_neighbors > 1:
+                if self.array_provider == cp:
+                    knn = cuml.neighbors.NearestNeighbors(
+                        n_neighbors=self.config.num_surface_neighbors,
+                        algorithm="rbc",
+                    )
+                    knn.fit(surface_coordinates)
+                else:
+                    # Under the hood this is instantiating a KDTree.
+                    # aka here knn is a type, not a class, technically.
+                    interp_func = KDTree(surface_coordinates)
 
             if self.config.sampling:
                 # Perform the down sampling:
@@ -682,6 +705,16 @@ class DoMINODataPipe(Dataset):
                         surface_coordinates,
                         self.config.surface_points_sample,
                         surface_sizes,
+                    )
+                elif self.config.surface_sampling_algorithm == "solution_weighted":
+                    (
+                        surface_coordinates_sampled,
+                        idx_surface,
+                    ) = solution_weighted_shuffle_array(
+                        surface_coordinates,
+                        self.config.surface_points_sample,
+                        surface_fields[:, 0],
+                        scaling_factor=0.5,
                     )
                 else:
                     surface_coordinates_sampled, idx_surface = shuffle_array(
@@ -703,22 +736,28 @@ class DoMINODataPipe(Dataset):
                 pos_normals_com_surface = pos_normals_com_surface[idx_surface]
 
                 # Now, perform the kNN on the sampled points:
-                if self.array_provider == cp:
-                    ii = knn.kneighbors(
-                        surface_coordinates_sampled, return_distance=False
-                    )
-                else:
-                    _, ii = interp_func.query(
-                        surface_coordinates_sampled, k=self.config.num_surface_neighbors
-                    )
+                if self.config.num_surface_neighbors > 1:
+                    if self.array_provider == cp:
+                        ii = knn.kneighbors(
+                            surface_coordinates_sampled, return_distance=False
+                        )
+                    else:
+                        _, ii = interp_func.query(
+                            surface_coordinates_sampled,
+                            k=self.config.num_surface_neighbors,
+                        )
 
-                # Pull out the neighbor elements.  Note that ii is the index into the original
-                # points - but only exists for the sampled points
-                # In other words, a point from `surface_coordinates_sampled` has neighbors
-                # from the full `surface_coordinates` array.
-                surface_neighbors = surface_coordinates[ii][:, 1:]
-                surface_neighbors_normals = surface_normals[ii][:, 1:]
-                surface_neighbors_sizes = surface_sizes[ii][:, 1:]
+                    # Pull out the neighbor elements.  Note that ii is the index into the original
+                    # points - but only exists for the sampled points
+                    # In other words, a point from `surface_coordinates_sampled` has neighbors
+                    # from the full `surface_coordinates` array.
+                    surface_neighbors = surface_coordinates[ii][:, 1:]
+                    surface_neighbors_normals = surface_normals[ii][:, 1:]
+                    surface_neighbors_sizes = surface_sizes[ii][:, 1:]
+                else:
+                    surface_neighbors = surface_coordinates
+                    surface_neighbors_normals = surface_normals
+                    surface_neighbors_sizes = surface_sizes
 
                 # We could index into these above the knn step too; they aren't dependent on that.
                 surface_normals = surface_normals[idx_surface]
@@ -729,7 +768,13 @@ class DoMINODataPipe(Dataset):
 
             else:
                 # We are *not* sampling, kNN on ALL points:
-                ii = knn.kneighbors(surface_coordinates, return_distance=False)
+                if self.array_provider == cp:
+                    ii = knn.kneighbors(surface_coordinates, return_distance=False)
+                else:
+                    _, ii = interp_func.query(
+                        surface_coordinates,
+                        k=self.config.num_surface_neighbors,
+                    )
 
                 # Construct the neighbors arrays:
                 surface_neighbors = surface_coordinates[ii][:, 1:]
@@ -793,7 +838,6 @@ class DoMINODataPipe(Dataset):
         stl_vertices,
         center_of_mass,
     ):
-
         return_dict = {}
 
         nx, ny, nz = self.config.grid_resolution
@@ -838,12 +882,14 @@ class DoMINODataPipe(Dataset):
             grid_reshaped = grid.reshape(nx * ny * nz, 3)
 
             # SDF calculation on the grid using WARP
-            sdf_grid = signed_distance_field(
-                stl_vertices,
-                mesh_indices_flattened,
-                grid_reshaped,
+            sdf_grid, _ = signed_distance_field(
+                _convert_array_to_torch(stl_vertices),
+                _convert_array_to_torch(mesh_indices_flattened),
+                _convert_array_to_torch(grid_reshaped),
                 use_sign_winding_number=True,
-            ).reshape(nx, ny, nz)
+            )
+            sdf_grid = sdf_grid.reshape((nx, ny, nz))
+            sdf_grid = _convert_torch_to_array(sdf_grid, self.array_provider)
 
             if self.config.sampling:
                 volume_coordinates_sampled, idx_volume = shuffle_array(
@@ -862,12 +908,16 @@ class DoMINODataPipe(Dataset):
                 volume_coordinates = volume_coordinates_sampled
 
             sdf_nodes, sdf_node_closest_point = signed_distance_field(
-                stl_vertices,
-                mesh_indices_flattened,
-                volume_coordinates,
-                include_hit_points=True,
+                _convert_array_to_torch(stl_vertices),
+                _convert_array_to_torch(mesh_indices_flattened),
+                _convert_array_to_torch(volume_coordinates),
                 use_sign_winding_number=True,
             )
+            sdf_nodes = _convert_torch_to_array(sdf_nodes, self.array_provider)
+            sdf_node_closest_point = _convert_torch_to_array(
+                sdf_node_closest_point, self.array_provider
+            )
+
             # TODO - is this needed?
             sdf_nodes = xp.asarray(sdf_nodes)
             sdf_node_closest_point = xp.asarray(sdf_node_closest_point)
@@ -878,17 +928,16 @@ class DoMINODataPipe(Dataset):
                 pos_normals_closest_vol = calculate_normal_positional_encoding(
                     volume_coordinates,
                     sdf_node_closest_point,
-                    cell_length=[dx, dy, dz],
+                    cell_dimensions=[dx, dy, dz],
                 )
                 pos_normals_com_vol = calculate_normal_positional_encoding(
-                    volume_coordinates, center_of_mass, cell_length=[dx, dy, dz]
+                    volume_coordinates, center_of_mass, cell_dimensions=[dx, dy, dz]
                 )
             else:
                 pos_normals_closest_vol = volume_coordinates - sdf_node_closest_point
                 pos_normals_com_vol = volume_coordinates - center_of_mass
 
             if self.config.normalize_coordinates:
-
                 volume_coordinates = normalize(volume_coordinates, c_max, c_min)
                 grid = normalize(grid, c_max, c_min)
 
@@ -930,7 +979,6 @@ class DoMINODataPipe(Dataset):
 
     @profile
     def preprocess_data(self, data_dict):
-
         (
             return_dict,
             s_min,
@@ -1018,7 +1066,6 @@ class DoMINODataPipe(Dataset):
 
 @profile
 def compute_scaling_factors(cfg: DictConfig, input_path: str, use_cache: bool) -> None:
-
     model_type = cfg.model.model_type
     max_scaling_factor_files = 20
 
@@ -1444,7 +1491,7 @@ def create_domino_dataset(
             model_type=cfg.model.model_type,
             bounding_box_dims=cfg.data.bounding_box,
             bounding_box_dims_surf=cfg.data.bounding_box_surface,
-            num_surface_neighbors=cfg.model.num_surface_neighbors,
+            num_surface_neighbors=cfg.model.num_neighbors_surface,
             resample_surfaces=cfg.model.resampling_surface_mesh.resample,
             resampling_points=cfg.model.resampling_surface_mesh.points,
             surface_sampling_algorithm=cfg.model.surface_sampling_algorithm,

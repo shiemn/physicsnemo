@@ -16,13 +16,13 @@
 
 """
 This code defines a distributed pipeline for testing the DoMINO model on
-CFD datasets. It includes the instantiating the DoMINO model and datapipe, 
-automatically loading the most recent checkpoint, reading the VTP/VTU/STL 
-testing files, calculation of parameters required for DoMINO model and 
-evaluating the model in parallel using DistributedDataParallel across multiple 
-GPUs. This is a common recipe that enables training of combined models for surface 
-and volume as well either of them separately. The model predictions are loaded in 
-the the VTP/VTU files and saved in the specified directory. The eval tab in 
+CFD datasets. It includes the instantiating the DoMINO model and datapipe,
+automatically loading the most recent checkpoint, reading the VTP/VTU/STL
+testing files, calculation of parameters required for DoMINO model and
+evaluating the model in parallel using DistributedDataParallel across multiple
+GPUs. This is a common recipe that enables training of combined models for surface
+and volume as well either of them separately. The model predictions are loaded in
+the the VTP/VTU files and saved in the specified directory. The eval tab in
 config.yaml can be used to specify the input and output directories.
 """
 
@@ -34,6 +34,7 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 import numpy as np
+import cupy as cp
 
 from collections import defaultdict
 from pathlib import Path
@@ -55,8 +56,8 @@ from physicsnemo.models.domino.model import DoMINO
 from physicsnemo.utils.domino.utils import *
 from physicsnemo.utils.sdf import signed_distance_field
 
-AIR_DENSITY = 1.205
-STREAM_VELOCITY = 30.00
+# AIR_DENSITY = 1.205
+# STREAM_VELOCITY = 30.00
 
 
 def loss_fn(output, target):
@@ -86,9 +87,12 @@ def test_step(data_dict, model, device, cfg, vol_factors, surf_factors):
         data_dict = dict_to_device(data_dict, device)
 
         # Non-dimensionalization factors
-        air_density = data_dict["air_density"]
-        stream_velocity = data_dict["stream_velocity"]
         length_scale = data_dict["length_scale"]
+
+        global_params_values = data_dict["global_params_values"]
+        global_params_reference = data_dict["global_params_reference"]
+        stream_velocity = global_params_reference[:, 0, :]
+        air_density = global_params_reference[:, 1, :]
 
         # STL nodes
         geo_centers = data_dict["geometry_coordinates"]
@@ -121,6 +125,15 @@ def test_step(data_dict, model, device, cfg, vol_factors, surf_factors):
             encoding_g_surf = model.geo_rep_surface(
                 geo_centers_surf, s_grid, sdf_surf_grid
             )
+
+        if (
+            output_features_vol is not None
+            and output_features_surf is not None
+            and cfg.model.combine_volume_surface
+        ):
+            encoding_g = torch.cat((encoding_g_vol, encoding_g_surf), axis=1)
+            encoding_g_surf = model.combined_unet_surf(encoding_g)
+            encoding_g_vol = model.combined_unet_vol(encoding_g)
 
         if output_features_vol is not None:
             # First calculate volume predictions if required
@@ -177,15 +190,15 @@ def test_step(data_dict, model, device, cfg, vol_factors, surf_factors):
                         volume_mesh_centers_batch,
                         geo_encoding_local,
                         pos_encoding,
-                        stream_velocity,
-                        air_density,
-                        num_sample_points=cfg.eval.stencil_size,
+                        global_params_values,
+                        global_params_reference,
+                        num_sample_points=cfg.model.num_neighbors_volume,
                         eval_mode="volume",
                     )
                     running_tloss_vol += loss_fn(tpredictions_batch, target_batch)
-                    prediction_vol[
-                        :, start_idx:end_idx
-                    ] = tpredictions_batch.cpu().numpy()
+                    prediction_vol[:, start_idx:end_idx] = (
+                        tpredictions_batch.cpu().numpy()
+                    )
 
             prediction_vol = unnormalize(prediction_vol, vol_factors[0], vol_factors[1])
 
@@ -260,33 +273,24 @@ def test_step(data_dict, model, device, cfg, vol_factors, surf_factors):
                         pos_encoding, eval_mode="surface"
                     )
 
-                    if cfg.model.surface_neighbors:
-                        tpredictions_batch = model.calculate_solution_with_neighbors(
-                            surface_mesh_centers_batch,
-                            geo_encoding_local,
-                            pos_encoding,
-                            surface_mesh_neighbors_batch,
-                            surface_normals_batch,
-                            surface_neighbors_normals_batch,
-                            surface_areas_batch,
-                            surface_neighbors_areas_batch,
-                            stream_velocity,
-                            air_density,
-                        )
-                    else:
-                        tpredictions_batch = model.calculate_solution(
-                            surface_mesh_centers_batch,
-                            geo_encoding_local,
-                            pos_encoding,
-                            stream_velocity,
-                            air_density,
-                            num_sample_points=1,
-                            eval_mode="surface",
-                        )
+                    tpredictions_batch = model.calculate_solution_with_neighbors(
+                        surface_mesh_centers_batch,
+                        geo_encoding_local,
+                        pos_encoding,
+                        surface_mesh_neighbors_batch,
+                        surface_normals_batch,
+                        surface_neighbors_normals_batch,
+                        surface_areas_batch,
+                        surface_neighbors_areas_batch,
+                        global_params_values,
+                        global_params_reference,
+                        num_sample_points=cfg.model.num_neighbors_surface,
+                    )
+
                     running_tloss_surf += loss_fn(tpredictions_batch, target_batch)
-                    prediction_surf[
-                        :, start_idx:end_idx
-                    ] = tpredictions_batch.cpu().numpy()
+                    prediction_surf[:, start_idx:end_idx] = (
+                        tpredictions_batch.cpu().numpy()
+                    )
 
             prediction_surf = (
                 unnormalize(prediction_surf, surf_factors[0], surf_factors[1])
@@ -334,6 +338,14 @@ def main(cfg: DictConfig):
     else:
         num_surf_vars = None
 
+    global_features = 0
+    global_params_names = list(cfg.variables.global_parameters.keys())
+    for param in global_params_names:
+        if cfg.variables.global_parameters[param].type == "vector":
+            global_features += len(cfg.variables.global_parameters[param].reference)
+        else:
+            global_features += 1
+
     vol_save_path = os.path.join(
         cfg.eval.scaling_param_path, "volume_scaling_factors.npy"
     )
@@ -357,6 +369,7 @@ def main(cfg: DictConfig):
         input_features=3,
         output_features_vol=num_vol_vars,
         output_features_surf=num_surf_vars,
+        global_features=global_features,
         model_parameters=cfg.model,
     ).to(dist.device)
 
@@ -389,11 +402,14 @@ def main(cfg: DictConfig):
     dirnames_per_gpu = dirnames[int(num_files * dev_id) : int(num_files * (dev_id + 1))]
 
     pred_save_path = cfg.eval.save_path
+
     if dist.rank == 0:
         create_directory(pred_save_path)
 
+    l2_surface_all = []
+    l2_volume_all = []
+    aero_forces_all = []
     for count, dirname in enumerate(dirnames_per_gpu):
-        # print(f"Processing file {dirname}")
         filepath = os.path.join(input_path, dirname)
         tag = int(re.findall(r"(\w+?)(\d+)", dirname)[0][1])
         stl_path = os.path.join(filepath, f"drivaer_{tag}.stl")
@@ -438,14 +454,60 @@ def main(cfg: DictConfig):
 
         # SDF calculation on the grid using WARP
         sdf_surf_grid = signed_distance_field(
-            stl_vertices,
-            mesh_indices_flattened,
-            surf_grid_reshaped,
+            cp.asarray(stl_vertices).astype(cp.float32),
+            cp.asarray(mesh_indices_flattened).astype(cp.int32),
+            cp.asarray(surf_grid_reshaped).astype(cp.float32),
             use_sign_winding_number=True,
+            return_cupy=False,
         ).reshape(nx, ny, nz)
+
         surf_grid = np.float32(surf_grid)
         sdf_surf_grid = np.float32(sdf_surf_grid)
         surf_grid_max_min = np.float32(np.asarray([s_min, s_max]))
+
+        # Get global parameters and global parameters scaling from config.yaml
+        global_params_names = list(cfg.variables.global_parameters.keys())
+        global_params_reference = {
+            name: cfg.variables.global_parameters[name]["reference"]
+            for name in global_params_names
+        }
+        global_params_types = {
+            name: cfg.variables.global_parameters[name]["type"]
+            for name in global_params_names
+        }
+        stream_velocity = global_params_reference["inlet_velocity"][0]
+        air_density = global_params_reference["air_density"]
+
+        # Arrange global parameters reference in a list, ensuring it is flat
+        global_params_reference_list = []
+        for name, type in global_params_types.items():
+            if type == "vector":
+                global_params_reference_list.extend(global_params_reference[name])
+            elif type == "scalar":
+                global_params_reference_list.append(global_params_reference[name])
+            else:
+                raise ValueError(
+                    f"Global parameter {name} not supported for  this dataset"
+                )
+        global_params_reference = np.array(
+            global_params_reference_list, dtype=np.float32
+        )
+
+        # Define the list of global parameter values for each simulation.
+        # Note: The user must ensure that the values provided here correspond to the
+        # `global_parameters` specified in `config.yaml` and that these parameters
+        # exist within each simulation file.
+        global_params_values_list = []
+        for key in global_params_types.keys():
+            if key == "inlet_velocity":
+                global_params_values_list.append(stream_velocity)
+            elif key == "air_density":
+                global_params_values_list.append(air_density)
+            else:
+                raise ValueError(
+                    f"Global parameter {key} not supported for  this dataset"
+                )
+        global_params_values = np.array(global_params_values_list, dtype=np.float32)
 
         # Read VTP
         if model_type == "surface" or model_type == "combined":
@@ -463,12 +525,6 @@ def main(cfg: DictConfig):
             mesh = pv.PolyData(polydata_surf)
             surface_coordinates = np.array(mesh.cell_centers().points, dtype=np.float32)
 
-            interp_func = KDTree(surface_coordinates)
-            dd, ii = interp_func.query(surface_coordinates, k=cfg.eval.stencil_size + 1)
-
-            surface_neighbors = surface_coordinates[ii]
-            surface_neighbors = surface_neighbors[:, 1:]
-
             surface_normals = np.array(mesh.cell_normals, dtype=np.float32)
             surface_sizes = mesh.compute_cell_sizes(
                 length=False, area=True, volume=False
@@ -479,10 +535,24 @@ def main(cfg: DictConfig):
             surface_normals = (
                 surface_normals / np.linalg.norm(surface_normals, axis=1)[:, np.newaxis]
             )
-            surface_neighbors_normals = surface_normals[ii]
-            surface_neighbors_normals = surface_neighbors_normals[:, 1:]
-            surface_neighbors_sizes = surface_sizes[ii]
-            surface_neighbors_sizes = surface_neighbors_sizes[:, 1:]
+
+            if cfg.model.num_neighbors_surface > 1:
+                interp_func = KDTree(surface_coordinates)
+                dd, ii = interp_func.query(
+                    surface_coordinates, k=cfg.model.num_neighbors_surface
+                )
+
+                surface_neighbors = surface_coordinates[ii]
+                surface_neighbors = surface_neighbors[:, 1:]
+
+                surface_neighbors_normals = surface_normals[ii]
+                surface_neighbors_normals = surface_neighbors_normals[:, 1:]
+                surface_neighbors_sizes = surface_sizes[ii]
+                surface_neighbors_sizes = surface_neighbors_sizes[:, 1:]
+            else:
+                surface_neighbors = surface_coordinates
+                surface_neighbors_normals = surface_normals
+                surface_neighbors_sizes = surface_sizes
 
             dx, dy, dz = (
                 (s_max[0] - s_min[0]) / nx,
@@ -521,7 +591,6 @@ def main(cfg: DictConfig):
                 polydata_vol, volume_variable_names
             )
             volume_fields = np.concatenate(volume_fields, axis=-1)
-            # print(f"Processed vtu {vtu_path}")
 
             bounding_box_dims = []
             bounding_box_dims.append(np.asarray(cfg.data.bounding_box.max))
@@ -549,19 +618,21 @@ def main(cfg: DictConfig):
 
             # SDF calculation on the grid using WARP
             sdf_grid = signed_distance_field(
-                stl_vertices,
-                mesh_indices_flattened,
-                grid_reshaped,
+                cp.asarray(stl_vertices).astype(cp.float32),
+                cp.asarray(mesh_indices_flattened).astype(cp.int32),
+                cp.asarray(grid_reshaped).astype(cp.float32),
                 use_sign_winding_number=True,
+                return_cupy=False,
             ).reshape(nx, ny, nz)
 
             # SDF calculation
             sdf_nodes, sdf_node_closest_point = signed_distance_field(
-                stl_vertices,
-                mesh_indices_flattened,
-                volume_coordinates,
+                cp.asarray(stl_vertices).astype(cp.float32),
+                cp.asarray(mesh_indices_flattened).astype(cp.int32),
+                cp.asarray(volume_coordinates).astype(cp.float32),
                 include_hit_points=True,
                 use_sign_winding_number=True,
+                return_cupy=False,
             )
             sdf_nodes = sdf_nodes.reshape(-1, 1)
 
@@ -614,11 +685,11 @@ def main(cfg: DictConfig):
                 "volume_min_max": vol_grid_max_min,
                 "surface_min_max": surf_grid_max_min,
                 "length_scale": np.array(length_scale, dtype=np.float32),
-                "stream_velocity": np.expand_dims(
-                    np.array(STREAM_VELOCITY, dtype=np.float32), axis=-1
+                "global_params_values": np.expand_dims(
+                    np.array(global_params_values, dtype=np.float32), -1
                 ),
-                "air_density": np.expand_dims(
-                    np.array(AIR_DENSITY, dtype=np.float32), axis=-1
+                "global_params_reference": np.expand_dims(
+                    np.array(global_params_reference, dtype=np.float32), -1
                 ),
             }
         elif model_type == "surface":
@@ -636,11 +707,11 @@ def main(cfg: DictConfig):
                 "surface_fields": np.float32(surface_fields),
                 "surface_min_max": np.float32(surf_grid_max_min),
                 "length_scale": np.array(length_scale, dtype=np.float32),
-                "stream_velocity": np.expand_dims(
-                    np.array(STREAM_VELOCITY, dtype=np.float32), axis=-1
+                "global_params_values": np.expand_dims(
+                    np.array(global_params_values, dtype=np.float32), -1
                 ),
-                "air_density": np.expand_dims(
-                    np.array(AIR_DENSITY, dtype=np.float32), axis=-1
+                "global_params_reference": np.expand_dims(
+                    np.array(global_params_reference, dtype=np.float32), -1
                 ),
             }
         elif model_type == "volume":
@@ -658,11 +729,11 @@ def main(cfg: DictConfig):
                 "volume_min_max": vol_grid_max_min,
                 "surface_min_max": surf_grid_max_min,
                 "length_scale": np.array(length_scale, dtype=np.float32),
-                "stream_velocity": np.expand_dims(
-                    np.array(STREAM_VELOCITY, dtype=np.float32), axis=-1
+                "global_params_values": np.expand_dims(
+                    np.array(global_params_values, dtype=np.float32), -1
                 ),
-                "air_density": np.expand_dims(
-                    np.array(AIR_DENSITY, dtype=np.float32), axis=-1
+                "global_params_reference": np.expand_dims(
+                    np.array(global_params_reference, dtype=np.float32), -1
                 ),
             }
 
@@ -717,9 +788,21 @@ def main(cfg: DictConfig):
             print("Drag=", dirname, force_x_pred, force_x_true)
             print("Lift=", dirname, force_z_pred, force_z_true)
             print("Side=", dirname, force_y_pred, force_y_true)
+            aero_forces_all.append(
+                [
+                    dirname,
+                    force_x_pred,
+                    force_x_true,
+                    force_z_pred,
+                    force_z_true,
+                    force_y_pred,
+                    force_y_true,
+                ]
+            )
 
-            l2_gt = np.sum(np.square(surface_fields), (0))
-            l2_error = np.sum(np.square(prediction_surf[0] - surface_fields), (0))
+            l2_gt = np.mean(np.square(surface_fields), (0))
+            l2_error = np.mean(np.square(prediction_surf[0] - surface_fields), (0))
+            l2_surface_all.append(np.sqrt(l2_error / l2_gt))
 
             print(
                 "Surface L-2 norm:",
@@ -743,13 +826,14 @@ def main(cfg: DictConfig):
             )
             target_vol[ids_in_bbox] = 0.0
             prediction_vol[ids_in_bbox] = 0.0
-            l2_gt = np.sum(np.square(target_vol), (0))
-            l2_error = np.sum(np.square(prediction_vol - target_vol), (0))
+            l2_gt = np.mean(np.square(target_vol), (0))
+            l2_error = np.mean(np.square(prediction_vol - target_vol), (0))
             print(
                 "Volume L-2 norm:",
                 dirname,
                 np.sqrt(l2_error) / np.sqrt(l2_gt),
             )
+            l2_volume_all.append(np.sqrt(l2_error) / np.sqrt(l2_gt))
 
         if prediction_surf is not None:
             surfParam_vtk = numpy_support.numpy_to_vtk(prediction_surf[0, :, 0:1])
@@ -763,7 +847,6 @@ def main(cfg: DictConfig):
             write_to_vtp(celldata_all, vtp_pred_save_path)
 
         if prediction_vol is not None:
-
             volParam_vtk = numpy_support.numpy_to_vtk(prediction_vol[:, 0:3])
             volParam_vtk.SetName(f"{volume_variable_names[0]}Pred")
             polydata_vol.GetPointData().AddArray(volParam_vtk)
@@ -777,6 +860,14 @@ def main(cfg: DictConfig):
             polydata_vol.GetPointData().AddArray(volParam_vtk)
 
             write_to_vtu(polydata_vol, vtu_pred_save_path)
+
+    l2_surface_all = np.asarray(l2_surface_all)  # num_files, 4
+    l2_volume_all = np.asarray(l2_volume_all)  # num_files, 4
+    l2_surface_mean = np.mean(l2_surface_all, 0)
+    l2_volume_mean = np.mean(l2_volume_all, 0)
+    print(
+        f"Mean over all samples, surface={l2_surface_mean} and volume={l2_volume_mean}"
+    )
 
 
 if __name__ == "__main__":

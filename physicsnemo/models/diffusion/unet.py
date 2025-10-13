@@ -16,10 +16,11 @@
 
 import importlib
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple, Union
+from typing import Any, Dict, List, Literal, Set, Tuple, Union
 
 import torch
 
+from physicsnemo.models.diffusion.utils import _wrapped_property
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -106,6 +107,25 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
         "0.1.0": "Loading UNet checkpoint from older version 0.1.0 (current version is 0.2.0). This version is still supported, but consider re-saving the model to upgrade to version 0.2.0 and remove this warning."
     }
 
+    # Classes that can be wrapped by this UNet class.
+    _wrapped_classes: Set[str] = {
+        "SongUNetPosEmbd",
+        "SongUNetPosLtEmbd",
+        "SongUNet",
+        "DhariwalUNet",
+    }
+
+    # Arguments of the __init__ method that can be overridden with the
+    # ``Module.from_checkpoint`` method. Here, since we use splatted arguments
+    # for the wrapped model instance, we allow overriding of any overridable
+    # argument of the wrapped classes.
+    _overridable_args: Set[str] = set.union(
+        *(
+            getattr(getattr(network_module, cls_name), "_overridable_args", set())
+            for cls_name in _wrapped_classes
+        )
+    )
+
     @classmethod
     def _backward_compat_arg_mapper(
         cls, version: str, args: Dict[str, Any]
@@ -155,6 +175,13 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
     ):
         super().__init__(meta=MetaData)
 
+        # Validation
+        if model_type not in self._wrapped_classes:
+            raise ValueError(
+                f"Model type '{model_type}' is not supported. "
+                f"Must be one of: {', '.join(self._wrapped_classes)}"
+            )
+
         # for compatibility with older versions that took only 1 dimension
         if isinstance(img_resolution, int):
             self.img_shape_x = self.img_shape_y = img_resolution
@@ -165,7 +192,6 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
         self.img_in_channels = img_in_channels
         self.img_out_channels = img_out_channels
 
-        self.use_fp16 = use_fp16
         model_class = getattr(network_module, model_type)
         self.model = model_class(
             img_resolution=img_resolution,
@@ -173,6 +199,57 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
             out_channels=img_out_channels,
             **model_kwargs,
         )
+        self.use_fp16 = use_fp16
+
+    # Properties delegated to the wrapped model
+    amp_mode = _wrapped_property(
+        "amp_mode",
+        "model",
+        "Set to ``True`` when using automatic mixed precision.",
+    )
+    profile_mode = _wrapped_property(
+        "profile_mode",
+        "model",
+        "Set to ``True`` to enable profiling of the wrapped model.",
+    )
+
+    @property
+    def use_fp16(self):
+        """
+        bool: Whether the model uses float16 precision.
+
+        Returns
+        -------
+        bool
+            True if the model is in float16 mode, False otherwise.
+        """
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        """
+        Set whether the model should use float16 precision.
+
+        Parameters
+        ----------
+        value : bool
+            If True, moves the model to torch.float16. If False, moves to torch.float32.
+
+        Raises
+        ------
+        ValueError
+            If `value` is not a boolean.
+        """
+        # NOTE: allow 0/1 values for older checkpoints
+        if not (isinstance(value, bool) or value in [0, 1]):
+            raise ValueError(
+                f"`use_fp16` must be a boolean, but got {type(value).__name__}."
+            )
+        self._use_fp16 = value
+        if value:
+            self.to(torch.float16)
+        else:
+            self.to(torch.float32)
 
     def forward(
         self,
@@ -181,7 +258,6 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
         force_fp32: bool = False,
         **model_kwargs: dict,
     ) -> torch.Tensor:
-
         # SR: concatenate input channels
         if img_lr is not None:
             x = torch.cat((x, img_lr), dim=1)
@@ -201,7 +277,7 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
 
         if (F_x.dtype != dtype) and not torch.is_autocast_enabled():
             raise ValueError(
-                f"Expected the dtype to be {dtype}, " f"but got {F_x.dtype} instead."
+                f"Expected the dtype to be {dtype}, but got {F_x.dtype} instead."
             )
 
         # skip connection
@@ -224,31 +300,9 @@ class UNet(Module):  # TODO a lot of redundancy, need to clean up
         """
         return torch.as_tensor(sigma)
 
-    @property
-    def amp_mode(self):
-        """
-        Return the *amp_mode* flag of the underlying architecture if present.
-        """
-        return getattr(self.model, "amp_mode", None)
 
-    @amp_mode.setter
-    def amp_mode(self, value: bool):
-        """
-        Update *amp_mode* on the wrapped architecture and its sub-modules.
-        """
-        if not isinstance(value, bool):
-            raise TypeError("amp_mode must be a boolean value.")
-
-        if hasattr(self.model, "amp_mode"):
-            self.model.amp_mode = value
-
-        # Recursively update sub-modules that define *amp_mode*.
-        for sub_module in self.model.modules():
-            if hasattr(sub_module, "amp_mode"):
-                sub_module.amp_mode = value
-
-
-# TODO: implement amp_mode property for StormCastUNet (same as UNet)
+# TODO: implement amp_mode and profile_mode properties for StormCastUNet (same
+# as UNet)
 class StormCastUNet(Module):
     """
     U-Net wrapper for StormCast; used so the same Song U-Net network can be re-used for this model.
@@ -312,6 +366,18 @@ class StormCastUNet(Module):
             out_channels=img_out_channels,
             **model_kwargs,
         )
+
+    # Properties delegated to the wrapped model
+    amp_mode = _wrapped_property(
+        "amp_mode",
+        "model",
+        "Set to ``True`` when using automatic mixed precision.",
+    )
+    profile_mode = _wrapped_property(
+        "profile_mode",
+        "model",
+        "Set to ``True`` to enable profiling of the wrapped model.",
+    )
 
     def forward(self, x, force_fp32=False, **model_kwargs):
         """Run a forward pass of the StormCast regression U-Net.

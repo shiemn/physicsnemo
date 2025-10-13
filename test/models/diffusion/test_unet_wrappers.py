@@ -57,13 +57,53 @@ def test_unet_forwards(device):
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
+def test_unet_fp16_forwards(device):
+    """Test forward passes of UNet wrappers with fp16"""
+
+    # Construct the UNet model
+    res, inc, outc = 64, 2, 3
+    model_fp16 = UNet(
+        img_resolution=res,
+        img_in_channels=inc,
+        img_out_channels=outc,
+        model_type="SongUNet",
+        use_fp16=True,
+    ).to(device)
+
+    model_fp32 = UNet(
+        img_resolution=res,
+        img_in_channels=inc,
+        img_out_channels=outc,
+        model_type="SongUNet",
+        use_fp16=False,
+    ).to(device)
+
+    input_image = torch.ones([1, inc, res, res]).to(device)
+    lr_image = torch.randn([1, outc, res, res]).to(device)
+    output_fp16 = model_fp16(x=input_image, img_lr=lr_image)
+    output_fp32 = model_fp32(x=input_image, img_lr=lr_image)
+
+    assert output_fp16.shape == (1, outc, res, res)
+    assert torch.allclose(output_fp16, output_fp32, rtol=1e-3, atol=1e-3), (
+        "FP16 and FP32 outputs differ more than allowed"
+    )
+
+    # Construct the StormCastUNet model
+    model = StormCastUNet(
+        img_resolution=res, img_in_channels=inc, img_out_channels=outc
+    ).to(device)
+    input_image = torch.ones([1, inc, res, res]).to(device)
+    output = model(x=input_image)
+    assert output.shape == (1, outc, res, res)
+
+
+@pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_unet_optims(device):
     """Test optimizations of U-Net wrappers"""
 
     res, inc, outc = 64, 2, 3
 
     def setup_model():
-
         model = UNet(
             img_resolution=res,
             img_in_channels=inc,
@@ -72,24 +112,40 @@ def test_unet_optims(device):
         ).to(device)
         input_image = torch.ones([1, inc, res, res]).to(device)
         lr_image = torch.randn([1, outc, res, res]).to(device)
-
         return model, [input_image, lr_image]
 
-    # Check AMP
+    #  Check AMP: with amp_mode=True for the layers, should pass
     model, invar = setup_model()
+    model.amp_mode = True
     assert common.validate_amp(model, (*invar,))
+
+    # Check failures (only on GPU, because validate_amp doesn't activate amp on
+    # CPU)
+    if device == "cuda:0":
+        # Check AMP: should fail because amp_mode=False for the layers
+        model, invar = setup_model()
+        with pytest.raises(RuntimeError):
+            assert common.validate_amp(model, (*invar,))
 
     def setup_model():
         model = StormCastUNet(
             img_resolution=res, img_in_channels=inc, img_out_channels=outc
         ).to(device)
         input_image = torch.ones([1, inc, res, res]).to(device)
-
         return model, [input_image]
 
-    # Check AMP
+    # Check AMP: with amp_mode=True for the layers, should pass
     model, invar = setup_model()
+    model.amp_mode = True
     assert common.validate_amp(model, (*invar,))
+
+    # Check failures (only on GPU, because validate_amp doesn't activate amp on
+    # CPU)
+    if device == "cuda:0":
+        # Check AMP: should fail because amp_mode is False for the layers
+        model, invar = setup_model()
+        with pytest.raises(RuntimeError):
+            assert common.validate_amp(model, (*invar,))
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
@@ -128,8 +184,8 @@ def test_unet_checkpoint(device):
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
-def test_unet_amp_mode_property(device):
-    """Test UNet wrappers amp_mode property"""
+def test_unet_properties(device):
+    """Test UNet wrappers amp_mode and profile_mode properties"""
 
     res, inc, outc = 32, 1, 1
 
@@ -160,6 +216,28 @@ def test_unet_amp_mode_property(device):
     for sub in model.model.modules():
         if hasattr(sub, "amp_mode"):
             assert sub.amp_mode is False
+
+    # Do the same for profile_mode
+    # Default value should be False
+    assert model.profile_mode is False
+
+    # Set to True and verify propagation
+    model.profile_mode = True
+    assert model.profile_mode is True
+    if hasattr(model.model, "profile_mode"):
+        assert model.model.profile_mode is True
+    for sub in model.model.modules():
+        if hasattr(sub, "profile_mode"):
+            assert sub.profile_mode is True
+
+    # Toggle back to False and verify again
+    model.profile_mode = False
+    assert model.profile_mode is False
+    if hasattr(model.model, "profile_mode"):
+        assert model.model.profile_mode is False
+    for sub in model.model.modules():
+        if hasattr(sub, "profile_mode"):
+            assert sub.profile_mode is False
 
 
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])

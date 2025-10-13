@@ -17,10 +17,14 @@
 
 """A script to check that copyright headers exists"""
 
+import argparse
 import fnmatch
 import itertools
 import json
+import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -98,7 +102,56 @@ def get_top_comments(_data):
     return comments
 
 
+def get_committed_files():
+    """
+    Get a list of files that are part of the current commit, excluding deleted files
+    """
+    git_executable = shutil.which("git")
+
+    # Basic check: ensure it's an absolute path and executable
+    if (
+        not git_executable
+        or not os.path.isabs(git_executable)
+        or not os.access(git_executable, os.X_OK)
+    ):
+        raise RuntimeError("Invalid git executable")
+
+    result = subprocess.run(  # noqa S603
+        [git_executable, "diff", "--name-status", "--cached"],
+        capture_output=True,
+        text=True,
+    )
+    files = []
+    for line in result.stdout.splitlines():
+        status, *file_path = line.split("\t")
+        if status.startswith("R"):
+            files.append(file_path[1])
+        elif status != "D":
+            files.append("\t".join(file_path))
+    return files
+
+
+def get_all_files(working_path, exts):
+    """
+    Get a list of all files in the directory with specified extensions
+    """
+    all_files = []
+    for ext in exts:
+        all_files.extend(working_path.rglob(f"*{ext}"))
+    return all_files
+
+
 def main():
+    """
+    Main function to check the copyright headers
+    """
+    parser = argparse.ArgumentParser(description="Check copyright headers in files.")
+    parser.add_argument(
+        "--all-files",
+        action="store_true",
+        help="Check all files in the directory instead of just committed files.",
+    )
+    args = parser.parse_args()
 
     with open(Path(__file__).parent.resolve() / Path("config.json")) as f:
         config = json.loads(f.read())
@@ -117,17 +170,22 @@ def main():
         pyheader = original.read().split("\n")
         pyheader_lines = len(pyheader)
 
-    # Build list of files to check
-    exclude_paths = [
-        (Path(__file__).parent / Path(path)).resolve().rglob("*")
-        for path in config["exclude-dir"]
-    ]
-    all_exclude_paths = itertools.chain.from_iterable(exclude_paths)
-    exclude_filenames = [p for p in all_exclude_paths if p.suffix in exts]
-    filenames = [p for p in working_path.resolve().rglob("*") if p.suffix in exts]
-    filenames = [
-        filename for filename in filenames if filename not in exclude_filenames
-    ]
+    # Determine which files to check
+    if args.all_files:
+        # Build list of files to check, excluding those in exclude-dir
+        exclude_paths = [
+            (Path(__file__).parent / Path(path)).resolve().rglob("*")
+            for path in config.get("exclude-dir", [])
+        ]
+        all_exclude_paths = itertools.chain.from_iterable(exclude_paths)
+        exclude_filenames = [p for p in all_exclude_paths if p.suffix in exts]
+        filenames = [p for p in working_path.resolve().rglob("*") if p.suffix in exts]
+        filenames = [
+            filename for filename in filenames if filename not in exclude_filenames
+        ]
+    else:
+        committed_files = get_committed_files()
+        filenames = [Path(f) for f in committed_files if Path(f).suffix in exts]
 
     problematic_files = []
     gpl_files = []

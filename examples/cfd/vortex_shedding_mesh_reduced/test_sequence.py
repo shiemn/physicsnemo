@@ -20,7 +20,7 @@ import time
 import numpy as np
 import torch
 import wandb as wb
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 
 from constants import Constants
 from physicsnemo.distributed.manager import DistributedManager
@@ -75,7 +75,7 @@ if __name__ == "__main__":
         g = graph.to(dist.device)
 
         break
-    ground_trueth = trainer.dataset_graph_test.solution_states
+    ground_truth = trainer.dataset_graph_test.solution_states
 
     i = 0
     relative_error_sum_u = 0
@@ -83,9 +83,8 @@ if __name__ == "__main__":
     relative_error_sum_p = 0
 
     for lc in trainer.dataloader_test:
-        ground = ground_trueth[i].to(dist.device)
+        ground = ground_truth[i].to(dist.device)
 
-        graph.ndata["x"]
         samples, relative_error_u, relative_error_v, relative_error_p = trainer.sample(
             lc[0][:, 0:2],
             lc[1],
@@ -107,7 +106,7 @@ if __name__ == "__main__":
     # avg_loss = loss_total/n_batch
     rank_zero_logger.info(
         f"relative_error_mean_u: {relative_error_mean_u:10.3e},relative_error_mean_v: {relative_error_mean_v:10.3e},relative_error_mean_p: {relative_error_mean_p:10.3e},\\\
-            time cost: {(time.time()-start):10.3e}"
+            time cost: {(time.time() - start):10.3e}"
     )
     # wb.log({"loss": loss.detach().cpu()})
 

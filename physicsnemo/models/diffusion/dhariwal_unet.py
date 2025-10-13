@@ -23,11 +23,12 @@ from torch.nn.functional import silu
 
 from physicsnemo.models.diffusion import (
     Conv2d,
-    GroupNorm,
     Linear,
     PositionalEmbedding,
     UNetBlock,
+    get_group_norm,
 )
+from physicsnemo.models.diffusion.utils import _recursive_property
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
@@ -264,10 +265,20 @@ class DhariwalUNet(Module):
                     attention=(res in attn_resolutions),
                     **block_kwargs,
                 )
-        self.out_norm = GroupNorm(num_channels=cout)
+        self.out_norm = get_group_norm(num_channels=cout)
         self.out_conv = Conv2d(
             in_channels=cout, out_channels=out_channels, kernel=3, **init_zero
         )
+
+    # Properties that are recursively set on submodules
+    profile_mode = _recursive_property(
+        "profile_mode", bool, "Should be set to ``True`` to enable profiling."
+    )
+    amp_mode = _recursive_property(
+        "amp_mode",
+        bool,
+        "Should be set to ``True`` to enable automatic mixed precision.",
+    )
 
     def forward(self, x, noise_labels, class_labels, augment_labels=None):
         # Mapping.

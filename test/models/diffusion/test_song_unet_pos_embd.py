@@ -127,8 +127,8 @@ def test_song_unet_embedding_selector(device):
 
     # Function to select embeddings
     def embedding_selector(emb):
-        return emb[
-            None,
+        return emb.expand(1, -1, -1, -1)[
+            :,
             :,
             offset_y : offset_y + patch_shape_y,
             offset_x : offset_x + patch_shape_x,
@@ -271,12 +271,28 @@ def test_song_unet_optims(device):
     # Check JIT
     model, invar = setup_model()
     assert common.validate_jit(model, (*invar,))
-    # Check AMP
+    # Check AMP with amp_mode=True for the layers: should pass
     model, invar = setup_model()
+    model.amp_mode = True
     assert common.validate_amp(model, (*invar,))
-    # Check Combo
+    # Check Combo with amp_mode=True for the layers: should pass
     model, invar = setup_model()
+    model.amp_mode = True
     assert common.validate_combo_optims(model, (*invar,))
+
+    # Check failures (only on GPU, because validate_amp and validate_combo_optims
+    # don't activate amp for SongUNetPosEmbd on CPU)
+    if device == "cuda:0":
+        # Check AMP: should fail because amp_mode is False for the layers
+        with pytest.raises(RuntimeError):
+            model, invar = setup_model()
+            assert common.validate_amp(model, (*invar,))
+        # Check Combo: should fail because amp_mode is False for the layers
+        # NOTE: this test doesn't fail because validate_combo_optims doesn't
+        # activate amp for SongUNetPosEmbd, even on GPU
+        # with pytest.raises(RuntimeError):
+        #     model, invar = setup_model()
+        #     assert common.validate_combo_optims(model, (*invar,))
 
 
 # Skip CPU tests because too slow
