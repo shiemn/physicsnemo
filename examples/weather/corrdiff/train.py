@@ -16,9 +16,9 @@
 
 import os
 import time
-import psutil
 from contextlib import nullcontext
 
+import psutil
 import hydra
 from hydra.utils import to_absolute_path
 from hydra.core.hydra_config import HydraConfig
@@ -40,6 +40,10 @@ from physicsnemo.launch.utils import (
     load_checkpoint,
     save_checkpoint,
     get_checkpoint_dir,
+)
+from physicsnemo.experimental.metrics.diffusion import tEDMResidualLoss
+from physicsnemo.experimental.models.diffusion.preconditioning import (
+    tEDMPrecondSuperRes,
 )
 
 from datasets.dataset import init_train_valid_datasets_from_config, register_dataset
@@ -107,7 +111,6 @@ def profiler_emit_nvtx():
 # Train the CorrDiff model using the configurations in "conf/config_training.yaml"
 @hydra.main(version_base="1.2", config_path="conf", config_name="config_training")
 def main(cfg: DictConfig) -> None:
-
     # Initialize distributed environment for training
     DistributedManager.initialize()
     dist = DistributedManager()
@@ -198,6 +201,39 @@ def main(cfg: DictConfig) -> None:
     if cfg.model.hr_mean_conditioning:
         img_in_channels += img_out_channels
 
+    # Handle distribution type
+    distribution = getattr(cfg.training.hp, "distribution", None)
+    student_t_nu = getattr(cfg.training.hp, "student_t_nu", None)
+    residual_loss, edm_precond_super_res = ResidualLoss, EDMPrecondSuperResolution
+    if distribution is not None and cfg.model.name not in [
+        "diffusion",
+        "patched_diffusion",
+        "lt_aware_patched_diffusion",
+    ]:
+        raise ValueError(
+            f"cfg.training.distribution should only be specified for diffusion models."
+        )
+    if distribution not in ["normal", "student_t", None]:
+        raise ValueError(f"Invalid distribution {distribution}")
+    if distribution == "student_t":
+        if student_t_nu is None:
+            raise ValueError(
+                "student_t_nu must be provided in cfg.training.hp.student_t_nu for student_t distribution"
+            )
+        elif student_t_nu <= 2:
+            raise ValueError(f"Expected nu > 2, but got {student_t_nu}.")
+        # Reassign models and class for student-t distribution
+        else:
+            residual_loss, edm_precond_super_res = tEDMResidualLoss, tEDMPrecondSuperRes
+            logger0.info(
+                f"Using student-t distribution with nu={student_t_nu}. "
+                f"This is an experimental feature and APIs may change without notice."
+            )
+
+    # Parse P_mean and P_std
+    P_mean = getattr(cfg.training.hp, "P_mean", None)
+    P_std = getattr(cfg.training.hp, "P_std", None)
+
     # Handle patch shape
     if cfg.model.name == "lt_aware_ce_regression":
         prob_channels = dataset.get_prob_channel_index()
@@ -247,24 +283,19 @@ def main(cfg: DictConfig) -> None:
         "use_fp16": fp16,
         "checkpoint_level": songunet_checkpoint_level,
     }
+    if student_t_nu is not None:
+        model_args["nu"] = student_t_nu
     if cfg.model.name == "lt_aware_ce_regression":
         model_args["prob_channels"] = prob_channels
     if hasattr(cfg.model, "model_args"):  # override defaults from config file
         model_args.update(OmegaConf.to_container(cfg.model.model_args))
 
-    use_torch_compile = False
-    use_apex_gn = False
-    profile_mode = False
+    use_torch_compile = getattr(cfg.training.perf, "torch_compile", False)
+    use_apex_gn = getattr(cfg.training.perf, "use_apex_gn", False)
+    profile_mode = getattr(cfg.training.perf, "profile_mode", False)
 
-    if hasattr(cfg.training.perf, "torch_compile"):
-        use_torch_compile = cfg.training.perf.torch_compile
-    if hasattr(cfg.training.perf, "use_apex_gn"):
-        use_apex_gn = cfg.training.perf.use_apex_gn
-        model_args["use_apex_gn"] = use_apex_gn
-
-    if hasattr(cfg.training.perf, "profile_mode"):
-        profile_mode = cfg.training.perf.profile_mode
-        model_args["profile_mode"] = profile_mode
+    model_args["use_apex_gn"] = use_apex_gn
+    model_args["profile_mode"] = profile_mode
 
     if enable_amp:
         model_args["amp_mode"] = enable_amp
@@ -285,19 +316,19 @@ def main(cfg: DictConfig) -> None:
             **model_args,
         )
     elif cfg.model.name == "lt_aware_patched_diffusion":
-        model = EDMPrecondSuperResolution(
+        model = edm_precond_super_res(
             img_in_channels=img_in_channels
             + model_args["N_grid_channels"]
             + model_args["lead_time_channels"],
             **model_args,
         )
     elif cfg.model.name == "diffusion":
-        model = EDMPrecondSuperResolution(
+        model = edm_precond_super_res(
             img_in_channels=img_in_channels + model_args["N_grid_channels"],
             **model_args,
         )
     elif cfg.model.name == "patched_diffusion":
-        model = EDMPrecondSuperResolution(
+        model = edm_precond_super_res(
             img_in_channels=img_in_channels + model_args["N_grid_channels"],
             **model_args,
         )
@@ -329,6 +360,7 @@ def main(cfg: DictConfig) -> None:
             find_unused_parameters=True,  # dist.find_unused_parameters,
             bucket_cap_mb=35,
             gradient_as_bucket_view=True,
+            static_graph=True,
         )
     if cfg.wandb.watch_model and dist.rank == 0:
         wandb.watch(model)
@@ -351,14 +383,11 @@ def main(cfg: DictConfig) -> None:
             raise FileNotFoundError(
                 f"Expected this regression checkpoint but not found: {regression_checkpoint_path}"
             )
-        reg_model_args = {
-            "use_apex_gn": use_apex_gn,
-            "profile_mode": profile_mode,
-            "amp_mode": enable_amp,
-        }
         regression_net = Module.from_checkpoint(
-            regression_checkpoint_path, reg_model_args
+            regression_checkpoint_path, override_args={"use_apex_gn": use_apex_gn}
         )
+        regression_net.amp_mode = enable_amp
+        regression_net.profile_mode = profile_mode
         regression_net.eval().requires_grad_(False).to(dist.device)
         if use_apex_gn:
             regression_net.to(memory_format=torch.channels_last)
@@ -434,12 +463,21 @@ def main(cfg: DictConfig) -> None:
         "patched_diffusion",
         "lt_aware_patched_diffusion",
     ):
+        loss_init_kwargs = {}
+        if student_t_nu is not None:
+            loss_init_kwargs["nu"] = student_t_nu
+        if P_mean is not None:
+            loss_init_kwargs["P_mean"] = P_mean
+        if P_std is not None:
+            loss_init_kwargs["P_std"] = P_std
+        
         loss_function = cfg.model.get("hp", {}).get("loss_function", None)
         if loss_function == None:
-            loss_fn = ResidualLoss(
-                regression_net=regression_net,
-                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
-            )
+            loss_fn = residual_loss(
+            regression_net=regression_net,
+            hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+            **loss_init_kwargs,
+        )
         elif loss_function == "IntensityResidualLoss":
             print("Using custom IntensityResidualLoss")
             loss_fn = IntensityResidualLoss(
@@ -448,6 +486,7 @@ def main(cfg: DictConfig) -> None:
                 average_intensity_weight=cfg.model.hp.get("average_intensity_weight", None),
                 maximum_intensity_weight=cfg.model.hp.get("maximum_intensity_weight", None),
             )
+        
     elif cfg.model.name == "regression" or cfg.model.name == "lt_aware_regression":
         loss_fn = RegressionLoss()
     elif cfg.model.name == "lt_aware_ce_regression":
@@ -497,7 +536,6 @@ def main(cfg: DictConfig) -> None:
     # enable profiler:
     with cuda_profiler():
         with profiler_emit_nvtx():
-
             while not done:
                 tick_start_nimg = cur_nimg
                 tick_start_time = time.time()
@@ -551,9 +589,9 @@ def main(cfg: DictConfig) -> None:
                                 "augment_pipe": None,
                             }
                             if use_patch_grad_acc is not None:
-                                loss_fn_kwargs[
-                                    "use_patch_grad_acc"
-                                ] = use_patch_grad_acc
+                                loss_fn_kwargs["use_patch_grad_acc"] = (
+                                    use_patch_grad_acc
+                                )
 
                             if lead_time_label:
                                 lead_time_label = (
@@ -698,12 +736,11 @@ def main(cfg: DictConfig) -> None:
                                         "img_clean": img_clean_valid,
                                         "img_lr": img_lr_valid,
                                         "augment_pipe": None,
-                                        "use_patch_grad_acc": use_patch_grad_acc,
                                     }
                                     if use_patch_grad_acc is not None:
-                                        loss_valid_kwargs[
-                                            "use_patch_grad_acc"
-                                        ] = use_patch_grad_acc
+                                        loss_valid_kwargs["use_patch_grad_acc"] = (
+                                            use_patch_grad_acc
+                                        )
                                     if lead_time_label_valid:
                                         lead_time_label_valid = (
                                             lead_time_label_valid[0]
@@ -719,7 +756,7 @@ def main(cfg: DictConfig) -> None:
                                     for patch_num_per_iter in patch_nums_iter:
                                         if patching is not None:
                                             patching.set_patch_num(patch_num_per_iter)
-                                            loss_fn_kwargs.update(
+                                            loss_valid_kwargs.update(
                                                 {"patching": patching}
                                             )
                                         with torch.autocast(
@@ -735,6 +772,7 @@ def main(cfg: DictConfig) -> None:
                                         valid_loss_accum += (
                                             loss_valid
                                             / cfg.training.io.validation_steps
+                                            / len(patch_nums_iter)
                                         )
                                 valid_loss_sum = torch.tensor(
                                     [valid_loss_accum], device=dist.device

@@ -17,10 +17,10 @@
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
-from dgl import DGLGraph
 from torch import Tensor
 
 from physicsnemo.models.gnn_layers.bsms import BistrideGraphMessagePassing
+from physicsnemo.models.gnn_layers.utils import DGLGraph, GraphType, PyGData
 from physicsnemo.models.meshgraphnet import MeshGraphNet
 from physicsnemo.models.meta import ModelMetaData
 
@@ -149,7 +149,7 @@ class BiStrideMeshGraphNet(MeshGraphNet):
         self,
         node_features: Tensor,
         edge_features: Tensor,
-        graph: DGLGraph,
+        graph: GraphType,
         ms_edges: Iterable[Tensor] = (),
         ms_ids: Iterable[Tensor] = (),
         **kwargs,
@@ -158,7 +158,14 @@ class BiStrideMeshGraphNet(MeshGraphNet):
         node_features = self.node_encoder(node_features)
         x = self.processor(node_features, edge_features, graph)
 
-        node_pos = graph.ndata["pos"]
+        # (DGL2PYG): keep only PyG version once DGL is removed.
+        if isinstance(graph, DGLGraph):
+            node_pos = graph.ndata["pos"]
+        elif isinstance(graph, PyGData):
+            node_pos = graph.pos
+        else:
+            raise ValueError(f"Unsupported graph type: {type(graph)}")
+
         ms_edges = [es.to(node_pos.device).squeeze(0) for es in ms_edges]
         ms_ids = [ids.squeeze(0) for ids in ms_ids]
         for _ in range(self.bistride_unet_levels):

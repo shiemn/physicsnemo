@@ -14,25 +14,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+from __future__ import annotations
+
 import importlib
 import inspect
 import json
+import keyword
 import logging
 import os
+import re
 import tarfile
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Union
 
 import torch
 
 import physicsnemo
 from physicsnemo.models.meta import ModelMetaData
-from physicsnemo.models.util_compatibility import convert_ckp_apex
 from physicsnemo.registry import ModelRegistry
 from physicsnemo.utils.filesystem import _download_cached, _get_fs
+
+# Used for saving checkpoints of nested modules
+_BASE_CKPT_PREFIX = "__physicsnemo.Module__"
+
+
+def _load_state_dict_with_logging(
+    module: torch.nn.Module, state_dict: Dict[str, Any], *args, **kwargs
+):
+    """Load state dictionary and log missing and unexpected keys
+
+    Parameters
+    ----------
+    module : torch.nn.Module
+        Module to load state dictionary into
+    state_dict : Dict[str, Any]
+        State dictionary to load
+    *args, **kwargs
+        Additional arguments to pass to load_state_dict
+    """
+    missing_keys, unexpected_keys = module.load_state_dict(state_dict, *args, **kwargs)
+    if missing_keys:
+        logging.warning(
+            f"Missing keys when loading {module.__class__.__name__}: {missing_keys}"
+        )
+    if unexpected_keys:
+        logging.warning(
+            f"Unexpected keys when loading {module.__class__.__name__}: {unexpected_keys}"
+        )
+    return missing_keys, unexpected_keys
 
 
 class Module(torch.nn.Module):
@@ -43,23 +74,87 @@ class Module(torch.nn.Module):
     handling file system abstractions.
 
     There is one important requirement for all models in PhysicsNeMo. They must
-    have json serializable arguments in their __init__ function. This is
+    have json serializable arguments in their ``__init__`` function. This is
     required for saving and loading models and allow models to be instantiated
-    from a checkpoint.
+    from a checkpoint. The only one exception to this rule is when the argument
+    passed to the ``__init__`` function is itself a ``physicsnemo.Module`` instance.
+    In this case, it is possible to construct, save and load nested Modules,
+    with multiple levels of nesting and/or multiple ``physicsnemo.Module``
+    instances at each level.
+    To be able to pass a ``torch.nn.Module`` instance as an argument to the
+    ``__init__`` function, it is necessary to first use the ``Module.from_torch`` method
+    to convert the ``torch.nn.Module`` subclass to a ``physicsnemo.Module`` subclass
+    To pass nested ``torch.nn.Module`` instances as arguments to the
+    ``__init__`` function, it is necessary to convert **all** nested ``torch.nn.Module``
+    instances to ``physicsnemo.Module`` instances using the
+    ``Module.from_torch`` method. See the examples below for more details.
 
     Parameters
     ----------
     meta : ModelMetaData, optional
         Meta data class for storing info regarding model, by default None
+
+    Examples
+    --------
+    To construct nested ``physicsnemo.Module`` instances with multiple levels of nesting and/or
+    multiple ``physicsnemo.Module`` instances at each level:
+
+    .. code-block:: python
+
+        class InnerModel(physicsnemo.Module):
+            def __init__(self, hidden_size):
+                super().__init__(meta=ModelMetaData())
+                self.hidden_size = hidden_size
+
+        class OuterModel(physicsnemo.Module):
+            def __init__(self, inner_model):
+                super().__init__(meta=ModelMetaData())
+                self.inner_model = inner_model
+
+        # Create and save nested model
+        model = OuterModel(inner_model=InnerModel(128))
+        model.save("checkpoint.mdlus")
+        loaded = physicsnemo.Module.from_checkpoint("checkpoint.mdlus")
+
+    Applying this to a ``torch.nn.Module`` instance is also possible, as long
+    as all nested ``torch.nn.Module`` instances are converted to ``physicsnemo.Module``
+    instances using the ``Module.from_torch`` method:
+
+    .. code-block:: python
+
+        class TorchInnerModel(torch.nn.Module):
+            def __init__(self, size):
+                super().__init__()
+                self.size = size
+
+        class TorchMyModel(torch.nn.Module):
+            def __init__(self, inner_model):
+                super().__init__()
+                self.inner_model = inner_model
+
+        # Convert both torch.nn.Module to physicsnemo.Module
+        PNMInnerModel = physicsnemo.Module.from_torch(
+            TorchInnerModel, meta=ModelMetaData()
+        )
+        PNMMyModel = physicsnemo.Module.from_torch(
+            TorchMyModel, meta=ModelMetaData()
+        )
+
+        # Create nested model with converted torch modules
+        model = PNMMyModel(inner_model=PNMInnerModel(size=128))
+
     """
 
     _file_extension = ".mdlus"  # Set file extension for saving and loading
     __model_checkpoint_version__ = (
         "0.1.0"  # Used for file versioning and is not the same as physicsnemo version
     )
-    __supported_model_checkpoint_version__ = (
-        {}
-    )  # Dict of supported model checkpoints and corresponding warnings messages
+    __supported_model_checkpoint_version__ = {}  # Dict of supported model checkpoints and corresponding warnings messages
+
+    # __init__ arguments that can be overridden. By default all arguments are
+    # protected. Subclasses can override this to allow for overriding of specific
+    # __init__'s arguments with the ``from_checkpoint`` method.
+    _overridable_args: Set[str] = set()
 
     def __new__(cls, *args, **kwargs):
         out = super().__new__(cls)
@@ -146,6 +241,36 @@ class Module(torch.nn.Module):
             Updated arguments dictionary compatible with current version
         """
         return args
+
+    @classmethod
+    def _override_args(
+        cls, args: Dict[str, Any], override_args: Dict[str, Any]
+    ) -> None:
+        """Safely override ``__init__`` arguments stored in a checkpoint.
+
+        This updates ``args`` *in-place* with the values provided in
+        ``override_args``. Only keys defined in ``cls._overridable_args`` are
+        allowed to be modified. Attempting to override any other key will raise
+        a ``ValueError``.
+
+        Parameters
+        ----------
+        args : Dict[str, Any]
+            Keyword arguments that will be forwarded to the model
+            constructor (e.g. ``args["__args__"]`` from a checkpoint).
+        override_args : Dict[str, Any]
+            Dictionary containing the desired argument overrides.
+        """
+
+        for key, value in override_args.items():
+            if key not in cls._overridable_args:
+                raise ValueError(
+                    f"Argument '{key}' cannot be overridden for {cls.__name__}."
+                )
+            # In this case we are not overriding, but we are adding a new arg
+            if key not in args:
+                warnings.warn(f"New argument '{key}' added for {cls.__name__}.")
+            args[key] = value
 
     @classmethod
     def _get_class_from_args(cls, arg_dict: Dict[str, Any]) -> type:
@@ -275,6 +400,74 @@ class Module(torch.nn.Module):
             If file_name does not end with .mdlus extension
         """
 
+        # Define some helper functions
+        def _save_process(module, args, metadata, mod_prefix="") -> None:
+            """Recursively serialize nested physicsnemo.Module instances for checkpoint saving.
+
+            Performs a depth-first search through the module's ``__init__`` arguments. When
+            an argument is a ``physicsnemo.Module`` instance, it is replaced with a
+            placeholder string (prefixed with ``_BASE_CKPT_PREFIX``) and the nested module's
+            information (``__name__``, ``__module__``, ``__args__``) is stored at the root level
+            of the ``args`` dictionary. The nested module metadata (e.g.,
+            ``__model_checkpoint_version__``) is also added at the root level
+            of ``metadata`` dictionary, with keys prefixed with
+            ``_BASE_CKPT_PREFIX``.
+
+            This allows for reconstruction of arbitrarily nested
+            module hierarchies during checkpoint loading.
+
+            Parameters
+            ----------
+            module : physicsnemo.Module
+                The module being processed
+            args : Dict[str, Any]
+                Dictionary to populate with serialized module arguments. Modified in-place.
+                Keys prefixed with ``_BASE_CKPT_PREFIX`` store nested module metadata.
+            metadata : Dict[str, Any]
+                Dictionary to populate with module metadata (e.g., version info).
+                Modified in-place.
+            mod_prefix : str, optional
+                Current module's prefix in the nested hierarchy, by default "". Root module
+                uses empty string; nested modules use format ``_BASE_CKPT_PREFIX.arg_name``.
+
+            Raises
+            ------
+            TypeError
+                If an argument is a ``torch.nn.Module`` instance that has not been converted
+                to a ``physicsnemo.Module`` using ``Module.from_torch``.
+            """
+
+            # Pointer to args["__args__"] for submodules
+            if mod_prefix == "":
+                args_ptr = args["__args__"].copy()
+            else:
+                args_ptr = args[mod_prefix]["__args__"].copy()
+
+            for arg_name, arg_value in args_ptr.items():
+                if isinstance(arg_value, Module):
+                    next_mod_prefix = (
+                        f"{mod_prefix if mod_prefix else _BASE_CKPT_PREFIX}.{arg_name}"
+                    )
+                    args[next_mod_prefix] = arg_value._args.copy()
+                    args_ptr[arg_name] = next_mod_prefix
+                    metadata[f"{next_mod_prefix}.mdlus_file_version"] = (
+                        arg_value.__model_checkpoint_version__
+                    )
+                    _save_process(arg_value, args, metadata, next_mod_prefix)
+                elif isinstance(arg_value, torch.nn.Module):
+                    raise TypeError(
+                        f"Submodule {arg_name} of module {module.__class__.__name__} is"
+                        f" a PyTorch module, which is not supported by 'Module.save'. Please "
+                        f"first convert it to a PhysicsNeMo module using 'Module.from_torch'."
+                    )
+
+            if mod_prefix == "":
+                args["__args__"] = args_ptr
+            else:
+                args[mod_prefix]["__args__"] = args_ptr
+
+            return
+
         if file_name is not None and not file_name.endswith(self._file_extension):
             raise ValueError(
                 f"File name must end with {self._file_extension} extension"
@@ -290,9 +483,6 @@ class Module(torch.nn.Module):
 
             torch.save(self.state_dict(), local_path / "model.pt")
 
-            with open(local_path / "args.json", "w") as f:
-                json.dump(self._args, f)
-
             # Save the physicsnemo version and git hash (if available)
             metadata_info = {
                 "physicsnemo_version": physicsnemo.__version__,
@@ -307,6 +497,16 @@ class Module(torch.nn.Module):
                     metadata_info["git_hash"] = repo.head.object.hexsha
                 except git.InvalidGitRepositoryError:
                     metadata_info["git_hash"] = None
+
+            # Copy self._args to avoid side effects
+            _args = self._args.copy()
+
+            # Recursively populate _args and metadata_info with submodules
+            # information
+            _save_process(self, _args, metadata_info)
+
+            with open(local_path / "args.json", "w") as f:
+                json.dump(_args, f)
 
             with open(local_path / "metadata.json", "w") as f:
                 json.dump(metadata_info, f)
@@ -324,18 +524,12 @@ class Module(torch.nn.Module):
             fs.put(str(local_path / "model.tar"), file_name)
 
     @staticmethod
-    def _check_checkpoint(local_path: str) -> bool:
-        if not local_path.joinpath("args.json").exists():
-            raise IOError("File 'args.json' not found in checkpoint")
-
-        if not local_path.joinpath("metadata.json").exists():
-            raise IOError("File 'metadata.json' not found in checkpoint")
-
-        if not local_path.joinpath("model.pt").exists():
-            raise IOError("Model weights 'model.pt' not found in checkpoint")
-
-        if not local_path.joinpath("metadata.json").exists():
-            raise IOError("Metadata 'metadata.json' not found in checkpoint")
+    def _check_checkpoint(local_path: Path | str) -> None:
+        local_path = Path(local_path)
+        expected_files = ["args.json", "metadata.json", "model.pt"]
+        for file in expected_files:
+            if not (local_path / file).exists():
+                raise IOError(f"File '{file}' not found in checkpoint")
 
     def load(
         self,
@@ -369,9 +563,16 @@ class Module(torch.nn.Module):
 
             # Open the tar file and extract its contents to the temporary directory
             with tarfile.open(cached_file_name, "r") as tar:
-                tar.extractall(
-                    path=local_path, members=list(Module._safe_members(tar, local_path))
+                # Safely extract while supporting Python versions < 3.12 that lack the
+                # ``filter`` keyword.  Starting with 3.12, ``filter="data"`` is the
+                # recommended way to avoid unsafe members
+                extract_kwargs = dict(
+                    path=local_path,
+                    members=list(Module._safe_members(tar, local_path)),
                 )
+                if "filter" in tar.extractall.__code__.co_varnames:
+                    extract_kwargs["filter"] = "data"
+                tar.extractall(**extract_kwargs)  # noqa: S202
 
             # Check if the checkpoint is valid
             Module._check_checkpoint(local_path)
@@ -381,18 +582,41 @@ class Module(torch.nn.Module):
             model_dict = torch.load(
                 local_path.joinpath("model.pt"), map_location=device
             )
-            self.load_state_dict(model_dict, strict=strict)
+            _load_state_dict_with_logging(self, model_dict, strict=strict)
 
     @classmethod
     def from_checkpoint(
-        cls, file_name: str, model_args: Optional[Dict] = None
-    ) -> "Module":
+        cls,
+        file_name: str,
+        override_args: Optional[Dict[str, Any]] = None,
+        strict: bool = True,
+    ) -> physicsnemo.Module:
         """Simple utility for constructing a model from a checkpoint
 
         Parameters
         ----------
         file_name : str
             Checkpoint file name
+        override_args : Optional[Dict[str, Any]], optional, default=None
+            Dictionary of arguments to override the ``__init__`` method's
+            arguments saved in the checkpoint. The override of arguments occurs
+            *before* the model is instantiated, which allows for *ad-hoc*
+            modifications to the model's initialization. Argument overrides are
+            however applied *before* the state-dict is loaded, which means that
+            for parameters or buffers saved in the state-dict, the values
+            contained in the state-dict will take precedence over the override.
+            This might also result in unexpected behavior if the model is
+            instantiated with different arguments than the ones saved in the
+            checkpoint, and some mismatching keys are saved in the state-dict.
+
+            *Note*: Only arguments defined in ``cls._overridable_args`` can be
+            overridden. ``Module``'s subclasses by default disable this
+            functionality, unless they explicity define an ``_overridable_args``
+            class attribute. Attempting to override any other argument will raise
+            a ``ValueError``. This API should be used with caution and only if
+            you fully understand the implications of the override.
+        strict : bool, optional
+            Whether to strictly enforce that the keys in state_dict match, by default True
 
         Returns
         -------
@@ -402,7 +626,198 @@ class Module(torch.nn.Module):
         ------
         IOError
             If file_name provided does not exist or is not a valid checkpoint
+
+        Examples
+        --------
+        Simple argument override:
+
+        .. code-block:: python
+
+            class MyModel(Module):
+                _overridable_args = set(["a", "b"])
+                def __init__(self, a, b=2.0):
+                    super().__init__()
+                    # ... model implementation ...
+            model = MyModel(1.0, b=2.0)
+            model.save("checkpoint.mdlus")
+            model_loaded = MyModel.from_checkpoint("checkpoint.mdlus", override_args={"a": 5.0})
+
+        For nested module, override is possible with dot-separated syntax:
+
+        .. code-block:: python
+
+            class SubModule(Module):
+                _overridable_args = set(["a"])
+                def __init__(self, a):
+                    super().__init__()
+                    # ... submodule implementation ...
+            class MyModel(Module):
+                def __init__(self, submodule):
+                    super().__init__()
+                    self.submodule = submodule
+                    # ... model implementation ...
+            submodule = SubModule(1.0)
+            model = MyModel(submodule)
+            model.save("checkpoint.mdlus")
+            model = MyModel.from_checkpoint("checkpoint.mdlus", override_args={"submodule.a": 2.0})
         """
+
+        # Validate the format of override_args keys
+        override_args = override_args or {}
+        for k in override_args.keys():
+            if not isinstance(k, str):
+                raise ValueError(
+                    f"All keys in override_args must be strings, got {type(k)} for key {k}"
+                )
+            if not all(
+                p and p.isidentifier() and not keyword.iskeyword(p)
+                for p in k.split(".")
+            ):
+                raise ValueError(
+                    f"Key {k} in override_args does not match the expected format "
+                    f"arg_name1.arg_name2..."
+                )
+
+        # Define some helper functions
+        def _from_checkpoint_process(
+            cls_in,
+            args,
+            metadata,
+            override_args,
+            strict,
+            mod_prefix="",
+        ):
+            """Recursively deserialize and instantiate nested physicsnemo.Module instances.
+
+            Performs a depth-first reconstruction of the module hierarchy from a checkpoint.
+            When an argument value is a placeholder string (prefixed with ``_BASE_CKPT_PREFIX``),
+            it is replaced with a recursively instantiated ``physicsnemo.Module`` instance.
+            This is the reciprocal operation of ``_save_process``, reconstructing the original
+            nested module structure from the serialized checkpoint data.
+
+            Parameters
+            ----------
+            cls_in : type
+                The class of the module to instantiate at the current recursion level
+            args : Dict[str, Any]
+                Dictionary containing serialized module arguments from the checkpoint.
+                Keys prefixed with ``_BASE_CKPT_PREFIX`` contain nested module metadata.
+                Modified in-place as nested modules are processed and removed.
+            metadata : Dict[str, Any]
+                Dictionary containing module metadata (e.g., version info) from the checkpoint.
+                Modified in-place as nested modules are processed and removed.
+            override_args : Dict[str, Any]
+                Dictionary of arguments to override in the module's ``__init__`` method.
+                Supports dot-separated syntax for nested module arguments.
+            strict : bool
+                Whether to strictly enforce that state_dict keys match when loading weights
+            mod_prefix : str, optional
+                Current module's prefix in the nested hierarchy, by default "". Root module
+                uses empty string; nested modules use format ``_BASE_CKPT_PREFIX.arg_name``.
+
+            Returns
+            -------
+            physicsnemo.Module
+                The instantiated module with all nested submodules recursively constructed
+
+            Raises
+            ------
+            IOError
+                If the checkpoint version is incompatible with the current model version
+            ValueError
+                If argument names or prefixes don't match the expected format
+            """
+
+            # Pointer to args (for submodules)
+            if mod_prefix == "":
+                args_ptr = {
+                    k: v for k, v in args.items() if not k.startswith(_BASE_CKPT_PREFIX)
+                }
+                override_args_ptr = {
+                    k: v
+                    for k, v in override_args.items()
+                    if k.isidentifier() and not keyword.iskeyword(k)
+                }
+            else:
+                args_ptr = args[mod_prefix]
+                prefix = mod_prefix[len(_BASE_CKPT_PREFIX) + 1 :]
+                override_args_ptr = {}
+                for k, v in override_args.items():
+                    if k.startswith(f"{prefix}."):
+                        suffix = k[len(prefix) + 1 :]  # +1 for the dot
+                        if suffix.isidentifier() and not keyword.iskeyword(suffix):
+                            override_args_ptr[suffix] = v
+
+            # Get the checkpoint version
+            version = metadata.get(
+                f"{mod_prefix}{'.' if mod_prefix else ''}mdlus_file_version",
+                cls_in.__model_checkpoint_version__,
+            )
+
+            # Get the class from args
+            _cls = Module._get_class_from_args(args_ptr)
+
+            # Check if the checkpoint version is compatible with the current version
+            # If not, apply backward compatibility mapping if method exists
+            if version != _cls.__model_checkpoint_version__:
+                if version in _cls.__supported_model_checkpoint_version__:
+                    warnings.warn(_cls.__supported_model_checkpoint_version__[version])
+                    args_ptr["__args__"] = _cls._backward_compat_arg_mapper(
+                        version, args_ptr["__args__"]
+                    )
+                else:
+                    raise IOError(
+                        f"Model checkpoint version {version} is not compatible with "
+                        f"current version {_cls.__model_checkpoint_version__} of class "
+                        f"{_cls.__name__}"
+                    )
+
+            # Process all args and recursively instantiate those that are
+            # submodules
+            for arg_name, arg_value in args_ptr["__args__"].items():
+                if not isinstance(arg_value, str):
+                    continue
+                is_module = re.match(rf"{_BASE_CKPT_PREFIX}(.*)", arg_value)
+                if is_module:
+                    suffix = is_module.group(1)
+                    args_split = re.match(r"^(.*\.)*([^\.]+)$", suffix)
+                    if args_split:
+                        _arg_name = args_split.group(2)
+                        # Make sure that arg_value has the expected format
+                        if _arg_name != arg_name:
+                            raise ValueError(
+                                f"Argument name '{_arg_name}' does not match the "
+                                f"expected '{arg_name}' for module {_cls.__name__}"
+                            )
+                        # Instantiate the submodule
+                        next_mod_prefix = arg_value
+                        args_ptr["__args__"][arg_name] = _from_checkpoint_process(
+                            Module._get_class_from_args(args[next_mod_prefix]),
+                            args,
+                            metadata,
+                            override_args,
+                            strict,
+                            mod_prefix=next_mod_prefix,
+                        )
+                        # Cleanup args and metadata by removing the items
+                        # related to the submodule
+                        args.pop(next_mod_prefix, None)
+                        metadata.pop(f"{next_mod_prefix}.mdlus_file_version", None)
+                    else:
+                        # Make sure that arg_value has the expected format
+                        raise ValueError(
+                            f"Argument value '{arg_value}' for argument '{arg_name}' "
+                            f"of module {_cls.__name__} does not match the expected format "
+                            f"{_BASE_CKPT_PREFIX}.arg_name1.arg_name2..."
+                        )
+
+            # Override args_ptr["__args__"] with override_args
+            if override_args is not None:
+                _cls._override_args(args_ptr["__args__"], override_args_ptr)
+
+            # Instantiate the module
+            model = Module.instantiate(args_ptr)
+            return model
 
         # Download and cache the checkpoint file if needed
         cached_file_name = _download_cached(file_name)
@@ -413,9 +828,16 @@ class Module(torch.nn.Module):
 
             # Open the tar file and extract its contents to the temporary directory
             with tarfile.open(cached_file_name, "r") as tar:
-                tar.extractall(
-                    path=local_path, members=list(Module._safe_members(tar, local_path))
+                # Safely extract while supporting Python versions < 3.12 that lack the
+                # ``filter`` keyword.  Starting with 3.12, ``filter="data"`` is the
+                # recommended way to avoid unsafe members;
+                extract_kwargs = dict(
+                    path=local_path,
+                    members=list(Module._safe_members(tar, local_path)),
                 )
+                if "filter" in tar.extractall.__code__.co_varnames:
+                    extract_kwargs["filter"] = "data"
+                tar.extractall(**extract_kwargs)  # noqa: S202
 
             # Check if the checkpoint is valid
             Module._check_checkpoint(local_path)
@@ -424,51 +846,30 @@ class Module(torch.nn.Module):
             with open(local_path.joinpath("args.json"), "r") as f:
                 args = json.load(f)
 
-            ckp_args = copy.deepcopy(args)
-
             # Load metadata to get version
             with open(local_path.joinpath("metadata.json"), "r") as f:
                 metadata = json.load(f)
-                version = metadata.get(
-                    "mdlus_file_version", cls.__model_checkpoint_version__
-                )
 
-            # Get class from args
-            _cls = Module._get_class_from_args(args)
-
-            # Check if the checkpoint version is compatible with the current version
-            # If not, apply backward compatibility mapping if method exists
-            if version != _cls.__model_checkpoint_version__:
-                if version in _cls.__supported_model_checkpoint_version__:
-                    warnings.warn(_cls.__supported_model_checkpoint_version__[version])
-                    args["__args__"] = _cls._backward_compat_arg_mapper(
-                        version, args["__args__"]
-                    )
-                else:
-                    raise IOError(
-                        f"Model checkpoint version {version} is not compatible with current version {_cls.__model_checkpoint_version__}"
-                    )
-
-            # Merge model_args (adding new keys and updating existing ones)
-            if model_args is not None:
-                args["__args__"].update(model_args)
-
-            # Instantiate the model
-            model = Module.instantiate(args)
+            model = _from_checkpoint_process(
+                cls,
+                args,
+                metadata,
+                override_args,
+                strict,
+            )
 
             # Load the model weights
             model_dict = torch.load(
                 local_path.joinpath("model.pt"), map_location=model.device
             )
 
-            model_dict = convert_ckp_apex(ckp_args, model_args, model_dict)
-            model.load_state_dict(model_dict, strict=False)
+            _load_state_dict_with_logging(model, model_dict, strict=strict)
         return model
 
     @staticmethod
     def from_torch(
-        torch_model_class: torch.nn.Module, meta: ModelMetaData = None
-    ) -> "Module":
+        torch_model_class: type[torch.nn.Module], meta: ModelMetaData | None = None
+    ) -> type[Module]:
         """Construct a PhysicsNeMo module from a PyTorch module
 
         Parameters
@@ -492,7 +893,8 @@ class Module(torch.nn.Module):
             def forward(self, x):
                 return self.inner_model(x)
 
-        # Get the argument names and default values of the PyTorch model's init method
+        # Get the argument names and default values of the PyTorch model's init
+        # method
         init_argspec = inspect.getfullargspec(torch_model_class.__init__)
         model_argnames = init_argspec.args[1:]  # Exclude 'self'
         model_defaults = init_argspec.defaults or []
