@@ -56,6 +56,7 @@ class NorwayDatasetH5(DownscalingDataset):
         invariant_variables_path: Union[str, None] = None,
         years: Union[List[int], None] = None,
         bounds: str = "small",
+        extreme_percentile: Union[float, None] = None,
     ):
         self.data_path = data_path
 
@@ -118,6 +119,8 @@ class NorwayDatasetH5(DownscalingDataset):
             self.target_mean *= 3600
             self.target_std *= 3600
 
+            print(f"Target Normalization: mean {self.target_mean}, std {self.target_std}")
+
         else:
             raise ValueError(f"No normalization coefficients found at {data_path}. Please run the calculate_mean_std.py script to calculate them.")
 
@@ -163,7 +166,61 @@ class NorwayDatasetH5(DownscalingDataset):
         assert len(self.files_target) > 0, f"No files found in the dataset directory {self.data_path}"
 
         self.cum_file_length = np.cumsum(self.file_lengths)
+
+        # Extreme filtering setup
+        self.extreme_percentile = extreme_percentile
+        self.extreme_indices = None
+        self.extreme_threshold = None
+        
+        if self.extreme_percentile is not None:
+            print(f"Filtering dataset to only include samples above {self.extreme_percentile}th percentile of rainfall...")
+            self.extreme_indices = self.__filter_extremes__(self.extreme_percentile)
+            print(f"Filtered dataset: {len(self.extreme_indices)} samples out of {sum(self.file_lengths)} ({len(self.extreme_indices)/sum(self.file_lengths)*100:.2f}%)")
+
+
+    def __filter_extremes__(self, percentile: float) -> list[int]:
+        """Go through the dataset and find indices which have extreme values in the target variables (i.e. rainfall above a certain threshold)."""
+        extreme_indices = []
+        
+        print("Step 1/2: Computing maximum rainfall values for all samples...")
+        max_rainfall_values = []
+        
+        # Iterate through all files and collect max rainfall for each sample
+        for file_idx, target_file in enumerate(self.files_target):
+            with h5py.File(target_file, 'r') as f:
+                targets = f['targets'][:]  # Shape: (n_samples, H, W)
+                # Convert from kg/m^2/s to mm per 3 hours
+                targets = targets * 3600
                 
+                # Get max rainfall for each sample (spatial maximum)
+                max_values = np.max(targets, axis=(1, 2))
+                max_rainfall_values.extend(max_values)
+        
+        max_rainfall_values = np.array(max_rainfall_values)
+        
+        # Calculate the threshold
+        self.extreme_threshold = np.percentile(max_rainfall_values, percentile)
+        print(f"   Rainfall threshold at {percentile}th percentile: {self.extreme_threshold:.4f} mm/3h")
+        
+        print("Step 2/2: Finding indices of samples exceeding threshold...")
+        # Now find indices that exceed the threshold
+        current_idx = 0
+        for file_idx, target_file in enumerate(self.files_target):
+            with h5py.File(target_file, 'r') as f:
+                targets = f['targets'][:]
+                targets = targets * 3600
+                
+                max_values = np.max(targets, axis=(1, 2))
+                # Find local indices in this file that exceed threshold
+                local_extreme_indices = np.where(max_values >= self.extreme_threshold)[0]
+                
+                # Convert to global indices
+                global_indices = local_extreme_indices + current_idx
+                extreme_indices.extend(global_indices.tolist())
+                
+                current_idx += targets.shape[0]
+
+        return extreme_indices
 
     def __getitem__(self, idx):
         """Return a tuple of:
@@ -177,12 +234,15 @@ class NorwayDatasetH5(DownscalingDataset):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
+        # If extreme filtering is active, map the requested index to the actual index
+        if self.extreme_indices is not None:
+            idx = self.extreme_indices[idx]
+
         file_idx: int = np.searchsorted(self.cum_file_length, idx, side='right')
         if file_idx == 0:
             local_idx = idx
         else:
-            local_idx = idx - self.cum_file_length[file_idx - 1] 
-
+            local_idx = idx - self.cum_file_length[file_idx - 1]
         with h5py.File(self.files_predictant[file_idx], 'r') as f:
             predictor = f['predictors'][local_idx].astype(np.float32)
 
@@ -204,9 +264,6 @@ class NorwayDatasetH5(DownscalingDataset):
         if self.bounds == 'small':
             predictor = predictor[:, 32:-32, 32:-32]
 
-        # print(f"Predictor shape: {predictor.shape}, Target shape: {target.shape}")
-        # print(f"Predictor dtype: {predictor.dtype}, Target dtype: {target.dtype}")
-
 
         return target[None, :], predictor
         
@@ -218,6 +275,8 @@ class NorwayDatasetH5(DownscalingDataset):
         return x.repeat(4, axis=1).repeat(4, axis=2)
 
     def __len__(self):
+        if self.extreme_indices is not None:
+            return len(self.extreme_indices)
         return sum(self.file_lengths)
 
     def latitude(self):
@@ -248,6 +307,11 @@ class NorwayDatasetH5(DownscalingDataset):
 
         print(f"Time values generated for years {self.years}: {len(datetimes)} timestamps.")
         print(f"First timestamp: {datetimes[0]}, Last timestamp: {datetimes[-1]}")
+
+        # If extreme filtering is active, only return times for filtered indices
+        if self.extreme_indices is not None:
+            datetimes = [datetimes[i] for i in self.extreme_indices]
+            print(f"Filtered to {len(datetimes)} timestamps based on extreme percentile filter.")
 
         return [convert_datetime_to_cftime(t) for t in datetimes]
 

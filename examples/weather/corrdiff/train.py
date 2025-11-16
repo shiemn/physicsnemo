@@ -129,8 +129,8 @@ def main(cfg: DictConfig) -> None:
         results_dir=cfg.wandb.results_dir,
     )
 
-        logger = PythonLogger("main")  # General python logger
-        logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
+    logger = PythonLogger("main")  # General python logger
+    logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
     
     # Resolve and parse configs
     OmegaConf.resolve(cfg)
