@@ -91,11 +91,11 @@ training:
         # Training duration based on the number of processed samples
     io:
         print_progress_freq: 100000
-        regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
+        regression_checkpoint_path: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
         # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
-        save_checkpoint_freq: 50000
-        save_n_recent_checkpoints: 5
+        checkpoint_dir: /checkpoints/norway_WL_28-11
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: 20
         # Set to a positive integer to only keep the most recent n checkpoints
 
 # Parameters for wandb logging

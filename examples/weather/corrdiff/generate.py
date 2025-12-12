@@ -201,7 +201,13 @@ def main(cfg: DictConfig) -> None:
             patching=patching,
         )
     elif cfg.sampler.type == "stochastic":
-        sampler_fn = partial(stochastic_sampler, patching=patching)
+        sampler_fn = partial(
+            stochastic_sampler, 
+            patching=patching,
+            S_churn=cfg.sampler.get("S_churn", 0),
+            S_min=cfg.sampler.get("S_min", 0),
+            S_max=cfg.sampler.get("S_max", float("inf")),
+        )
     else:
         raise ValueError(f"Unknown sampling method {cfg.sampling.type}")
 

@@ -1,13 +1,13 @@
 #!/bin/bash
 #SBATCH -J PrecipitationDownscalingParallel
 #SBATCH -c 16
-#SBATCH -p h100
-#SBATCH --ntasks-per-node=4
-#SBATCH --gres=gpu:4
+#SBATCH -p standard
+#SBATCH --ntasks-per-node=2
+#SBATCH --gres=gpu:2
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=simon.hentschel@uni-wuerzburg.de
 #SBATCH --output=output/job-%j.out
-#SBATCH --tmp=3000G
+#SBATCH --tmp=1000G
 
 
 # #SBATCH --error=output/job-%j.err
@@ -40,7 +40,7 @@ echo "Copying data to scratch complete"
 
 
 
-apptainer run --nv --bind /tmp/:/data --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ ~/own_corrdiff.sif torchrun --nproc_per_node=4  ~/bjerknes/corrdiff/train.py --config-name $1 \
+srun apptainer run --nv --bind /tmp/:/data --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ ~/own_corrdiff.sif torchrun --nproc_per_node=2  ~/bjerknes/corrdiff/train.py --config-name $1  \
 
 #apptainer run --nv --bind ~/data/downscaling:/data --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ ~/own_corrdiff.sif torchrun --nproc_per_node=4  ~/bjerknes/corrdiff/train.py --config-name $1 \
 

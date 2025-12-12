@@ -78,6 +78,7 @@ dataset:
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
     bounds: large
+    extreme_percentile: 95.0
 
 validation:
     years: [2003, 2004]
@@ -86,14 +87,15 @@ validation:
 # Training parameters
 training:
     hp:
-        training_duration: 2000000
+        training_duration: 3000000
         batch_size_per_gpu: 4
         # Training duration based on the number of processed samples
     io:
         print_progress_freq: 100000
         regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
+         #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus #### TODO: Change this to the correct checkpoint
         # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
+        checkpoint_dir: /checkpoints/extremes_norway_WL_new
         save_checkpoint_freq: 50000
         save_n_recent_checkpoints: 5
         # Set to a positive integer to only keep the most recent n checkpoints

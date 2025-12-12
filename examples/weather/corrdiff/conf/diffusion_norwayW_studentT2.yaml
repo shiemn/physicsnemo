@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: norway_diffusion
+          name: norway_diffusion_studentT_2
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -88,12 +88,16 @@ training:
     hp:
         training_duration: 2000000
         batch_size_per_gpu: 4
+        distribution: student_t
+        student_t_nu: 2
+
         # Training duration based on the number of processed samples
     io:
         print_progress_freq: 100000
         regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
+         #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus #### TODO: Change this to the correct checkpoint
         # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
+        checkpoint_dir: /checkpoints/norway_WL_studentT2_new
         save_checkpoint_freq: 50000
         save_n_recent_checkpoints: 5
         # Set to a positive integer to only keep the most recent n checkpoints

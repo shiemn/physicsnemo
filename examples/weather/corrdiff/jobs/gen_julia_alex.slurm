@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J PrecipitationDownscaling
 #SBATCH -c 16
-#SBATCH -p h100
+#SBATCH -p standard
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mail-type=ALL
@@ -32,9 +32,9 @@ ssh alex "find /anvme/workspace/b214cb13-ecodata/downscaling/Norway/HCLIM3/prepr
  | awk -F '[_.]' '{ year=$(NF-1); if (year >= 2000 && year <= 2005) print $0 }' \
  | xargs -P 1 -I{} rsync --info=PROGRESS2 alex:{} /tmp/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH/.
 
-cp ~/datatemp/Norway/HCLIM3/orog_NEU-3_ECMWF-ERAINT_evaluation_r1i1p1_HCLIMcom-HCLIM38-AROME_x2yn2v1_fx.nc /tmp/Norway/HCLIM3/.
-cp ~/datatemp/Norway/HCLIM3/orog_NEU-3_ECMWF-ERAINT_evaluation_r1i1p1_HCLIMcom-HCLIM38-AROME_x2yn2v1_fx.nc /tmp/Norway/HCLIM3/preprocessed_large/.
-cp ~/datatemp/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH/* /tmp/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH/.
+cp /data/42-julia-hpc-rz-lsx/sih25nq/datatemp/Norway/HCLIM3/orog_NEU-3_ECMWF-ERAINT_evaluation_r1i1p1_HCLIMcom-HCLIM38-AROME_x2yn2v1_fx.nc /tmp/Norway/HCLIM3/.
+cp /data/42-julia-hpc-rz-lsx/sih25nq/datatemp/Norway/HCLIM3/orog_NEU-3_ECMWF-ERAINT_evaluation_r1i1p1_HCLIMcom-HCLIM38-AROME_x2yn2v1_fx.nc /tmp/Norway/HCLIM3/preprocessed_large/.
+cp /data/42-julia-hpc-rz-lsx/sih25nq/datatemp/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH/* /tmp/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH/.
 
 wait
 
@@ -46,6 +46,7 @@ echo "Copying data to scratch complete"
 
 srun apptainer run --nv --bind /tmp/:/data  \
                         --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ \
-                        ~/own_corrdiff.sif python -u ~/bjerknes/corrdiff/generate.py --config-name $1 \
+                        --bind ~/data/outputs/norway:/outputs/ \
+                        ~/new_corrdiff.sif python -u ~/bjerknes/corrdiff/generate.py --config-name $1 \
 
 

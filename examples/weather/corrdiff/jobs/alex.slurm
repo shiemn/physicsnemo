@@ -16,9 +16,14 @@ export https_proxy=http://proxy:80
 
 
 
-export WANDB__SERVICE_WAIT=300
+export APPTAINERENV_WANDB__SERVICE_WAIT=300
 export APPTAINERENV_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
+export APPTAINERENV_NCCL_DEBUG=INFO
+export APPTAINERENV_HYDRA_FULL_ERROR=1
+export APPTAINERENV_OMP_NUM_THREADS=16
 echo ${CUDA_VISIBLE_DEVICES}
+
+
 
 
 
@@ -27,7 +32,7 @@ echo ${CUDA_VISIBLE_DEVICES}
 export HYDRA_FULL_ERROR=1
 srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/data/ \
                         --bind $WORK/checkpoints:/checkpoints/ \
-                        $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/train.py --config-name $1 \
+                        $WORK/new_corrdiff.sif torchrun --nproc_per_node=1  $HOME/bjerknes/corrdiff/train.py --config-name $1 \
 
 
 #srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/data/ --bind $WORK/checkpoints:/checkpoints/ $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/generate.py --config-name 

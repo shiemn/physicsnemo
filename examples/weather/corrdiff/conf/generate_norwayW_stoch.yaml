@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: generate_hrrr_mini
+          name: generate_norway
     run:
           dir: ./outputs/${hydra:job.name}
     searchpath:
@@ -26,7 +26,7 @@ hydra:
 # Base parameters for dataset, model, and generation
 defaults:
 
-    - dataset: hrrr_mini
+    - dataset: custom
     # The dataset type for training.
     # Accepted values:
     #   `gefs_hrrr`: full GEFS-HRRR dataset for continental US.
@@ -45,28 +45,53 @@ defaults:
 # Modify or add below parameters that should be passed as argument to the
 # user-defined dataset class.
 dataset:
-    data_path: Users/simon/Datasets/CorrDiff/hrrr-mini/hrrr_mini_train.nc
-    # Path to .nc data file
-    stats_path: Users/simon/Datasets/CorrDiff/hrrr-mini/stats.json
+    type: norway #datasets/norway.py::NorwayDatasetH5
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+    
     # Path to json stats file
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+    years: [2004, 2005] #[2041, 2042, 2099, 2100] # 
+
+sampler:
+    type: stochastic
+    S_churn: 40
 
 # Generation parameters to specialize
 generation:
-    num_ensembles: 2
+    num_ensembles: 10
     # int, number of ensembles to generate per input
-    seed_batch_size: 1
+    seed_batch_size: 10
     # int, size of the batched inference
-    times:
-        - 2020-02-02T00:00:00
+    #times_range: ["2004-01-01T00:00:00", "2004-01-10T23:59:59", 3]
+    times_range: ["2005-01-01T00:00:00", "2005-12-31T23:59:59", 3]
+    # times_range: ["2041-01-01T00:00:00", "2100-12-31T23:59:59", 3]
+    # List[str] and interval in h, time range in ISO 8601 format. Replace with desired time range.
+    # times: None
     # List[str], time stamps in ISO 8601 format. Replace and list desired target
     # time stamps.
     io:
-        res_ckpt_filename: <diffusion_checkpoint.mdlus> 
+
+        res_ckpt_filename: /checkpoints/norway_WL_28-11/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000128.mdlus
+        #res_ckpt_filename: /checkpoints/norway_large/checkpoints_diffusion/EDMPrecondSuperResolution.0.10000128.mdlus
+        #/checkpoints/norway_run2/checkpoints_diffusion/EDMPrecondSuperResolution.0.8000040.mdlus
         # Path to checkpoint file for the diffusion model  
-        reg_ckpt_filename: <regression_checkpoint.mdlus>
+        reg_ckpt_filename:  /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
+        #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus 
+        
+
+
         # Path to checkpoint filename for the mean predictor model
+        output_filename: /outputs/corrdiff_large_norwayW_stoch.nc
 
 # Parameters for wandb logging
 wandb:
-    mode: offline
-    # Configure whether to use wandb: "offline", "online", "disabled"
+    mode: online
+    results_dir: "./wandb"
+    # Directory to store wandb results
+    watch_model: false
+    # If true, wandb will track model parameters and gradients

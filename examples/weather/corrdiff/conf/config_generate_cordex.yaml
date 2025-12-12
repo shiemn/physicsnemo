@@ -17,16 +17,16 @@
 hydra:
     job:
           chdir: false
-          name: cordex_bench_regression
+          name: generate_cordex_local
     run:
-          dir: ./output/${hydra:job.name}
+          dir: ./outputs/${hydra:job.name}
     searchpath:
           - pkg://conf/base # Do not modify
 
-# Base parameters for dataset, model, training, and validation
+# Base parameters for dataset, model, and generation
 defaults:
 
-    - dataset: custom 
+    - dataset: custom
     # The dataset type for training.
     # Accepted values:
     #   `gefs_hrrr`: full GEFS-HRRR dataset for continental US.
@@ -34,25 +34,16 @@ defaults:
     #   `cwb`: full CWB dataset for Taiwan.
     #   `custom`: user-defined dataset. Parameters need to be specified below.
 
-    - model: regression
-    # The model type.
-    # Accepted values:
-    #     `regression`: a regression UNet for deterministic predictions
-    #     `lt_aware_ce_regression`: similar to `regression` but with lead time
-    #       conditioning
-    #     `diffusion`: a diffusion UNet for residual predictions
-    #     `patched_diffusion`: a more memory-efficient diffusion model
-    #     `lt_aware_patched_diffusion`: similar to `patched_diffusion` but
-    #       with lead time conditioning
-
+    # - model: diffusion
     - model_size: mini
-    # The model size configuration.
-    # Accepted values:
-    #     `normal`: normal model size
-    #     `mini`: smaller model size for fast experiments
 
-    - training: ${model}
-    # The base training parameters. Determined by the model type.
+    
+    # The base generation parameters.
+    - generation: non_patched
+        # Accepted values:
+    #     `patched`: base parameters for a patch-based model
+    #     `non_patched`: base parameters for a non-patched model
+
 
 
 # Dataset parameters. Used for `custom` dataset type.
@@ -66,7 +57,7 @@ dataset:
     gcm: CNRM-CM6-1
     task: pseudo-reality
     standardize: true
-    stage: 'train'
+    stage: 'val'
     
     # CordexBench predictor variables - actual variables from the dataset
     input_variables: ["u_850", "u_700", "u_500", "v_850", "v_700", "v_500",
@@ -75,27 +66,42 @@ dataset:
     output_variables: ['pr', 'tasmax']
     invariant_variables: ['Orog']
 
-validation:
-    stage: 'val'
-    # CordexBench uses predefined train/val splits based on years
-    # Train: 1961-1978, Val: 1979-1980
-    # No need to specify years as they are handled internally
 
-# Training parameters
-training:
-    hp:
-        training_duration: 2000000
-        batch_size_per_gpu: 128
-        # Training duration based on the number of processed samples
+# Generation parameters to specialize
+generation:
+    hr_mean_conditioning: false
+    num_ensembles: 10
+    # int, number of ensembles to generate per input
+    seed_batch_size: 10
+    # int, size of the batched inference
+    times_range: ["1979-01-01T00:00:00", "1981-01-23T23:59:59", 3]
+    # inference_mode: regression
+    # times_range: ["2004-01-01T00:00:00", "2005-12-31T23:59:59", 3]
+    # times_range: ["2041-01-01T00:00:00", "2100-12-31T23:59:59", 3]
+    # List[str] and interval in h, time range in ISO 8601 format. Replace with desired time range.
+    # times: None
+    # List[str], time stamps in ISO 8601 format. Replace and list desired target
+    # time stamps.
     io:
-        print_progress_freq: 10000
-        checkpoint_dir: /checkpoints/cordex_bench_alps2
-        save_n_recent_checkpoints: 5
+        res_ckpt_filename: /checkpoints/cordex_bench_alps2/checkpoints_diffusion/EDMPrecondSuperResolution.0.665088.mdlus
+        #res_ckpt_filename: /checkpoints/norway_large/checkpoints_diffusion/EDMPrecondSuperResolution.0.10000128.mdlus
+        #/checkpoints/norway_run2/checkpoints_diffusion/EDMPrecondSuperResolution.0.8000040.mdlus
+        # Path to checkpoint file for the diffusion model
+        reg_ckpt_filename:  /checkpoints/cordex_bench_alps2/checkpoints_regression/UNet.0.675072.mdlus
+        #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus
+        
+
+
+        # Path to checkpoint filename for the mean predictor model
+        output_filename: /checkpoints/cordex_corrdiff_output.nc
+
+    perf:
+        io_syncronous: false
+
 
 # Parameters for wandb logging
 wandb:
-    mode: online
-    # Configure whether to use wandb: "offline", "online", "disabled"
+    mode: offline
     results_dir: "./wandb"
     # Directory to store wandb results
     watch_model: false

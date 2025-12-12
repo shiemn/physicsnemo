@@ -46,6 +46,7 @@ defaults:
     #       with lead time conditioning
 
     - model_size: normal
+    
     # The model size configuration.
     # Accepted values:
     #     `normal`: normal model size
@@ -54,6 +55,9 @@ defaults:
     - training: ${model}
     # The base training parameters. Determined by the model type.
 
+model:
+    model_args:
+        attn_resolutions: [16]
 
 # Dataset parameters. Used for `custom` dataset type.
 # Modify or add below parameters that should be passed as argument to the
@@ -83,14 +87,14 @@ validation:
 # Training parameters
 training:
     hp:
-        training_duration: 10000000 #1000000
+        training_duration: 1000000 #1000000
         batch_size_per_gpu: 4
         # Training duration based on the number of processed samples
     io:
-        print_progress_freq: 100000
-        save_checkpoint_freq: 50000
-        checkpoint_dir: /checkpoints/norway_whole_large2
-        save_n_recent_checkpoints: 5
+        print_progress_freq: 10000
+        save_checkpoint_freq: 100000
+        checkpoint_dir: /checkpoints/norway_WL_28-11
+        save_n_recent_checkpoints: 10
         validation_freq: 100000
 
 # Parameters for wandb logging

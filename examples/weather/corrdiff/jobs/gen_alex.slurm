@@ -1,6 +1,5 @@
 #!/bin/bash -l
 #SBATCH -J CorrDiff
-#SBATCH --ntasks=1
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:100:1
 #SBATCH --partition=a100
@@ -28,5 +27,6 @@ echo ${CUDA_VISIBLE_DEVICES}
 export HYDRA_FULL_ERROR=1
 srun apptainer run --nv --bind /anvme/workspace/b214cb13-ecodata/downscaling/:/data/ \
                         --bind $WORK/checkpoints:/checkpoints/ \
-                        $WORK/own_corrdiff.sif python -u $HOME/bjerknes/corrdiff/generate.py --config-name $1 \
+                        --bind $WORK/outputs/norway:/outputs/ \
+                        $WORK/new_corrdiff.sif python -u $HOME/bjerknes/corrdiff/generate.py --config-name $1 \
 

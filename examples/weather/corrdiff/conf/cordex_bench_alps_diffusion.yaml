@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: norway_diffusion
+          name: cordex_bench_diffusion
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -26,7 +26,7 @@ hydra:
 # Base parameters for dataset, model, training, and validation
 defaults:
 
-    - dataset: custom 
+    - dataset: custom
     # The dataset type for training.
     # Accepted values:
     #   `gefs_hrrr`: full GEFS-HRRR dataset for continental US.
@@ -45,7 +45,7 @@ defaults:
     #     `lt_aware_patched_diffusion`: similar to `patched_diffusion` but
     #       with lead time conditioning
 
-    - model_size: normal
+    - model_size: mini
     # The model size configuration.
     # Accepted values:
     #     `normal`: normal model size
@@ -54,49 +54,52 @@ defaults:
     - training: ${model}
     # The base training parameters. Determined by the model type.
 
-model:
-    model_args:
-        attn_resolutions: [16]
 
 # Dataset parameters. Used for `custom` dataset type.
 # Modify or add below parameters that should be passed as argument to the
 # user-defined dataset class.
 dataset:
-    type: norway #datasets/norway.py::NorwayDatasetH5
-    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
-    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
-    invariant_variables_path: /data/Norway/HCLIM3/
+    type: cordex_bench # datasets/benchmark_dataset.py::CordexBenchDataset
+    data_path: /data/CordexBench/ALPS_domain
+    domain: ALPS
+    evaluation_type: PP
+    gcm: CNRM-CM6-1
+    task: pseudo-reality
+    standardize: true
+    stage: 'train'
     
-    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
-        
-    # data_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
-    # stats_path: /Users/simon/Datasets/Norway/HCLIM3/preprocessed/NorCP_AROME_EC-EARTH
-    # invariant_variables_path: /Users/simon/Datasets/Norway/
-    
-    # Path to json stats file
-    output_variables: ['precipitation']
-    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
-    invariant_variables: ["elevation"]
-    bounds: large
+    # CordexBench predictor variables - actual variables from the dataset
+    input_variables: ["u_850", "u_700", "u_500", "v_850", "v_700", "v_500",
+                      "q_850", "q_700", "q_500", "t_850", "t_700", "t_500",
+                      "z_850", "z_700", "z_500"]
+    output_variables: ['pr', 'tasmax']
+    invariant_variables: ['Orog']
 
 validation:
-    years: [2003, 2004]
-    # List[int], years to use for validation. Replace with desired years.
+    stage: 'val'
+    # CordexBench uses predefined train/val splits based on years
+    # Train: 1961-1978, Val: 1979-1980
+    # No need to specify years as they are handled internally
+
+model:
+    hr_mean_conditioning: false
+  # High-res mean (regression's output) as additional condition
 
 # Training parameters
 training:
     hp:
-        training_duration: 2000000
-        batch_size_per_gpu: 4
+        training_duration: 8000000
+        batch_size_per_gpu: 64
         # Training duration based on the number of processed samples
     io:
-        print_progress_freq: 100000
-        regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
+        print_progress_freq: 10000
         # Path to load the regression checkpoint
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
-        save_checkpoint_freq: 50000
+        regression_checkpoint_path: /checkpoints/cordex_bench_alps2/checkpoints_regression/UNet.0.675072.mdlus
+        checkpoint_dir: /checkpoints/cordex_bench_alps2/
         save_n_recent_checkpoints: 5
-        # Set to a positive integer to only keep the most recent n checkpoints
+
+perf:
+    dataloader_workers: 16
 
 # Parameters for wandb logging
 wandb:

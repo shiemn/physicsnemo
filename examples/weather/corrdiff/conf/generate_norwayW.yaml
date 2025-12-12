@@ -56,34 +56,34 @@ dataset:
     invariant_variables: ["elevation"]
     bounds: large
     years: [2004, 2005] #[2041, 2042, 2099, 2100] # 
-    
+
 
 
 # Generation parameters to specialize
 generation:
-    num_ensembles: 3
+    num_ensembles: 10
     # int, number of ensembles to generate per input
-    seed_batch_size: 3
+    seed_batch_size: 10
     # int, size of the batched inference
     #times_range: ["2004-01-01T00:00:00", "2004-01-10T23:59:59", 3]
-    times_range: ["2004-01-01T00:00:00", "2004-12-31T23:59:59", 3]
+    times_range: ["2005-01-01T00:00:00", "2005-12-31T23:59:59", 3]
     # times_range: ["2041-01-01T00:00:00", "2100-12-31T23:59:59", 3]
     # List[str] and interval in h, time range in ISO 8601 format. Replace with desired time range.
     # times: None
     # List[str], time stamps in ISO 8601 format. Replace and list desired target
     # time stamps.
     io:
-        res_ckpt_filename: /checkpoints/norway_whole_large2/checkpoints_diffusion/EDMPrecondSuperResolution.0.3000064.mdlus
+        res_ckpt_filename: /checkpoints/norway_WL_28-11/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000128.mdlus
         #res_ckpt_filename: /checkpoints/norway_large/checkpoints_diffusion/EDMPrecondSuperResolution.0.10000128.mdlus
         #/checkpoints/norway_run2/checkpoints_diffusion/EDMPrecondSuperResolution.0.8000040.mdlus
         # Path to checkpoint file for the diffusion model  
-        reg_ckpt_filename:  /checkpoints/norway_whole_large2/checkpoints_regression/UNet.0.5800192.mdlus
+        reg_ckpt_filename:  /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
         #/checkpoints/norway_large/checkpoints_regression/UNet.0.1000192.mdlus 
         
 
 
         # Path to checkpoint filename for the mean predictor model
-        output_filename: corrdiff_large_norwayW.nc
+        output_filename: /outputs/norway_WL_28-11_stoch.nc
 
 # Parameters for wandb logging
 wandb:
