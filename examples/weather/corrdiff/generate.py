@@ -144,7 +144,9 @@ def main(cfg: DictConfig) -> None:
 
     # Load diffusion network, move to device, change precision
     if load_net_res:
-        res_ckpt_filename = cfg.generation.io.res_ckpt_filename
+        res_ckpt_filename = getattr(cfg.generation.io, 'res_ckpt_filename', None)
+        if res_ckpt_filename is None:
+            raise ValueError("res_ckpt_filename not found in config but diffusion inference is requested")
         logger0.info(f'Loading residual network from "{res_ckpt_filename}"...')
         net_res = Module.from_checkpoint(
             to_absolute_path(res_ckpt_filename),
@@ -164,7 +166,9 @@ def main(cfg: DictConfig) -> None:
 
     # load regression network, move to device, change precision
     if load_net_reg:
-        reg_ckpt_filename = cfg.generation.io.reg_ckpt_filename
+        reg_ckpt_filename = getattr(cfg.generation.io, 'reg_ckpt_filename', None)
+        if reg_ckpt_filename is None:
+            raise ValueError("reg_ckpt_filename not found in config but regression inference is requested")
         logger0.info(f'Loading network from "{reg_ckpt_filename}"...')
         net_reg = Module.from_checkpoint(
             to_absolute_path(reg_ckpt_filename),
@@ -343,6 +347,23 @@ def main(cfg: DictConfig) -> None:
         f = nc.Dataset(output_path, "w")
         # add attributes
         f.cfg = str(cfg)
+        
+        # Add checkpoint metadata
+        import datetime
+        f.generation_timestamp = datetime.datetime.now().isoformat()
+        f.inference_mode = cfg.generation.inference_mode
+        
+        if load_net_reg:
+            reg_ckpt = getattr(cfg.generation.io, 'reg_ckpt_filename', 'unknown')
+            f.regression_checkpoint = str(reg_ckpt)
+        else:
+            f.regression_checkpoint = "not_used"
+            
+        if load_net_res:
+            res_ckpt = getattr(cfg.generation.io, 'res_ckpt_filename', 'unknown')
+            f.residual_checkpoint = str(res_ckpt)
+        else:
+            f.residual_checkpoint = "not_used"
 
     torch_cuda_profiler = (
         torch.cuda.profiler.profile()
