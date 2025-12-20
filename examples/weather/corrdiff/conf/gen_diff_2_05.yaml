@@ -17,24 +17,19 @@
 hydra:
     job:
           chdir: false
-          name: norway_diffusion
+          name: gen_diff_2_05
     run:
-          dir: ./output/${hydra:job.name}
+          dir: ./outputs/${hydra:job.name}
     searchpath:
           - pkg://conf/base # Do not modify
 
-
+# Base parameters for dataset, model, and generation
 defaults:
 
-    - dataset: custom 
-    - model: diffusion
-    - model_size: normal
-    - training: ${model}
+    - dataset: custom
+    - generation: non_patched
 
 
-model:
-    model_args:
-        attn_resolutions: [16]
 
 dataset:
     type: norway #datasets/norway.py::NorwayDatasetH5
@@ -42,34 +37,30 @@ dataset:
     stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
     invariant_variables_path: /data/Norway/HCLIM3/
     
-    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+    # Path to json stats file
     output_variables: ['precipitation']
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
     bounds: large
-
-validation:
-    years: [2003, 2004]
+    years: [2004, 2005]
 
 
-# Training parameters
-training:
-    hp:
-        training_duration: 2000000
-        batch_size_per_gpu: 4
 
+# Generation parameters to specialize
+generation:
+    num_ensembles: 10
+    # int, number of ensembles to generate per input
+    seed_batch_size: 10
+    # int, size of the batched inference
+    times_range: ["2005-01-01T00:00:00", "2005-12-31T23:59:59", 3]
     io:
-        print_progress_freq: 100000
-        regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
-
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
-        save_checkpoint_freq: 50000
-        save_n_recent_checkpoints: 5
+        res_ckpt_filename: /checkpoints/tr_diff_02/checkpoints_diffusion/EDMPrecondSuperResolution.0.500224.mdlus
+        reg_ckpt_filename:  /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.200192.mdlus
+        output_filename: /outputs/gen_diff_2_05.nc
 
 # Parameters for wandb logging
 wandb:
     mode: online
-    # Configure whether to use wandb: "offline", "online", "disabled"
     results_dir: "./wandb"
     # Directory to store wandb results
     watch_model: false

@@ -17,7 +17,7 @@
 hydra:
     job:
           chdir: false
-          name: norway_diffusion
+          name: tr_diff_10
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -43,6 +43,8 @@ dataset:
     invariant_variables_path: /data/Norway/HCLIM3/
     
     years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+        
+    # Path to json stats file
     output_variables: ['precipitation']
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
@@ -60,11 +62,12 @@ training:
 
     io:
         print_progress_freq: 100000
-        regression_checkpoint_path: /checkpoints/norway_WL_new/checkpoints_regression/UNet.0.5000192.mdlus
+        regression_checkpoint_path: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.1000192.mdlus
 
-        checkpoint_dir: /checkpoints/norway_WL_28-11/checkpoints_regression/UNet.0.500224.mdlus
-        save_checkpoint_freq: 50000
-        save_n_recent_checkpoints: 5
+        checkpoint_dir: /checkpoints/tr_diff_10
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: 20
+
 
 # Parameters for wandb logging
 wandb:

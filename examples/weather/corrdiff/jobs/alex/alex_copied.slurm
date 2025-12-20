@@ -21,7 +21,7 @@ export APPTAINERENV_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 echo ${CUDA_VISIBLE_DEVICES}
 
 
-bash $HOME/bjerknes/corrdiff/jobs/copy_norway_data.sh
+bash $HOME/bjerknes/corrdiff/jobs/alex/copy_norway_data.sh
 
 
 export HYDRA_FULL_ERROR=1

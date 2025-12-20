@@ -22,7 +22,7 @@ export APPTAINERENV_OMP_NUM_THREADS=16
 echo ${CUDA_VISIBLE_DEVICES}
 
 
-bash $HOME/bjerknes/corrdiff/jobs/copy_norway_data.sh
+bash $HOME/bjerknes/corrdiff/jobs/alex/copy_norway_data.sh
 
 
 
