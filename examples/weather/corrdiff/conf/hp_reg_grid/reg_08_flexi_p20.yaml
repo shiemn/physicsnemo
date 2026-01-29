@@ -1,0 +1,26 @@
+# @package _global_
+# Regression HP Grid - Config 08: FlexiLoss p=2.0 (L2-like)
+# lr=1e-4, batch=256, lr_decay=1.0, FlexiLoss p=2.0, attn=[16]
+
+defaults:
+  - /hp_base_trainreg
+  - _self_
+
+hydra:
+  job:
+    name: reg_08_flexi_p175
+
+training:
+  hp:
+    lr: 1.0e-4
+    total_batch_size: 256
+    lr_decay: 1.0
+    loss_function: flexiloss
+    flexi_loss_p: [1.75]
+    flexi_loss_d: [1]
+  io:
+    checkpoint_dir: /checkpoints/hp_reg_grid/reg_08_flexi_p20
+
+model:
+  model_args:
+    attn_resolutions: [16]

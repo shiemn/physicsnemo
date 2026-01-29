@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# HP Search generated outputs
+hp_search/visualizations/
+hp_search/slurm/logs/
+hp_search/archive/
+
+# Optuna databases (local testing)
+*.db
+
+# Notebooks outputs
+notebooks/
+
+# Multi-checkpoint tools (user-specific checkpoint lists)
+multi_checkpoint_tools/

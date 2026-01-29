@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+ 
+# Base parameters for dataset, model, training, and validation - all inlined
+ 
+# Model settings (from conf/model/regression.yaml)
+model:
+    # Regression model name
+    name: regression
+    hr_mean_conditioning: false
+    model_args:
+        "N_grid_channels": 4
+        "embedding_type": "zero"
+        # Inlined from model_size/normal.yaml to avoid defaults
+        model_channels: 128
+        channel_mult: [1, 2, 2, 2, 2]
+        attn_resolutions: [16]  # Overridden from normal's [28]
+ 
+# Dataset parameters (from conf/dataset/custom.yaml)
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    output_variables: ['precipitation']
+    invariant_variables: ["elevation"]
+    bounds: large
+    invariant_variables_path: /data/Norway/HCLIM3/
+    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+
+# Validation settings
+validation:
+    years: [2003, 2004]
+
+# Training parameters (from conf/training/regression.yaml -> conf/training/base_all.yaml)
+training:
+    # Hyperparameters
+    hp:
+        training_duration: 2000000
+        total_batch_size: 256
+        batch_size_per_gpu: 4
+        lr: 0.0001
+        grad_clip_threshold: null
+        lr_decay: 1.0
+        lr_rampup: 0
+        lr_decay_rate: 500000.0
+    # Performance
+    perf:
+        fp_optimizations: amp-bf16
+        dataloader_workers: 4
+        songunet_checkpoint_level: 0
+    # IO
+    io:
+        regression_checkpoint_path: null
+        print_progress_freq: 10000
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: 0
+        validation_freq: 100000
+        validation_steps: 10
+
+# Parameters for wandb logging
+wandb:
+    mode: online
+    results_dir: "./wandb"
+    watch_model: false

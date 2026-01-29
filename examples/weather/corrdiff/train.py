@@ -16,9 +16,34 @@
 
 import os
 import time
+import signal
 from contextlib import nullcontext
 
 import psutil
+
+# Global flag for SLURM timeout signal handling
+_TIMEOUT_SIGNAL_RECEIVED = False
+
+
+def _handle_timeout_signal(signum, frame):
+    """Handle SLURM timeout signal (SIGUSR1) for graceful shutdown."""
+    global _TIMEOUT_SIGNAL_RECEIVED
+    _TIMEOUT_SIGNAL_RECEIVED = True
+    print(f"\n[SIGNAL] Received timeout signal ({signum}). Will save checkpoint and exit gracefully.", flush=True)
+
+
+def _check_timeout_signal_file():
+    """Check if the timeout signal file exists (created by bash script on SIGUSR1)."""
+    global _TIMEOUT_SIGNAL_RECEIVED
+    if _TIMEOUT_SIGNAL_RECEIVED:
+        return True  # Already received
+    signal_file = os.environ.get('TIMEOUT_SIGNAL_FILE')
+    if signal_file and os.path.exists(signal_file):
+        _TIMEOUT_SIGNAL_RECEIVED = True
+        print(f"\n[SIGNAL] Detected timeout signal file: {signal_file}. Will save checkpoint and exit gracefully.", flush=True)
+        return True
+    return False
+
 import hydra
 from hydra.utils import to_absolute_path
 from hydra.core.hydra_config import HydraConfig
@@ -57,6 +82,7 @@ from helpers.train_helpers import (
 )
 
 from helpers.custom_losses import IntensityResidualLoss
+from helpers.custom_tweedie_losses import FlexiLoss
 
 torch._dynamo.reset()
 # Increase the cache size limit
@@ -68,6 +94,8 @@ torch._logging.set_logs(recompiles=True, graph_breaks=True)
 
 def checkpoint_list(path, suffix=".mdlus"):
     """Helper function to return sorted list, in ascending order, of checkpoints in a path"""
+    if not os.path.exists(path):
+        return []
     checkpoints = []
     for file in os.listdir(path):
         if file.endswith(suffix):
@@ -115,6 +143,12 @@ def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
     dist = DistributedManager()
 
+    # Register signal handler for SLURM timeout (SIGUSR1)
+    # This allows graceful checkpoint saving before job termination
+    signal.signal(signal.SIGUSR1, _handle_timeout_signal)
+    # Also catch SIGTERM which may be sent by job schedulers
+    signal.signal(signal.SIGTERM, _handle_timeout_signal)
+
     # Initialize loggers
     if dist.rank == 0:
         writer = SummaryWriter(log_dir="tensorboard")
@@ -131,6 +165,13 @@ def main(cfg: DictConfig) -> None:
 
     logger = PythonLogger("main")  # General python logger
     logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available(): 
+        device = "mps"
+    else: 
+        device = "cpu"
     
     # Resolve and parse configs
     OmegaConf.resolve(cfg)
@@ -230,9 +271,10 @@ def main(cfg: DictConfig) -> None:
                 f"This is an experimental feature and APIs may change without notice."
             )
 
-    # Parse P_mean and P_std
+    # Parse P_mean, P_std, and sigma_data
     P_mean = getattr(cfg.training.hp, "P_mean", None)
     P_std = getattr(cfg.training.hp, "P_std", None)
+    sigma_data = getattr(cfg.training.hp, "sigma_data", None)
 
     # Handle patch shape
     if cfg.model.name == "lt_aware_ce_regression":
@@ -283,8 +325,11 @@ def main(cfg: DictConfig) -> None:
         "use_fp16": fp16,
         "checkpoint_level": songunet_checkpoint_level,
     }
-    if student_t_nu is not None:
+    # Only add nu for student-t distribution (not for normal/gaussian)
+    if distribution == "student_t" and student_t_nu is not None:
         model_args["nu"] = student_t_nu
+    if sigma_data is not None:
+        model_args["sigma_data"] = sigma_data
     if cfg.model.name == "lt_aware_ce_regression":
         model_args["prob_channels"] = prob_channels
     if hasattr(cfg.model, "model_args"):  # override defaults from config file
@@ -464,12 +509,15 @@ def main(cfg: DictConfig) -> None:
         "lt_aware_patched_diffusion",
     ):
         loss_init_kwargs = {}
-        if student_t_nu is not None:
+        # Only add nu for student-t distribution (not for normal/gaussian)
+        if distribution == "student_t" and student_t_nu is not None:
             loss_init_kwargs["nu"] = student_t_nu
         if P_mean is not None:
             loss_init_kwargs["P_mean"] = P_mean
         if P_std is not None:
             loss_init_kwargs["P_std"] = P_std
+        if sigma_data is not None:
+            loss_init_kwargs["sigma_data"] = sigma_data
         
         loss_function = cfg.model.get("hp", {}).get("loss_function", None)
         if loss_function == None:
@@ -482,13 +530,18 @@ def main(cfg: DictConfig) -> None:
             print("Using custom IntensityResidualLoss")
             loss_fn = IntensityResidualLoss(
                 regression_net=regression_net,
-                hr_mean_conditioning= cfg.model.hr_mean_conditioning,
-                average_intensity_weight=cfg.model.hp.get("average_intensity_weight", None),
-                maximum_intensity_weight=cfg.model.hp.get("maximum_intensity_weight", None),
+                hr_mean_conditioning= cfg.training.hr_mean_conditioning,
+                average_intensity_weight=cfg.training.hp.get("average_intensity_weight", None),
+                maximum_intensity_weight=cfg.training.hp.get("maximum_intensity_weight", None),
             )
         
     elif cfg.model.name == "regression" or cfg.model.name == "lt_aware_regression":
-        loss_fn = RegressionLoss()
+        loss_function = cfg.training.get("hp", {}).get("loss_function", None)
+        if loss_function == None:
+            loss_fn = RegressionLoss()
+        elif loss_function == "flexiloss":
+            print(f"Using custom FlexiLoss using {cfg.training.hp.get('flexi_loss_p', [1.6])}, {cfg.training.hp.get('flexi_loss_d', [1])}")
+            loss_fn = FlexiLoss(cfg.training.hp.get("flexi_loss_p", [1.6]), cfg.training.hp.get("flexi_loss_d", [1]))
     elif cfg.model.name == "lt_aware_ce_regression":
         loss_fn = RegressionLossCE(prob_channels=prob_channels)
 
@@ -611,7 +664,7 @@ def main(cfg: DictConfig) -> None:
                                     loss_fn_kwargs.update({"patching": patching})
                                 with nvtx.annotate(f"loss forward", color="green"):
                                     with torch.autocast(
-                                        "cuda", dtype=amp_dtype, enabled=enable_amp
+                                        device, dtype=amp_dtype, enabled=enable_amp
                                     ):
                                         loss = loss_fn(**loss_fn_kwargs)
 
@@ -688,9 +741,16 @@ def main(cfg: DictConfig) -> None:
                     cur_nimg += cfg.training.hp.total_batch_size
                     done = cur_nimg >= cfg.training.hp.training_duration
 
+                    # Check for SLURM timeout signal (via signal handler OR signal file)
+                    # The signal file is created by the bash script when it receives SIGUSR1
+                    _check_timeout_signal_file()
+                    if _TIMEOUT_SIGNAL_RECEIVED:
+                        logger0.warning(f"Timeout signal received at {cur_nimg} images. Skipping validation and saving checkpoint before exit...")
+                        done = True
+
                 with nvtx.annotate("validation", color="red"):
-                    # Validation
-                    if validation_dataset_iterator is not None:
+                    # Validation (skip if timeout signal received to save time for checkpoint)
+                    if validation_dataset_iterator is not None and not _TIMEOUT_SIGNAL_RECEIVED:
                         valid_loss_accum = 0
                         if is_time_for_periodic_task(
                             cur_nimg,
@@ -760,7 +820,7 @@ def main(cfg: DictConfig) -> None:
                                                 {"patching": patching}
                                             )
                                         with torch.autocast(
-                                            "cuda", dtype=amp_dtype, enabled=enable_amp
+                                            device, dtype=amp_dtype, enabled=enable_amp
                                         ):
                                             loss_valid = loss_fn(**loss_valid_kwargs)
 
@@ -850,8 +910,8 @@ def main(cfg: DictConfig) -> None:
                         epoch=cur_nimg,
                     )
 
-            # Retain only the recent n checkpoints, if desired
-            if cfg.training.io.save_n_recent_checkpoints > 0:
+            # Retain only the recent n checkpoints, if desired (rank 0 only)
+            if cfg.training.io.save_n_recent_checkpoints > 0 and dist.rank == 0:
                 for suffix in [".mdlus", ".pt"]:
                     ckpts = checkpoint_list(checkpoint_dir, suffix=suffix)
                     while len(ckpts) > cfg.training.io.save_n_recent_checkpoints:

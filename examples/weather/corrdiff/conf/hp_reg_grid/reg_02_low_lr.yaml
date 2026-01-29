@@ -1,0 +1,23 @@
+# @package _global_
+# Regression HP Grid - Config 02: Low learning rate
+# lr=3e-5, batch=256, lr_decay=0.99, MSE loss, attn=[16]
+
+defaults:
+  - /hp_base_trainreg
+  - _self_
+
+hydra:
+  job:
+    name: reg_02_low_lr
+
+training:
+  hp:
+    lr: 3.0e-5
+    total_batch_size: 256
+    lr_decay: 0.99
+  io:
+    checkpoint_dir: /checkpoints/hp_reg_grid/reg_02_low_lr
+
+model:
+  model_args:
+    attn_resolutions: [16]

@@ -1,0 +1,23 @@
+# @package _global_
+# Regression HP Grid - Config 09: More attention layers
+# lr=1e-4, batch=256, lr_decay=1.0, MSE loss, attn=[16,32]
+
+defaults:
+  - /hp_base_trainreg
+  - _self_
+
+hydra:
+  job:
+    name: reg_09_more_attn
+
+training:
+  hp:
+    lr: 1.0e-4
+    total_batch_size: 256
+    lr_decay: 1.0
+  io:
+    checkpoint_dir: /checkpoints/hp_reg_grid/reg_09_more_attn
+
+model:
+  model_args:
+    attn_resolutions: [16, 32]
