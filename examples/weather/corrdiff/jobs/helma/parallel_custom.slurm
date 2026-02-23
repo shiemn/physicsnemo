@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH -J CorrDiff
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --gres=gpu:h100:1
 #SBATCH --partition=h100
 #SBATCH --output=output/job-%j.out
@@ -21,11 +21,11 @@ echo ${CUDA_VISIBLE_DEVICES}
 
 
 #bash $HOME/bjerknes/corrdiff/jobs/helma/copy.sh
-
+NGPUS=$(nvidia-smi -L | wc -l)
 
 srun apptainer run --nv --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/:/data/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
-                        /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif torchrun --nproc_per_node=1  $HOME/bjerknes/corrdiff/generate.py --config-name $1 
+                        /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif torchrun --nproc_per_node=$NGPUS $1 --config-name $2 
                         
 

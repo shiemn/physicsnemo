@@ -3,6 +3,7 @@
 #SBATCH -c 16
 #SBATCH -p h100
 #SBATCH --gres=gpu:4
+#SBATCH --qos=normal
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=simon.hentschel@uni-wuerzburg.de
 #SBATCH --output=output/job-%j.out
@@ -46,7 +47,7 @@ echo "Copying data to scratch took $(awk "BEGIN {print ${end} - ${start}}") seco
 echo "Copying data to scratch complete"
 
 
-srun apptainer run --nv --bind /tmp/:/data --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ ~/new_corrdiff.sif torchrun --nproc_per_node=4  ~/bjerknes/corrdiff/train.py --config-name $1 
+srun apptainer run --nv --bind /tmp/:/data --bind ~/bjerknes/corrdiff/checkpoints:/checkpoints/ ~/corrdiff_ngc.sif torchrun --nproc_per_node=4  ~/bjerknes/corrdiff/train.py --config-name $1 
 
 
 

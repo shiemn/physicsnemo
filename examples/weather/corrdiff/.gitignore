@@ -15,3 +15,12 @@ notebooks/
 
 # Multi-checkpoint tools (user-specific checkpoint lists)
 multi_checkpoint_tools/
+
+# Coding Tools
+.vscode/
+.idea/
+.claude/
+
+
+# MacOs specific
+.DS_Store
