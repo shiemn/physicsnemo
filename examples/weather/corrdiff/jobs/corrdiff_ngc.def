@@ -1,0 +1,35 @@
+BootStrap: docker
+From: nvcr.io/nvidia/pytorch:25.01-py3
+
+%post
+   export DEBIAN_FRONTEND=noninteractive
+
+   apt-get update && apt-get install -y \
+      libgeos++ \
+      libproj-dev \
+      libnetcdf-dev \
+      libhdf5-dev \
+      netcdf-bin \
+      libx11-6 \
+      libxext6 \
+      libglvnd-dev \
+      cdo \
+      pandoc \
+      valgrind \
+      && rm -rf /var/lib/apt/lists/*
+
+   pip install --upgrade pip
+   apt-get remove -y python3-opencv libopencv-* 2>/dev/null || true
+   rm -rf /usr/local/lib/python3.12/dist-packages/cv2* 2>/dev/null || true
+   git clone https://github.com/NVIDIA/physicsnemo.git
+   cd physicsnemo
+   git checkout v1.3.0
+   cd ..
+   pip install ./physicsnemo
+
+   pip install "numpy>=1.26.0,<2" netCDF4==1.6.5 hydra-core>=1.2.0 omegaconf>=2.3.0 wandb>=0.13.7 nvtx>=0.2.8 dask>=2025.3.0 xskillscore>=0.0.26 cftime>=1.6.2 numba>=0.61.0 scipy>=1.12.0 typer>=0.16.0 termcolor>=2.1.1 jsonargparse[signatures] lightning matplotlib xarray plotly geopandas cartopy h5py basicsr einops diffusers cdo optuna optuna-integration[wandb]
+   pip uninstall -y opencv-python opencv-python-headless opencv-contrib-python 2>/dev/null || true
+   pip install --force-reinstall --no-deps opencv-python==4.13.0.90
+
+%labels
+   Author SimonH
