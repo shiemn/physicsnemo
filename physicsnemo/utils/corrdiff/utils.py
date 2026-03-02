@@ -239,10 +239,20 @@ class NetCDFWriter:
     """NetCDF Writer"""
 
     def __init__(
-        self, f, lat, lon, input_channels, output_channels, has_lead_time=False
+        self,
+        f,
+        lat,
+        lon,
+        input_channels,
+        output_channels,
+        has_lead_time=False,
+        save_uncertainty=False,
+        uncertainty_group_name="predicted_std",
     ):
         self._f = f
         self.has_lead_time = has_lead_time
+        self.save_uncertainty = save_uncertainty
+        self.uncertainty_group_name = uncertainty_group_name
         # create unlimited dimensions
         f.createDimension("time")
         f.createDimension("ensemble")
@@ -277,6 +287,9 @@ class NetCDFWriter:
         self.truth_group = f.createGroup("truth")
         self.prediction_group = f.createGroup("prediction")
         self.input_group = f.createGroup("input")
+        self.uncertainty_group = (
+            f.createGroup(uncertainty_group_name) if save_uncertainty else None
+        )
 
         for variable in output_channels:
             name = variable.name + variable.level
@@ -284,6 +297,10 @@ class NetCDFWriter:
             self.prediction_group.createVariable(
                 name, "f", dimensions=("ensemble", "time", "y", "x")
             )
+            if self.uncertainty_group is not None:
+                self.uncertainty_group.createVariable(
+                    name, "f", dimensions=("time", "y", "x")
+                )
 
         # setup input data in netCDF
 
@@ -302,6 +319,12 @@ class NetCDFWriter:
     def write_prediction(self, channel_name, time_index, ensemble_index, val):
         """Write prediction data to NetCDF file."""
         self.prediction_group[channel_name][ensemble_index, time_index] = val
+
+    def write_uncertainty(self, channel_name, time_index, val):
+        """Write predicted uncertainty data to NetCDF file."""
+        if self.uncertainty_group is None:
+            return
+        self.uncertainty_group[channel_name][time_index] = val
 
     def write_time(self, time_index, time):
         """Write time information to NetCDF file."""

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from functools import partial
 
@@ -34,13 +35,15 @@ from physicsnemo.experimental.models.diffusion.preconditioning import (
 )
 from physicsnemo.utils.patching import GridPatching2D
 from physicsnemo import Module
-from physicsnemo.utils.diffusion import deterministic_sampler, stochastic_sampler
+from physicsnemo.utils.diffusion import deterministic_sampler
+from helpers.stochastic_sampler import stochastic_sampler
 from physicsnemo.utils.corrdiff import (
     NetCDFWriter,
     get_time_from_range,
     regression_step,
     diffusion_step,
 )
+from helpers.stochastic_sampler import uncertainty_aware_stochastic_sampler
 
 from helpers.generate_helpers import (
     get_dataset_and_sampler,
@@ -48,6 +51,17 @@ from helpers.generate_helpers import (
 )
 from helpers.train_helpers import set_patch_shape
 from datasets.dataset import register_dataset
+
+
+def _unwrap_compiled_model(model: torch.nn.Module | None) -> torch.nn.Module | None:
+    if model is None:
+        return None
+    return getattr(model, "_orig_mod", model)
+
+
+def _has_variance_head(model: torch.nn.Module | None) -> bool:
+    unwrapped_model = _unwrap_compiled_model(model)
+    return unwrapped_model is not None and hasattr(unwrapped_model, "variance_head")
 
 
 @hydra.main(version_base="1.2", config_path="conf", config_name="config_generate")
@@ -206,11 +220,21 @@ def main(cfg: DictConfig) -> None:
         )
     elif cfg.sampler.type == "stochastic":
         sampler_fn = partial(
-            stochastic_sampler, 
+            stochastic_sampler,
             patching=patching,
             S_churn=cfg.sampler.get("S_churn", 0),
             S_min=cfg.sampler.get("S_min", 0),
             S_max=cfg.sampler.get("S_max", float("inf")),
+        )
+    elif cfg.sampler.type == "uncertainty_aware":
+        sampler_fn = partial(
+            uncertainty_aware_stochastic_sampler,
+            patching=patching,
+            S_churn=cfg.sampler.get("S_churn", 0),
+            S_min=cfg.sampler.get("S_min", 0),
+            S_max=cfg.sampler.get("S_max", float("inf")),
+            use_predicted_uncertainty=cfg.sampler.get("use_predicted_uncertainty", True),
+            uncertainty_scale=cfg.sampler.get("uncertainty_scale", 1.0),
         )
     else:
         raise ValueError(f"Unknown sampling method {cfg.sampling.type}")
@@ -250,6 +274,122 @@ def main(cfg: DictConfig) -> None:
     P_mean = getattr(cfg.generation, "P_mean", None)
     P_std = getattr(cfg.generation, "P_std", None)
 
+    save_predicted_uncertainty = getattr(
+        cfg.generation, "save_predicted_uncertainty", False
+    )
+    uncertainty_output_name = getattr(
+        cfg.generation, "uncertainty_output_name", "predicted_std"
+    )
+    uncertainty_sigma_probe = getattr(
+        cfg.generation, "uncertainty_sigma_probe", 0.01
+    )
+    heteroscedastic_mode_cfg = getattr(
+        cfg.generation, "use_heteroscedastic_model", "auto"
+    )
+    detected_heteroscedastic = _has_variance_head(net_res)
+
+    if isinstance(heteroscedastic_mode_cfg, str):
+        heteroscedastic_mode = heteroscedastic_mode_cfg.lower()
+        if heteroscedastic_mode not in {"auto", "true", "false"}:
+            raise ValueError(
+                "generation.use_heteroscedastic_model must be one of: "
+                "auto, true, false"
+            )
+        if heteroscedastic_mode == "auto":
+            use_heteroscedastic_model = detected_heteroscedastic
+        else:
+            use_heteroscedastic_model = heteroscedastic_mode == "true"
+    else:
+        use_heteroscedastic_model = bool(heteroscedastic_mode_cfg)
+
+    if load_net_res:
+        logger0.info(
+            "Heteroscedastic residual model detected: "
+            f"{detected_heteroscedastic}"
+        )
+    if use_heteroscedastic_model and not detected_heteroscedastic:
+        logger0.warning(
+            "generation.use_heteroscedastic_model is enabled but residual model "
+            "has no variance head. Falling back to standard diffusion outputs."
+        )
+
+    can_save_predicted_uncertainty = (
+        save_predicted_uncertainty
+        and load_net_res
+        and use_heteroscedastic_model
+        and detected_heteroscedastic
+        and cfg.generation.inference_mode in ["diffusion", "all"]
+    )
+    if save_predicted_uncertainty and not can_save_predicted_uncertainty:
+        logger0.warning(
+            "Requested save_predicted_uncertainty=true, but uncertainty output is "
+            "disabled for this run (missing heteroscedastic diffusion model or mode)."
+        )
+
+    def predict_uncertainty_map(image_lr, mean_hr=None, lead_time_label=None):
+        """Predict per-channel uncertainty map for one timestep."""
+        if not can_save_predicted_uncertainty:
+            return None
+
+        if net_res is None:
+            return None
+
+        x_lr = image_lr.to(memory_format=torch.channels_last)
+        if mean_hr is not None:
+            x_lr = torch.cat((mean_hr.expand(x_lr.shape[0], -1, -1, -1), x_lr), dim=1)
+
+        if patching:
+            x_lr_net = patching.apply(input=x_lr, additional_input=image_lr)
+
+            def patch_embedding_selector(emb):
+                return patching.apply(emb.expand(image_lr.shape[0], -1, -1, -1))
+
+        else:
+            x_lr_net = x_lr
+            patch_embedding_selector = None
+
+        optional_args = {}
+        if lead_time_label is not None:
+            optional_args["lead_time_label"] = lead_time_label
+
+        x_probe = torch.randn(
+            1,
+            img_out_channels,
+            img_shape[0],
+            img_shape[1],
+            device=device,
+            dtype=torch.float32,
+        ).to(memory_format=torch.channels_last)
+        if patching:
+            x_probe_net = patching.apply(input=x_probe)
+        else:
+            x_probe_net = x_probe
+
+        sigma_probe = torch.tensor([uncertainty_sigma_probe], device=device)
+        with torch.inference_mode():
+            net_output = net_res(
+                x_probe_net,
+                x_lr_net,
+                sigma_probe,
+                embedding_selector=patch_embedding_selector,
+                return_variance=True,
+                **optional_args,
+            )
+
+        if not isinstance(net_output, tuple):
+            logger0.warning(
+                "Residual model did not return variance tensor with "
+                "return_variance=True. Writing zeros for uncertainty."
+            )
+            return np.zeros(
+                (img_out_channels, img_shape[0], img_shape[1]), dtype=np.float32
+            )
+
+        _, d_std = net_output
+        if patching:
+            d_std = patching.fuse(input=d_std, batch_size=1)
+        return d_std[0].detach().cpu().numpy()
+
     # Main generation definition
     def generate_fn():
         with nvtx.annotate("generate_fn", color="green"):
@@ -280,7 +420,7 @@ def main(cfg: DictConfig) -> None:
                         lead_time_label=lead_time_label,
                     )
             if net_res:
-                if cfg.generation.hr_mean_conditioning:
+                if cfg.generation.hr_mean_conditioning and net_reg:
                     mean_hr = image_reg[0:1]
                 else:
                     mean_hr = None
@@ -382,14 +522,19 @@ def main(cfg: DictConfig) -> None:
             )
             time_index = -1
             if dist.rank == 0:
-                writer = NetCDFWriter(
-                    f,
-                    lat=dataset.latitude(),
-                    lon=dataset.longitude(),
-                    input_channels=dataset.input_channels(),
-                    output_channels=dataset.output_channels(),
-                    has_lead_time=has_lead_time,
-                )
+                writer_kwargs = {
+                    "lat": dataset.latitude(),
+                    "lon": dataset.longitude(),
+                    "input_channels": dataset.input_channels(),
+                    "output_channels": dataset.output_channels(),
+                    "has_lead_time": has_lead_time,
+                }
+                writer_signature = inspect.signature(NetCDFWriter.__init__)
+                if "save_uncertainty" in writer_signature.parameters:
+                    writer_kwargs["save_uncertainty"] = can_save_predicted_uncertainty
+                if "uncertainty_group_name" in writer_signature.parameters:
+                    writer_kwargs["uncertainty_group_name"] = uncertainty_output_name
+                writer = NetCDFWriter(f, **writer_kwargs)
 
                 if cfg.generation.perf.io_syncronous:
                     writer_executor = ThreadPoolExecutor(
@@ -441,6 +586,27 @@ def main(cfg: DictConfig) -> None:
                 image_tar = image_tar.to(device=device).to(torch.float32)
                 image_out = generate_fn()
                 if dist.rank == 0:
+                    predicted_uncertainty = None
+                    if can_save_predicted_uncertainty:
+                        mean_hr = None
+                        if cfg.generation.hr_mean_conditioning and net_reg:
+                            mean_hr = regression_step(
+                                net=net_reg,
+                                img_lr=image_lr,
+                                latents_shape=(
+                                    1,
+                                    img_out_channels,
+                                    img_shape[0],
+                                    img_shape[1],
+                                ),
+                                lead_time_label=lead_time_label,
+                            )[0:1]
+                        predicted_uncertainty = predict_uncertainty_map(
+                            image_lr=image_lr,
+                            mean_hr=mean_hr,
+                            lead_time_label=lead_time_label,
+                        )
+
                     batch_size = image_out.shape[0]
                     if cfg.generation.perf.io_syncronous:
                         # write out data in a seperate thread so we don't hold up inferencing
@@ -456,6 +622,7 @@ def main(cfg: DictConfig) -> None:
                                 time_index,
                                 index,
                                 has_lead_time,
+                                predicted_uncertainty,
                             )
                         )
                     else:
@@ -469,6 +636,7 @@ def main(cfg: DictConfig) -> None:
                             time_index,
                             index,
                             has_lead_time,
+                            predicted_uncertainty,
                         )
             end.record()
             end.synchronize()

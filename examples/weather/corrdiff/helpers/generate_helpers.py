@@ -58,6 +58,7 @@ def save_images(
     time_index,
     t_index,
     has_lead_time,
+    predicted_uncertainty=None,
 ):
     """
     Saves inferencing result along with the baseline
@@ -113,6 +114,15 @@ def save_images(
             writer.write_prediction(
                 channel_name, time_index, idx, image_out2[0, channel_idx]
             )
+
+            if (
+                predicted_uncertainty is not None
+                and idx == 0
+                and hasattr(writer, "write_uncertainty")
+            ):
+                writer.write_uncertainty(
+                    channel_name, time_index, predicted_uncertainty[channel_idx]
+                )
 
         input_channel_info = dataset.input_channels()
         for channel_idx in range(len(input_channel_info)):

@@ -51,6 +51,7 @@ Usage:
 """
 
 import contextlib
+import inspect
 import json
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -85,6 +86,30 @@ HP_EVAL_CONFIGS = [
     },
 ]
 
+# HP Eval configs for heteroscedastic models (only uncertainty-aware samplers work)
+HP_EVAL_CONFIGS_HETEROSCEDASTIC = [
+    {
+        "name": "uncert_18_churn20_scale1.0",
+        "sampler": {"type": "uncertainty_aware", "num_steps": 18, "S_churn": 20, "S_min": 0, "S_max": float("inf"), "use_predicted_uncertainty": True, "uncertainty_scale": 1.0},
+    },
+    {
+        "name": "uncert_18_churn40_scale1.0",
+        "sampler": {"type": "uncertainty_aware", "num_steps": 18, "S_churn": 40, "S_min": 0, "S_max": float("inf"), "use_predicted_uncertainty": True, "uncertainty_scale": 1.0},
+    },
+    {
+        "name": "uncert_18_churn40_scale0.5",
+        "sampler": {"type": "uncertainty_aware", "num_steps": 18, "S_churn": 40, "S_min": 0, "S_max": float("inf"), "use_predicted_uncertainty": True, "uncertainty_scale": 0.5},
+    },
+    {
+        "name": "uncert_18_churn80_scale1.0",
+        "sampler": {"type": "uncertainty_aware", "num_steps": 18, "S_churn": 80, "S_min": 0, "S_max": float("inf"), "use_predicted_uncertainty": True, "uncertainty_scale": 1.0},
+    },
+    {
+        "name": "uncert_18_churn80_scale0.5",
+        "sampler": {"type": "uncertainty_aware", "num_steps": 18, "S_churn": 80, "S_min": 0, "S_max": float("inf"), "use_predicted_uncertainty": True, "uncertainty_scale": 0.5},
+    },
+]
+
 
 def create_sampler_fn(sampler_cfg, patching):
     """Create a sampler function from config dict or OmegaConf."""
@@ -111,6 +136,23 @@ def create_sampler_fn(sampler_cfg, patching):
             S_churn=S_churn,
             S_min=S_min,
             S_max=S_max,
+        )
+    elif sampler_type == "uncertainty_aware":
+        num_steps = sampler_cfg.get("num_steps", 18) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "num_steps", 18)
+        S_churn = sampler_cfg.get("S_churn", 0) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "S_churn", 0)
+        S_min = sampler_cfg.get("S_min", 0) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "S_min", 0)
+        S_max = sampler_cfg.get("S_max", float("inf")) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "S_max", float("inf"))
+        use_predicted_uncertainty = sampler_cfg.get("use_predicted_uncertainty", True) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "use_predicted_uncertainty", True)
+        uncertainty_scale = sampler_cfg.get("uncertainty_scale", 1.0) if isinstance(sampler_cfg, dict) else getattr(sampler_cfg, "uncertainty_scale", 1.0)
+        return partial(
+            uncertainty_aware_stochastic_sampler,
+            patching=patching,
+            num_steps=num_steps,
+            S_churn=S_churn,
+            S_min=S_min,
+            S_max=S_max,
+            use_predicted_uncertainty=use_predicted_uncertainty,
+            uncertainty_scale=uncertainty_scale,
         )
     else:
         raise ValueError(f"Unknown sampling method {sampler_type}")
@@ -307,13 +349,15 @@ from physicsnemo.experimental.models.diffusion.preconditioning import (
 )
 from physicsnemo.utils.patching import GridPatching2D
 from physicsnemo import Module
-from physicsnemo.utils.diffusion import deterministic_sampler, stochastic_sampler
+from physicsnemo.utils.diffusion import deterministic_sampler
+from helpers.stochastic_sampler import stochastic_sampler
 from physicsnemo.utils.corrdiff import (
     NetCDFWriter,
     get_time_from_range,
     regression_step,
     diffusion_step,
 )
+from helpers.stochastic_sampler import uncertainty_aware_stochastic_sampler
 
 from helpers.generate_helpers import (
     get_dataset_and_sampler,
@@ -321,6 +365,17 @@ from helpers.generate_helpers import (
 )
 from helpers.train_helpers import set_patch_shape
 from datasets.dataset import register_dataset
+
+
+def _unwrap_compiled_model(model: torch.nn.Module | None) -> torch.nn.Module | None:
+    if model is None:
+        return None
+    return getattr(model, "_orig_mod", model)
+
+
+def _has_variance_head(model: torch.nn.Module | None) -> bool:
+    unwrapped_model = _unwrap_compiled_model(model)
+    return unwrapped_model is not None and hasattr(unwrapped_model, "variance_head")
 
 
 @hydra.main(version_base="1.2", config_path="conf", config_name="config_generate")
@@ -483,6 +538,59 @@ def main(cfg: DictConfig) -> None:
     P_mean = getattr(cfg.generation, "P_mean", None)
     P_std = getattr(cfg.generation, "P_std", None)
 
+    save_predicted_uncertainty = getattr(
+        cfg.generation, "save_predicted_uncertainty", False
+    )
+    uncertainty_output_name = getattr(
+        cfg.generation, "uncertainty_output_name", "predicted_std"
+    )
+    uncertainty_sigma_probe = getattr(
+        cfg.generation, "uncertainty_sigma_probe", 0.01
+    )
+    heteroscedastic_mode_cfg = getattr(
+        cfg.generation, "use_heteroscedastic_model", "auto"
+    )
+    detected_heteroscedastic = _has_variance_head(net_res)
+    if isinstance(heteroscedastic_mode_cfg, str):
+        heteroscedastic_mode = heteroscedastic_mode_cfg.lower()
+        if heteroscedastic_mode not in {"auto", "true", "false"}:
+            raise ValueError(
+                "generation.use_heteroscedastic_model must be one of: "
+                "auto, true, false"
+            )
+        if heteroscedastic_mode == "auto":
+            use_heteroscedastic_model = detected_heteroscedastic
+        else:
+            use_heteroscedastic_model = heteroscedastic_mode == "true"
+    else:
+        use_heteroscedastic_model = bool(heteroscedastic_mode_cfg)
+
+    if load_net_res:
+        logger0.info(
+            "Heteroscedastic residual model detected: "
+            f"{detected_heteroscedastic}"
+        )
+    if use_heteroscedastic_model and not detected_heteroscedastic:
+        logger0.warning(
+            "generation.use_heteroscedastic_model is enabled but residual model "
+            "has no variance head. Falling back to standard diffusion outputs."
+        )
+
+    can_save_predicted_uncertainty = (
+        save_predicted_uncertainty
+        and (not skip_netcdf)
+        and load_net_res
+        and use_heteroscedastic_model
+        and detected_heteroscedastic
+        and cfg.generation.inference_mode in ["diffusion", "all"]
+    )
+    if save_predicted_uncertainty and not can_save_predicted_uncertainty:
+        logger0.warning(
+            "Requested save_predicted_uncertainty=true, but uncertainty output is "
+            "disabled for this run (NetCDF disabled, missing heteroscedastic model, "
+            "or incompatible inference mode)."
+        )
+
     def generate_for_time(image_lr, lead_time_label, current_sampler_fn=None):
         """Generate all ensemble members for a single time step.
         
@@ -519,7 +627,11 @@ def main(cfg: DictConfig) -> None:
                 )
 
             if net_res:
-                mean_hr = image_reg[0:1] if (cfg.generation.hr_mean_conditioning and net_reg) else None
+                mean_hr = (
+                    image_reg[0:1]
+                    if (cfg.generation.hr_mean_conditioning and net_reg)
+                    else None
+                )
                 rank_batches = [torch.tensor(seed_batch)]
                 image_res = diffusion_step(
                     net=net_res,
@@ -546,6 +658,73 @@ def main(cfg: DictConfig) -> None:
 
         return torch.cat(all_outputs, dim=0)
 
+    def predict_uncertainty_map(image_lr, mean_hr=None, lead_time_label=None):
+        """Predict per-channel uncertainty map for one timestep."""
+        if not can_save_predicted_uncertainty:
+            return None
+        if net_res is None:
+            return None
+
+        x_lr = image_lr.to(memory_format=torch.channels_last)
+        if mean_hr is not None:
+            x_lr = torch.cat((mean_hr.expand(x_lr.shape[0], -1, -1, -1), x_lr), dim=1)
+
+        if patching:
+            x_lr_net = patching.apply(input=x_lr, additional_input=image_lr)
+
+            def patch_embedding_selector(emb):
+                return patching.apply(emb.expand(image_lr.shape[0], -1, -1, -1))
+
+        else:
+            x_lr_net = x_lr
+            patch_embedding_selector = None
+
+        optional_args = {}
+        if lead_time_label is not None:
+            optional_args["lead_time_label"] = lead_time_label
+
+        x_probe = torch.randn(
+            1,
+            img_out_channels,
+            img_shape[0],
+            img_shape[1],
+            device=device,
+            dtype=torch.float32,
+        ).to(memory_format=torch.channels_last)
+        if patching:
+            x_probe_net = patching.apply(input=x_probe)
+        else:
+            x_probe_net = x_probe
+
+        sigma_probe = torch.tensor([uncertainty_sigma_probe], device=device)
+        with torch.inference_mode():
+            net_output = net_res(
+                x_probe_net,
+                x_lr_net,
+                sigma_probe,
+                embedding_selector=patch_embedding_selector,
+                return_variance=True,
+                **optional_args,
+            )
+
+        if not isinstance(net_output, tuple):
+            logger0.warning(
+                "Residual model did not return variance tensor with "
+                "return_variance=True. Writing zeros for uncertainty."
+            )
+            return torch.zeros(
+                img_out_channels,
+                img_shape[0],
+                img_shape[1],
+                device=device,
+                dtype=torch.float32,
+            )
+
+        _, d_std = net_output
+        if patching:
+            d_std = patching.fuse(input=d_std, batch_size=1)
+        return d_std[0]
+
     # =========================================================================
     # HP Eval Mode: Run multiple sampler configs and pick best
     # =========================================================================
@@ -553,15 +732,23 @@ def main(cfg: DictConfig) -> None:
     
     if hp_eval:
         logger0.info("=== HP Eval Mode: Testing multiple sampler configs ===")
-        
+
+        # Detect if model is heteroscedastic (returns tuple) and use appropriate configs
+        is_heteroscedastic = _has_variance_head(net_res) if net_res else False
+        if is_heteroscedastic:
+            eval_configs = HP_EVAL_CONFIGS_HETEROSCEDASTIC
+            logger0.info("  Detected heteroscedastic model - using uncertainty-aware samplers only")
+        else:
+            eval_configs = HP_EVAL_CONFIGS
+
         # Prepare dataset iteration info (shared across configs)
         all_times = dataset.time()
         times_list = [all_times[i] for i in sampler] if sampler else all_times
         max_times_per_gpu = (total_times + dist.world_size - 1) // dist.world_size
-        
+
         all_config_results = {}
-        
-        for eval_cfg in HP_EVAL_CONFIGS:
+
+        for eval_cfg in eval_configs:
             config_name = eval_cfg["name"]
             logger0.info(f"  Evaluating config: {config_name}")
             
@@ -741,11 +928,19 @@ def main(cfg: DictConfig) -> None:
 
             writer = NetCDFWriter(
                 f,
-                lat=dataset.latitude(),
-                lon=dataset.longitude(),
-                input_channels=dataset.input_channels(),
-                output_channels=dataset.output_channels(),
-                has_lead_time=has_lead_time,
+                **{
+                    key: value
+                    for key, value in {
+                        "lat": dataset.latitude(),
+                        "lon": dataset.longitude(),
+                        "input_channels": dataset.input_channels(),
+                        "output_channels": dataset.output_channels(),
+                        "has_lead_time": has_lead_time,
+                        "save_uncertainty": can_save_predicted_uncertainty,
+                        "uncertainty_group_name": uncertainty_output_name,
+                    }.items()
+                    if key in inspect.signature(NetCDFWriter.__init__).parameters
+                },
             )
 
             if cfg.generation.perf.io_syncronous:
@@ -807,6 +1002,22 @@ def main(cfg: DictConfig) -> None:
             # Generate
             image_out = generate_for_time(image_lr, lead_time_label)
 
+            predicted_uncertainty = None
+            if can_save_predicted_uncertainty:
+                mean_hr = None
+                if cfg.generation.hr_mean_conditioning and net_reg:
+                    mean_hr = regression_step(
+                        net=net_reg,
+                        img_lr=image_lr,
+                        latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+                        lead_time_label=lead_time_label,
+                    )[0:1]
+                predicted_uncertainty = predict_uncertainty_map(
+                    image_lr=image_lr,
+                    mean_hr=mean_hr,
+                    lead_time_label=lead_time_label,
+                )
+
             # Update metrics (on GPU, before CPU transfer - very efficient)
             if metrics is not None:
                 metrics.update(image_out, image_tar)
@@ -820,6 +1031,13 @@ def main(cfg: DictConfig) -> None:
                                    device=device, dtype=torch.float32)
             image_lr = torch.zeros(1, in_channels, img_shape[0], img_shape[1],
                                   device=device, dtype=torch.float32)
+            predicted_uncertainty = torch.zeros(
+                img_out_channels,
+                img_shape[0],
+                img_shape[1],
+                device=device,
+                dtype=torch.float32,
+            )
 
         # Gather results from all GPUs
         if dist.world_size > 1:
@@ -831,14 +1049,28 @@ def main(cfg: DictConfig) -> None:
                 gathered_outputs = [torch.zeros_like(image_out) for _ in range(dist.world_size)]
                 gathered_targets = [torch.zeros_like(image_tar) for _ in range(dist.world_size)]
                 gathered_inputs = [torch.zeros_like(image_lr) for _ in range(dist.world_size)]
+                if can_save_predicted_uncertainty:
+                    gathered_uncertainties = [
+                        torch.zeros_like(predicted_uncertainty)
+                        for _ in range(dist.world_size)
+                    ]
+                else:
+                    gathered_uncertainties = None
             else:
                 gathered_time_indices = gathered_outputs = gathered_targets = gathered_inputs = None
+                gathered_uncertainties = None
 
             torch.distributed.barrier()
             torch.distributed.gather(time_idx_tensor, gather_list=gathered_time_indices, dst=0)
             torch.distributed.gather(image_out, gather_list=gathered_outputs, dst=0)
             torch.distributed.gather(image_tar, gather_list=gathered_targets, dst=0)
             torch.distributed.gather(image_lr, gather_list=gathered_inputs, dst=0)
+            if can_save_predicted_uncertainty:
+                torch.distributed.gather(
+                    predicted_uncertainty,
+                    gather_list=gathered_uncertainties,
+                    dst=0,
+                )
 
             # Write on rank 0 (skip if skip_netcdf)
             if dist.rank == 0 and writer is not None:
@@ -855,6 +1087,9 @@ def main(cfg: DictConfig) -> None:
                                 gathered_targets[gpu_idx].cpu(),
                                 gathered_inputs[gpu_idx].cpu(),
                                 t_idx, t_idx, has_lead_time,
+                                gathered_uncertainties[gpu_idx].cpu().numpy()
+                                if can_save_predicted_uncertainty
+                                else None,
                             )
                         )
                     else:
@@ -864,6 +1099,9 @@ def main(cfg: DictConfig) -> None:
                             gathered_targets[gpu_idx].cpu(),
                             gathered_inputs[gpu_idx].cpu(),
                             t_idx, t_idx, has_lead_time,
+                            gathered_uncertainties[gpu_idx].cpu().numpy()
+                            if can_save_predicted_uncertainty
+                            else None,
                         )
         else:
             # Single GPU (skip if skip_netcdf)
@@ -874,6 +1112,9 @@ def main(cfg: DictConfig) -> None:
                             save_images, writer, dataset, list(times_list),
                             image_out.cpu(), image_tar.cpu(), image_lr.cpu(),
                             time_idx, time_idx, has_lead_time,
+                            predicted_uncertainty.cpu().numpy()
+                            if can_save_predicted_uncertainty
+                            else None,
                         )
                     )
                 else:
@@ -881,6 +1122,9 @@ def main(cfg: DictConfig) -> None:
                         writer, dataset, list(times_list),
                         image_out.cpu(), image_tar.cpu(), image_lr.cpu(),
                         time_idx, time_idx, has_lead_time,
+                        predicted_uncertainty.cpu().numpy()
+                        if can_save_predicted_uncertainty
+                        else None,
                     )
 
     # Timing

@@ -2,6 +2,11 @@
 __pycache__/
 *.pyc
 
+#Outputs
+tensorboard/
+wandb/
+outputs/
+
 # HP Search generated outputs
 hp_search/visualizations/
 hp_search/slurm/logs/

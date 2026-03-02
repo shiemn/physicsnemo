@@ -80,9 +80,10 @@ from helpers.train_helpers import (
     handle_and_clip_gradients,
     is_time_for_periodic_task,
 )
-
-from helpers.custom_losses import IntensityResidualLoss
+from helpers.custom_losses import IntensityResidualLoss, CalibratedResidualLoss, CalibratedResidualLossV2
 from helpers.custom_tweedie_losses import FlexiLoss
+from helpers.preconditioning import HeteroscedasticEDMPrecondSR
+from helpers.edm2_preconditioning import EDM2PrecondSuperResolution
 
 torch._dynamo.reset()
 # Increase the cache size limit
@@ -154,23 +155,24 @@ def main(cfg: DictConfig) -> None:
         writer = SummaryWriter(log_dir="tensorboard")
 
         initialize_wandb(
-        project="CorrDiff",
-        entity="shiemn",
-        name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
-        group="CorrDiff-DDP-Group",
-        mode=cfg.wandb.mode,
-        config=OmegaConf.to_container(cfg),
-        results_dir=cfg.wandb.results_dir,
-    )
+            project="CorrDiff",
+            entity="shiemn",
+            name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
+            group="CorrDiff-DDP-Group",
+            mode=cfg.wandb.mode,
+            config=OmegaConf.to_container(cfg),
+            results_dir=cfg.wandb.results_dir,
+        )
 
     logger = PythonLogger("main")  # General python logger
     logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
 
     if torch.cuda.is_available():
         device = "cuda"
-    elif torch.backends.mps.is_available(): 
+    elif torch.backends.mps.is_available():
         device = "mps"
-    else: 
+        dist._device = torch.device("mps")
+    else:
         device = "cpu"
     
     # Resolve and parse configs
@@ -190,7 +192,7 @@ def main(cfg: DictConfig) -> None:
     fp_optimizations = cfg.training.perf.fp_optimizations
     songunet_checkpoint_level = cfg.training.perf.songunet_checkpoint_level
     fp16 = fp_optimizations == "fp16"
-    enable_amp = fp_optimizations.startswith("amp")
+    enable_amp = fp_optimizations.startswith("amp") and device != "mps"
     amp_dtype = torch.float16 if (fp_optimizations == "amp-fp16") else torch.bfloat16
     logger.info(f"Saving the outputs in {os.getcwd()}")
     checkpoint_dir = get_checkpoint_dir(
@@ -215,7 +217,7 @@ def main(cfg: DictConfig) -> None:
 
     # Instantiate the dataset
     data_loader_kwargs = {
-        "pin_memory": True,
+        "pin_memory": torch.cuda.is_available(),
         "num_workers": cfg.training.perf.dataloader_workers,
         "prefetch_factor": 2 if cfg.training.perf.dataloader_workers > 0 else None,
     }
@@ -250,6 +252,8 @@ def main(cfg: DictConfig) -> None:
         "diffusion",
         "patched_diffusion",
         "lt_aware_patched_diffusion",
+        "heteroscedastic_diffusion",
+        "heteroscedastic_patched_diffusion",
     ]:
         raise ValueError(
             f"cfg.training.distribution should only be specified for diffusion models."
@@ -377,6 +381,47 @@ def main(cfg: DictConfig) -> None:
             img_in_channels=img_in_channels + model_args["N_grid_channels"],
             **model_args,
         )
+    elif cfg.model.name == "heteroscedastic_diffusion":
+        hetero_model_args = model_args.copy()
+        hetero_model_args.pop("img_out_channels", None)
+        hetero_model_args.pop("use_fp16", None)
+        if "sigma_data" in hetero_model_args:
+            hetero_model_args.pop("sigma_data")
+        model = HeteroscedasticEDMPrecondSR(
+            img_in_channels=img_in_channels + hetero_model_args["N_grid_channels"],
+            img_out_channels=img_out_channels,
+            variance_channels=cfg.model.get("variance_channels", img_out_channels),
+            min_std=cfg.model.get("min_std", 1e-4),
+            use_fp16=cfg.model.get("use_fp16", False),
+            sigma_data=cfg.model.get("sigma_data", sigma_data),
+            **hetero_model_args,
+        )
+    elif cfg.model.name == "heteroscedastic_patched_diffusion":
+        hetero_model_args = model_args.copy()
+        hetero_model_args.pop("img_out_channels", None)
+        hetero_model_args.pop("use_fp16", None)
+        if "sigma_data" in hetero_model_args:
+            hetero_model_args.pop("sigma_data")
+        model = HeteroscedasticEDMPrecondSR(
+            img_in_channels=img_in_channels + hetero_model_args["N_grid_channels"],
+            img_out_channels=img_out_channels,
+            variance_channels=cfg.model.get("variance_channels", img_out_channels),
+            min_std=cfg.model.get("min_std", 1e-4),
+            use_fp16=cfg.model.get("use_fp16", False),
+            sigma_data=cfg.model.get("sigma_data", sigma_data),
+            **hetero_model_args,
+        )
+    elif cfg.model.name == "edm2_diffusion":
+        edm2_args = {
+            "img_resolution": list(img_shape),  # (H, W) — preconditioner derives min for U-Net ladder
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": fp16,
+            "sigma_data": sigma_data or 0.5,
+        }
+        if hasattr(cfg.model, "model_args"):
+            edm2_args.update(OmegaConf.to_container(cfg.model.model_args))
+        model = EDM2PrecondSuperResolution(**edm2_args)
     else:
         raise ValueError(f"Invalid model: {cfg.model.name}")
 
@@ -484,6 +529,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.model.name in {
         "patched_diffusion",
         "lt_aware_patched_diffusion",
+        "heteroscedastic_patched_diffusion",
     }:
         if len(patch_nums_iter) > 1:
             if not patching:
@@ -507,6 +553,9 @@ def main(cfg: DictConfig) -> None:
         "diffusion",
         "patched_diffusion",
         "lt_aware_patched_diffusion",
+        "heteroscedastic_diffusion",
+        "heteroscedastic_patched_diffusion",
+        "edm2_diffusion",
     ):
         loss_init_kwargs = {}
         # Only add nu for student-t distribution (not for normal/gaussian)
@@ -530,9 +579,31 @@ def main(cfg: DictConfig) -> None:
             print("Using custom IntensityResidualLoss")
             loss_fn = IntensityResidualLoss(
                 regression_net=regression_net,
-                hr_mean_conditioning= cfg.training.hr_mean_conditioning,
-                average_intensity_weight=cfg.training.hp.get("average_intensity_weight", None),
-                maximum_intensity_weight=cfg.training.hp.get("maximum_intensity_weight", None),
+                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+                average_intensity_weight=cfg.model.get("hp", {}).get("average_intensity_weight", None),
+                maximum_intensity_weight=cfg.model.get("hp", {}).get("maximum_intensity_weight", None),
+            )
+        elif loss_function == "CalibratedResidualLoss":
+            print("Using CalibratedResidualLoss with Gaussian CRPS for uncertainty calibration")
+            loss_fn = CalibratedResidualLoss(
+                regression_net=regression_net,
+                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+                crps_weight=cfg.model.get("hp", {}).get("crps_weight", 0.1),
+                min_std=cfg.model.get("hp", {}).get("min_std", 1e-4),
+                **loss_init_kwargs,
+            )
+        elif loss_function == "CalibratedResidualLossV2":
+            crps_dist = cfg.model.get("hp", {}).get("crps_distribution", "gaussian")
+            print(f"Using CalibratedResidualLossV2 with {crps_dist} CRPS + threshold-weighted CRPS")
+            loss_fn = CalibratedResidualLossV2(
+                regression_net=regression_net,
+                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+                crps_weight=cfg.model.get("hp", {}).get("crps_weight", 0.1),
+                tw_crps_weight=cfg.model.get("hp", {}).get("tw_crps_weight", 0.1),
+                tw_threshold=cfg.model.get("hp", {}).get("tw_threshold", 0.0),
+                min_std=cfg.model.get("hp", {}).get("min_std", 1e-4),
+                crps_distribution=crps_dist,
+                **loss_init_kwargs,
             )
         
     elif cfg.model.name == "regression" or cfg.model.name == "lt_aware_regression":
@@ -551,7 +622,7 @@ def main(cfg: DictConfig) -> None:
         lr=cfg.training.hp.lr,
         betas=[0.9, 0.999],
         eps=1e-8,
-        fused=True,
+        fused=torch.cuda.is_available(),
     )
 
     # Record the current time to measure the duration of subsequent operations.
@@ -579,6 +650,29 @@ def main(cfg: DictConfig) -> None:
     # init variables to monitor running mean of average loss since last periodic
     average_loss_running_mean = 0
     n_average_loss_running_mean = 1
+    component_running_mean = {}
+
+    def _accumulate_component_values(accumulator, components, scale):
+        if not isinstance(components, dict):
+            return
+        for key, value in components.items():
+            if not torch.is_tensor(value):
+                value = torch.tensor(value, device=dist.device, dtype=torch.float32)
+            value = value.detach().to(device=dist.device, dtype=torch.float32)
+            if key not in accumulator:
+                accumulator[key] = torch.zeros((), device=dist.device, dtype=torch.float32)
+            accumulator[key] += value * scale
+
+    def _reduce_component_values(local_components):
+        if not local_components:
+            return {}
+        keys = sorted(local_components.keys())
+        values = torch.stack([local_components[k] for k in keys])
+        if dist.world_size > 1:
+            torch.distributed.barrier()
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+            values /= dist.world_size
+        return {k: values[i].item() for i, k in enumerate(keys)}
     start_nimg = cur_nimg
     input_dtype = torch.float32
     if enable_amp:
@@ -605,6 +699,8 @@ def main(cfg: DictConfig) -> None:
                     # Compute & accumulate gradients
                     optimizer.zero_grad(set_to_none=True)
                     loss_accum = 0
+                    loss_component_accum = {}
+                    averaged_loss_components = {}
                     for n_i in range(num_accumulation_rounds):
                         with nvtx.annotate(
                             f"accumulation round {n_i}", color="Magenta"
@@ -668,6 +764,12 @@ def main(cfg: DictConfig) -> None:
                                     ):
                                         loss = loss_fn(**loss_fn_kwargs)
 
+                                _accumulate_component_values(
+                                    loss_component_accum,
+                                    getattr(loss_fn, "latest_components", None),
+                                    1.0 / num_accumulation_rounds / len(patch_nums_iter),
+                                )
+
                                 loss = loss.sum() / batch_size_per_gpu
                                 loss_accum += (
                                     loss
@@ -685,11 +787,19 @@ def main(cfg: DictConfig) -> None:
                                 loss_sum, op=torch.distributed.ReduceOp.SUM
                             )
                         average_loss = (loss_sum / dist.world_size).cpu().item()
+                        averaged_loss_components = _reduce_component_values(
+                            loss_component_accum
+                        )
 
                     # update running mean of average loss since last periodic task
                     average_loss_running_mean += (
                         average_loss - average_loss_running_mean
                     ) / n_average_loss_running_mean
+                    for key, value in averaged_loss_components.items():
+                        prev = component_running_mean.get(key, 0.0)
+                        component_running_mean[key] = (
+                            prev + (value - prev) / n_average_loss_running_mean
+                        )
                     n_average_loss_running_mean += 1
 
                     if dist.rank == 0:
@@ -699,6 +809,15 @@ def main(cfg: DictConfig) -> None:
                             average_loss_running_mean,
                             cur_nimg,
                         )
+                        for key, value in averaged_loss_components.items():
+                            writer.add_scalar(
+                                f"training_components/{key}", value, cur_nimg
+                            )
+                            writer.add_scalar(
+                                f"training_components_running/{key}",
+                                component_running_mean.get(key, value),
+                                cur_nimg,
+                            )
 
                     ptt = is_time_for_periodic_task(
                         cur_nimg,
@@ -712,6 +831,7 @@ def main(cfg: DictConfig) -> None:
                         # reset running mean of average loss
                         average_loss_running_mean = 0
                         n_average_loss_running_mean = 1
+                        component_running_mean = {}
 
                     # Update weights.
                     with nvtx.annotate("update weights", color="blue"):
@@ -752,6 +872,8 @@ def main(cfg: DictConfig) -> None:
                     # Validation (skip if timeout signal received to save time for checkpoint)
                     if validation_dataset_iterator is not None and not _TIMEOUT_SIGNAL_RECEIVED:
                         valid_loss_accum = 0
+                        valid_component_accum = {}
+                        average_valid_components = {}
                         if is_time_for_periodic_task(
                             cur_nimg,
                             cfg.training.io.validation_freq,
@@ -824,11 +946,17 @@ def main(cfg: DictConfig) -> None:
                                         ):
                                             loss_valid = loss_fn(**loss_valid_kwargs)
 
-                                        loss_valid = (
-                                            (loss_valid.sum() / batch_size_per_gpu)
-                                            .cpu()
-                                            .item()
+                                        _accumulate_component_values(
+                                            valid_component_accum,
+                                            getattr(loss_fn, "latest_components", None),
+                                            1.0
+                                            / cfg.training.io.validation_steps
+                                            / len(patch_nums_iter),
                                         )
+
+                                        loss_valid = (
+                                            loss_valid.sum() / batch_size_per_gpu
+                                        ).cpu().item()
                                         valid_loss_accum += (
                                             loss_valid
                                             / cfg.training.io.validation_steps
@@ -844,16 +972,30 @@ def main(cfg: DictConfig) -> None:
                                         op=torch.distributed.ReduceOp.SUM,
                                     )
                                 average_valid_loss = valid_loss_sum / dist.world_size
+                                average_valid_components = _reduce_component_values(
+                                    valid_component_accum
+                                )
                                 if dist.rank == 0:
                                     writer.add_scalar(
                                         "validation_loss", average_valid_loss, cur_nimg
                                     )
-                                    wandb.log({
+                                    for key, value in average_valid_components.items():
+                                        writer.add_scalar(
+                                            f"validation_components/{key}",
+                                            value,
+                                            cur_nimg,
+                                        )
+                                    wandb_payload = {
                                         "validation_loss": average_valid_loss,
                                         "learning_rate": current_lr,
                                         "training_loss": average_loss,
                                         "training_loss_running_mean": average_loss_running_mean
-                                    }, step=cur_nimg)
+                                    }
+                                    for key, value in averaged_loss_components.items():
+                                        wandb_payload[f"training_components/{key}"] = value
+                                    for key, value in average_valid_components.items():
+                                        wandb_payload[f"validation_components/{key}"] = value
+                                    wandb.log(wandb_payload, step=cur_nimg)
 
                 if is_time_for_periodic_task(
                     cur_nimg,
@@ -871,6 +1013,18 @@ def main(cfg: DictConfig) -> None:
                     fields += [
                         f"training_loss_running_mean {average_loss_running_mean:<7.2f}"
                     ]
+                    if "loss_crps_weighted_mean" in averaged_loss_components:
+                        fields += [
+                            f"crps_w {averaged_loss_components['loss_crps_weighted_mean']:<7.3f}"
+                        ]
+                    if "loss_tw_crps_weighted_mean" in averaged_loss_components:
+                        fields += [
+                            f"twcrps_w {averaged_loss_components['loss_tw_crps_weighted_mean']:<7.3f}"
+                        ]
+                    if "pred_scale_mean" in averaged_loss_components:
+                        fields += [
+                            f"pred_scale {averaged_loss_components['pred_scale_mean']:<7.3f}"
+                        ]
                     fields += [f"learning_rate {current_lr:<7.8f}"]
                     fields += [f"total_sec {(tick_end_time - start_time):<7.1f}"]
                     fields += [

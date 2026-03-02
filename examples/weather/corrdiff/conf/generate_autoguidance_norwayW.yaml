@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Generation config for generate_autoguidance.py — works with EDM1 or EDM2 diffusion models.
+
+hydra:
+    job:
+        chdir: false
+        name: generate_autoguidance_norwayW
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base  # Do not modify
+
+
+defaults:
+    - dataset: custom
+    - generation: non_patched
+    # sampler is loaded transitively via generation/base_all.yaml
+
+
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+    years: [2005]
+
+
+generation:
+    hr_mean_conditioning: true   # must match training config
+    num_ensembles: 3
+    seed_batch_size: 3
+
+    times_range: ["2005-01-01T00:00:00", "2005-01-03T23:59:59", 3]
+    # Must overlap with dataset.years. A few timesteps for a quick check.
+
+    perf:
+        use_fp16: false
+
+    io:
+        reg_ckpt_filename: /checkpoints/hp_reg_grid/reg_10_combined/checkpoints_regression/UNet.0.1500160.mdlus
+        res_ckpt_filename: ???   # strong model — later/final checkpoint
+        output_filename: /outputs/autoguidance_norwayW.nc
+
+    guidance:
+        guide_ckpt_filename: ???  # weak model — earlier checkpoint
+        scale: 1.5                # w in D_guided = D_main + w*(D_main - D_weak)
+        # scale=0.0 disables guidance entirely (standard diffusion run)
+        # Typical range: 1.0 – 4.0; tune on validation CRPS
+
+
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 0        # 0 = deterministic ODE; >0 adds stochasticity
+    S_min: 0
+    S_max: .inf
