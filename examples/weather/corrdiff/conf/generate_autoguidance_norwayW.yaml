@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Generation config for generate_autoguidance.py — works with EDM1 or EDM2 diffusion models.
+# Generation config for autoguidance — works with EDM1 or EDM2 diffusion models.
+# Use with: python generate.py --config-name=generate_autoguidance_norwayW
 
 hydra:
     job:
@@ -66,6 +67,24 @@ generation:
         scale: 1.5                # w in D_guided = D_main + w*(D_main - D_weak)
         # scale=0.0 disables guidance entirely (standard diffusion run)
         # Typical range: 1.0 – 4.0; tune on validation CRPS
+
+    # EDM2 model config — needed to reconstruct the model from .pt state dict
+    # Must match the training config (edm2_norwayW.yaml + base/model/edm2_diffusion.yaml)
+    edm2:
+        sigma_data: 0.5
+        model_args:
+            model_channels: 128
+            channel_mult: [1, 2, 3, 4]
+            num_blocks: 3
+            attn_resolutions: [16]
+            N_grid_channels: 4
+            gridtype: sinusoidal
+            grid_mp_balance: 0.5
+            dropout: 0.0
+            res_balance: 0.3
+            attn_balance: 0.3
+            clip_act: 256
+            channels_per_head: 64
 
 
 sampler:

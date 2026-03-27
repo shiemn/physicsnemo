@@ -57,6 +57,9 @@ class NorwayDatasetH5(DownscalingDataset):
         years: Union[List[int], None] = None,
         bounds: str = "small",
         extreme_percentile: Union[float, None] = None,
+        max_percentile: Union[float, None] = None,
+        log_precip: bool = False,
+        log_epsilon: float = 0.01,
     ):
         self.data_path = data_path
 
@@ -124,6 +127,21 @@ class NorwayDatasetH5(DownscalingDataset):
         else:
             raise ValueError(f"No normalization coefficients found at {data_path}. Please run the calculate_mean_std.py script to calculate them.")
 
+        self.log_precip = log_precip
+        self.log_epsilon = log_epsilon
+        self.log_target_mean: Union[float, None] = None
+        self.log_target_std: Union[float, None] = None
+
+        if self.log_precip:
+            log_stats_path = os.path.join(stats_path, "log_target_mean_std.pt")
+            if not os.path.exists(log_stats_path):
+                raise ValueError(
+                    f"log_precip=True but {log_stats_path} not found. "
+                    "Run NorwayDatasetH5.compute_and_save_log_stats(...) first."
+                )
+            self.log_target_mean, self.log_target_std = torch.load(log_stats_path, weights_only=False)
+            print(f"Log-space normalization: mean={self.log_target_mean:.4f}, std={self.log_target_std:.4f}")
+
         if self.years is None:
             if stage == 'train':
                 print("Return dataset in train stage.")
@@ -167,14 +185,23 @@ class NorwayDatasetH5(DownscalingDataset):
 
         self.cum_file_length = np.cumsum(self.file_lengths)
 
-        # Extreme filtering setup
+        # Extreme / low-precip filtering setup
+        if extreme_percentile is not None and max_percentile is not None:
+            raise ValueError("Cannot set both extreme_percentile and max_percentile — they are mutually exclusive.")
+
         self.extreme_percentile = extreme_percentile
+        self.max_percentile = max_percentile
         self.extreme_indices = None
         self.extreme_threshold = None
-        
+
         if self.extreme_percentile is not None:
             print(f"Filtering dataset to only include samples above {self.extreme_percentile}th percentile of rainfall...")
             self.extreme_indices = self.__filter_extremes__(self.extreme_percentile)
+            print(f"Filtered dataset: {len(self.extreme_indices)} samples out of {sum(self.file_lengths)} ({len(self.extreme_indices)/sum(self.file_lengths)*100:.2f}%)")
+
+        if self.max_percentile is not None:
+            print(f"Filtering dataset to only include samples below {self.max_percentile}th percentile of rainfall...")
+            self.extreme_indices = self.__filter_low_precip__(self.max_percentile)
             print(f"Filtered dataset: {len(self.extreme_indices)} samples out of {sum(self.file_lengths)} ({len(self.extreme_indices)/sum(self.file_lengths)*100:.2f}%)")
 
 
@@ -222,6 +249,38 @@ class NorwayDatasetH5(DownscalingDataset):
 
         return extreme_indices
 
+    def __filter_low_precip__(self, max_percentile: float) -> list[int]:
+        """Find indices whose spatial-maximum precipitation is below the given percentile threshold."""
+        low_indices = []
+
+        print("Step 1/2: Computing maximum rainfall values for all samples...")
+        max_rainfall_values = []
+
+        for target_file in self.files_target:
+            with h5py.File(target_file, 'r') as f:
+                targets = f['targets'][:]  # (n_samples, H, W)
+                targets = targets * 3600   # kg/m^2/s -> mm/3h
+                max_values = np.max(targets, axis=(1, 2))
+                max_rainfall_values.extend(max_values)
+
+        max_rainfall_values = np.array(max_rainfall_values)
+
+        self.extreme_threshold = np.percentile(max_rainfall_values, max_percentile)
+        print(f"   Rainfall threshold at {max_percentile}th percentile: {self.extreme_threshold:.4f} mm/3h")
+
+        print("Step 2/2: Finding indices of samples below threshold...")
+        current_idx = 0
+        for target_file in self.files_target:
+            with h5py.File(target_file, 'r') as f:
+                targets = f['targets'][:]
+                targets = targets * 3600
+                max_values = np.max(targets, axis=(1, 2))
+                local_low_indices = np.where(max_values < self.extreme_threshold)[0]
+                low_indices.extend((local_low_indices + current_idx).tolist())
+                current_idx += targets.shape[0]
+
+        return low_indices
+
     def __getitem__(self, idx):
         """Return a tuple of:
         - target_field: High-resolution HCLIM3 output data
@@ -254,7 +313,11 @@ class NorwayDatasetH5(DownscalingDataset):
         
         if self.normalize:
             predictor = (predictor - self.predictor_mean[:, None, None]) / self.predictor_std[:, None, None]
-            target = (target - self.target_mean) / self.target_std
+            if self.log_precip:
+                target = np.log(target + self.log_epsilon)
+                target = (target - self.log_target_mean) / self.log_target_std
+            else:
+                target = (target - self.target_mean) / self.target_std
 
         predictor = self.upsample(predictor)
 
@@ -372,6 +435,44 @@ class NorwayDatasetH5(DownscalingDataset):
         return orography, lat, lon
     
 
+    @classmethod
+    def compute_and_save_log_stats(
+        cls,
+        data_path: str,
+        stats_path: str,
+        years: List[int],
+        log_epsilon: float = 0.01,
+    ) -> None:
+        """Compute mean/std of log(target_mm + epsilon) over training years and save to stats_path/log_target_mean_std.pt.
+
+        Run this once before training with log_precip=True:
+            NorwayDatasetH5.compute_and_save_log_stats(
+                data_path="/data/Norway/...",
+                stats_path="/data/Norway/...",
+                years=list(range(1986, 2002)),
+                log_epsilon=0.01,
+            )
+        """
+        files = sorted([
+            os.path.join(data_path, f)
+            for f in os.listdir(data_path)
+            if f.startswith("targets") and f.endswith(".h5") and int(f[-7:-3]) in years
+        ])
+        if not files:
+            raise ValueError(f"No target files found in {data_path} for years {years}")
+        all_vals = []
+        for fpath in files:
+            with h5py.File(fpath, 'r') as f:
+                targets_mm = f['targets'][:].astype(np.float32) * 3600
+                all_vals.append(np.log(targets_mm + log_epsilon).ravel())
+        all_vals = np.concatenate(all_vals)
+        mean, std = float(all_vals.mean()), float(all_vals.std())
+        print(f"Log-space stats ({len(files)} files, epsilon={log_epsilon}): mean={mean:.4f}, std={std:.4f}")
+        torch.save((mean, std), os.path.join(stats_path, "log_target_mean_std.pt"))
+        print(f"Saved to {os.path.join(stats_path, 'log_target_mean_std.pt')}")
+
     def denormalize_output(self, x: np.ndarray) -> np.ndarray:
-        """Convert output from normalized data to physical units."""
+        """Convert output from normalized data to physical units (mm/3h)."""
+        if self.log_precip:
+            return np.exp(x * self.log_target_std + self.log_target_mean) - self.log_epsilon
         return (x * self.target_std) + self.target_mean

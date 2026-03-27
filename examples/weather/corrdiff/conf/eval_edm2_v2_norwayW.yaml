@@ -14,71 +14,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Config for time-parallel generation with heteroscedastic diffusion model
-# Uses uncertainty-aware sampling for calibrated ensemble spread
+# Evaluation config for EDM2 v2 diffusion model on Norway (large) domain.
+# Must match edm2_v2_norwayW.yaml (training config).
 #
-# Usage:
-#   torchrun --nproc_per_node=4 generate.py --config-name=gen_heteroscedastic_parallel
+# Usage on helma:
+#   sbatch jobs/helma/eval.slurm /checkpoints/edm2_v2_norwayW/checkpoints_edm2_diffusion/EDM2PrecondSuperResolution.0.XXXXXX.pt
 #
-# With HP evaluation (tests multiple sampler configs):
-#   torchrun --nproc_per_node=4 generate.py --config-name=gen_heteroscedastic_parallel \
-#       generation.hp_eval=true
+# Usage locally (single GPU):
+#   python evaluate.py --config-name=eval_edm2_v2_norwayW \
+#       run_tag=edm2_v2_test \
+#       generation.io.res_ckpt_filename=/path/to/EDM2PrecondSuperResolution.0.XXXXXX.pt
 
 hydra:
     job:
-          chdir: false
-          name: gen_heteroscedastic_parallel
+        chdir: false
+        name: eval_edm2_v2
     run:
-          dir: ./outputs/${hydra:job.name}
+        dir: ./outputs/${hydra:job.name}
     searchpath:
-          - pkg://conf/base # Do not modify
+        - pkg://conf/base   # Do not modify
 
 defaults:
     - dataset: custom
     - generation: non_patched
 
+# ── Experiment identifier ─────────────────────────────────────────────────────
+run_tag: ???
 
-# Dataset parameters
+# ── W&B settings ─────────────────────────────────────────────────────────────
+wandb:
+    mode: online
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+# ── Evaluation settings ───────────────────────────────────────────────────────
+eval:
+    precip_threshold: 1.0
+    output_json: eval_results.json
+    twcrps_thresholds: [5.0, 10.0]
+    n_plot_events: 5
+    plot_events: null
+    rapsd_dx_km: 2.0
+    predictions_file: edmv2_15M.nc  # "auto" = derive from checkpoint name; explicit path to save/load; null to disable
+
+# ── Dataset (matches edm2_v2_norwayW training config) ────────────────────────
 dataset:
     type: norway
     data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
     stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
     invariant_variables_path: /data/Norway/HCLIM3/
-
     output_variables: ['precipitation']
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
     bounds: large
     years: [2005]
 
-
-# Uncertainty-aware sampler configuration
+# ── Sampler ──────────────────────────────────────────────────────────────────
 sampler:
-    type: uncertainty_aware
+    type: stochastic
     num_steps: 18
-    # Base stochastic sampling parameters
     S_churn: 40
     S_min: 0
     S_max: .inf
-    # Uncertainty-aware specific parameters
-    use_predicted_uncertainty: false
-    # Whether to use the network's predicted std to modulate noise
-    uncertainty_scale: 1.0
-    # Scaling factor for predicted uncertainty:
-    #   0.0 = ignore predicted uncertainty (standard stochastic)
-    #   1.0 = full use of predicted uncertainty
-    #   >1.0 = amplify uncertainty effect (more ensemble spread)
 
+# ── Generation ───────────────────────────────────────────────────────────────
 generation:
+    inference_mode: all
     num_ensembles: 10
-    # int, number of ensembles to generate per input
     seed_batch_size: 10
-    # int, size of the batched inference
-    use_heteroscedastic_model: auto
-    save_predicted_uncertainty: true
-    uncertainty_output_name: predicted_std
-    uncertainty_sigma_probe: 0.001
-    # times_range: ["2005-01-01T00:00:00", "2005-12-31T23:59:59", 3]
+    hr_mean_conditioning: true
+
+    io:
+        # Regression checkpoint — shared across all diffusion model evaluations
+        reg_ckpt_filename: /checkpoints/hp_reg_grid/reg_07_flexi_p125/checkpoints_regression/UNet.0.1700096.mdlus
+        # EDM2 v2 diffusion checkpoint — override on the command line
+        res_ckpt_filename: /checkpoints/edm2_v2_norwayW/checkpoints_edm2_diffusion/EDM2PrecondSuperResolution.0.1500160.mdlus
+        output_filename: /dev/null
+
+    # Eval timesteps — 128 high-precipitation events from 2005
     times:
     - 2005-01-02T00:00:00
     - 2005-01-02T12:00:00
@@ -208,30 +222,3 @@ generation:
     - 2005-12-08T09:00:00
     - 2005-12-08T12:00:00
     - 2005-12-31T18:00:00
-
-    # Metrics computation for evaluation
-    compute_metrics: true
-    metrics_output: metrics_heteroscedastic.json
-    precip_threshold: 1.0  # mm threshold for conditional metrics
-
-    # Set to true to test multiple sampler configs and pick best
-    hp_eval: true
-
-    # Time range for generation
-    #times_range: ["2005-01-01T00:00:00", "2005-12-31T23:59:59", 3]
-
-    io:
-        # Heteroscedastic diffusion model checkpoint
-        res_ckpt_filename: /checkpoints/heteroscedastic_twcrps2/checkpoints_heteroscedastic_diffusion/HeteroscedasticEDMPrecondSR.0.1300224.mdlus
-        # Regression model checkpoint (same as used for training)
-        reg_ckpt_filename: /checkpoints/hp_reg_grid/reg_10_combined/checkpoints_regression/UNet.0.1500160.mdlus
-
-        # Output file
-        output_filename: /outputs/heteroscedastic_parallel.nc
-
-
-# Parameters for wandb logging
-wandb:
-    mode: online
-    results_dir: "./wandb"
-    watch_model: false

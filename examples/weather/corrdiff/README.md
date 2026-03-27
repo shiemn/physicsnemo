@@ -15,6 +15,110 @@ weather forecasts.
 
 ![CorrDiff-based downscaling over Taiwan](../../../docs/img/corrdiff_cold_front.png)
 
+## Extensions: Norway Precipitation Downscaling
+
+This section documents features added beyond the original CorrDiff repository, developed for precipitation downscaling over Norway using the NorCP-AROME/EC-EARTH dataset.
+
+### Norway dataset (`datasets/norway.py`)
+
+`NorwayDatasetH5` is a custom dataset implementation for the Norway downscaling task. It loads paired H5 files of low-resolution predictors and high-resolution precipitation targets, organized by year, and supports several preprocessing options:
+
+| Parameter | Description |
+|---|---|
+| `data_path` | Path to directory containing `predictors_YYYY.h5` and `targets_YYYY.h5` files |
+| `stats_path` | Path to directory containing normalization stats (`predictor_mean_std.pt`, `target_mean_std.pt`) |
+| `years` | List of years to include; defaults to all years 1986–2005 |
+| `bounds` | Spatial crop: `"small"` (256×256 eastern Norway) or `"large"` (512×512 southern Norway) |
+| `invariant_variables` | Static fields to append to input, e.g. `["elevation"]` |
+| `extreme_percentile` | Keep only samples where spatial-maximum precipitation exceeds this percentile (e.g. `95.0` for top 5% events) |
+| `max_percentile` | Keep only samples where spatial-maximum precipitation is *below* this percentile (e.g. `50.0` for the drier half) |
+| `log_precip` | Apply `log(target + epsilon)` before standardization; requires pre-computed log-space statistics |
+| `log_epsilon` | Offset added before log to handle zero precipitation (default: `0.01` mm/3h) |
+
+**Precipitation filtering** (`extreme_percentile` / `max_percentile`) is useful for training specialist models on specific regimes of the precipitation distribution. The two options are mutually exclusive.
+
+**Log-transform** (`log_precip=True`) compresses the heavy-tailed precipitation distribution before training. Log-space normalization statistics must be pre-computed once from the training years:
+
+```python
+from datasets.norway import NorwayDatasetH5
+NorwayDatasetH5.compute_and_save_log_stats(
+    data_path="/data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH",
+    stats_path="/data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH",
+    years=list(range(1986, 2002)),
+    log_epsilon=0.01,
+)
+# Saves log_target_mean_std.pt to stats_path
+```
+
+`denormalize_output()` automatically inverts the log transform when `log_precip=True`, so all downstream evaluation code works unchanged.
+
+### EDM2 architecture (`helpers/edm2_preconditioning.py`, `helpers/edm2_networks.py`)
+
+`EDM2PrecondSuperResolution` implements the EDM2 preconditioning scheme (Karras et al., 2024) with magnitude-preserving operations for super-resolution. Key differences from the standard EDM preconditioner:
+
+- **Magnitude-preserving concatenation** (`mp_cat`) ensures unit-norm activations when concatenating the noisy HR image with the LR conditioning input
+- **Positional grid channels** (sinusoidal or linear) are concatenated to provide spatial coordinate information
+- Supports both `.mdlus` (PhysicsNeMo module archive) and raw `.pt` state-dict checkpoints
+
+Training configs: `conf/edm2_norwayW.yaml`, `conf/edm2_v2_norwayW.yaml`.
+
+### Autoguidance generation
+
+Autoguidance is supported directly by `generate.py`. It uses two diffusion model checkpoints — a *strong* (later) model and a *weak* (earlier or specialist) model — and steers sampling with:
+
+```
+D_guided = D_strong + w × (D_strong - D_weak)
+```
+
+where `w` is `guidance.scale` (typical range: 1.0–4.0). Setting `scale=0` disables guidance.
+
+**Example use case**: train a model on extreme precipitation events only (`extreme_percentile: 95.0`) as the strong model, and use a full-data or low-precipitation model as the weak guide. This amplifies the diffusion model's tendency to produce intense precipitation events.
+
+```bash
+python generate.py --config-name=generate_autoguidance_norwayW \
+  generation.io.res_ckpt_filename=/path/to/extreme_model.mdlus \
+  generation.guidance.guide_ckpt_filename=/path/to/fulldata_model.mdlus \
+  generation.guidance.scale=2.0
+```
+
+Config: `conf/generate_autoguidance_norwayW.yaml`.
+
+### Unified evaluation pipeline (`evaluate.py`)
+
+`evaluate.py` combines generation, metric computation, and WandB logging into a single script. It evaluates a trained model on a fixed set of timesteps (by default, 128 high-precipitation events from 2005 defined in `conf/evaluate.yaml`).
+
+Features:
+- Runs both the regression and diffusion models to produce ensemble predictions
+- Computes proper CRPS, RMSE, spread–skill ratio, and wet-95th-percentile metrics in physical (mm/3h) units
+- Logs all metrics to WandB under a run named `eval-{run_tag}`
+- Supports single-GPU and multi-GPU (`torchrun`) execution
+
+```bash
+# Single GPU
+python evaluate.py --config-name=evaluate run_tag=my_run \
+  generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
+  generation.io.res_ckpt_filename=/path/to/diff.mdlus
+
+# Multi-GPU
+torchrun --nproc_per_node=4 evaluate.py --config-name=evaluate \
+  run_tag=my_run \
+  generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
+  generation.io.res_ckpt_filename=/path/to/diff.mdlus
+```
+
+### Metrics module (`helpers/metrics.py`)
+
+Centralized implementation of probabilistic and deterministic metrics for precipitation:
+
+- `proper_crps(pred_ens, target)` — finite-ensemble CRPS using the correct pairwise formula
+- `MetricsAccumulator` — accumulates metrics across batches and GPUs (via `all_reduce`), then returns a flat dict for WandB logging via `.to_dict(prefix="")`
+
+All metrics are computed in denormalized (physical, mm/3h) space. The accumulator handles distributed reduction correctly, avoiding the averaging-of-averages error that arises when naively aggregating per-GPU metrics.
+
+### Hyperparameter search (`hp_search/`)
+
+Infrastructure for running Optuna-based hyperparameter optimization over diffusion model training. Uses an ask–tell interface (`optuna_ask.py`, `optuna_tell.py`) that decouples the optimizer from the training jobs, making it compatible with SLURM-managed cluster workflows.
+
 ## Getting started with the HRRR-Mini example
 
 To get started with CorrDiff, we provide a simplified version called CorrDiff-Mini that combines:
@@ -652,7 +756,6 @@ The generated samples are saved in a NetCDF file with three main components:
    validation loss is logged by our built-in loggers and to Weights & Biases (if enabled).
 
    **Early Stopping**: CorrDiff does not currently include built-in configurable early stopping. However, the training script saves multiple checkpoints throughout training and logs the associated validation losses. You can analyze these metrics after training to identify the optimal checkpoint with the lowest validation loss, effectively implementing a form of post-training early stopping.
-
 
 ## References
 

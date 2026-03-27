@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Unified evaluation configuration for evaluate.py
+#
+# Usage (single GPU):
+#   python evaluate.py --config-name=evaluate run_tag=my_run \
+#       generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
+#       generation.io.res_ckpt_filename=/path/to/diff.mdlus
+#
+# Usage (multi-GPU):
+#   torchrun --nproc_per_node=4 evaluate.py --config-name=evaluate \
+#       run_tag=my_run \
+#       generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
+#       generation.io.res_ckpt_filename=/path/to/diff.mdlus
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base   # Do not modify
+
+defaults:
+    - dataset: custom
+    - generation: non_patched
+    - times: random512   # switch to "custom128" for targeted high-precip eval
+
+# ── Experiment identifier ─────────────────────────────────────────────────────
+# Set this to a short descriptive tag; used as the W&B run name (eval-<run_tag>)
+run_tag: ???
+
+# ── W&B settings ─────────────────────────────────────────────────────────────
+wandb:
+    mode: online           # "online" | "offline" | "disabled"
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+# ── Evaluation settings ───────────────────────────────────────────────────────
+eval:
+    precip_threshold: 1.0  # mm — threshold for conditional high-precip metrics
+    output_json: eval_results.json
+    twcrps_thresholds: [5.0, 10.0]  # mm — thresholds for threshold-weighted CRPS
+    n_plot_events: 5                 # auto-select top-N timesteps by max precipitation for maps
+    plot_events: null                # optional explicit list of time_idx integers to plot
+    rapsd_dx_km: 2.0                 # grid spacing in km for RAPSD (Norway AROME ≈ 2 km)
+    predictions_file: auto  # "auto" = derive from checkpoint name; explicit path to save/load; null to disable
+    spread_skill_bin_mode: quantile  # "fixed" (legacy 8-bin) or "quantile" (20 equal-count bins)
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+    years: [2005]   # must include all eval timestep years
+
+# ── Sampler (diffusion only) ──────────────────────────────────────────────────
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 40
+    S_min: 0
+    S_max: .inf
+
+# ── Generation ────────────────────────────────────────────────────────────────
+generation:
+    inference_mode: all    # "regression" | "all" (regression + diffusion)
+    num_ensembles: 10
+    seed_batch_size: 10
+    hr_mean_conditioning: true
+
+    perf:
+        use_fp16: true
+        use_torch_compile: true
+
+    io:
+        # Checkpoint paths — override on the command line
+        reg_ckpt_filename: ???
+        res_ckpt_filename: ???
+        output_filename: /dev/null   # evaluate.py does not write NetCDF
+        guide_ckpt_filename: null   # optional: path to guidance model checkpoint
+
+    guidance_scale: 0.0             # autoguidance scale; 0 = no guidance
+    guidance_schedule_alpha: 0.0    # power exponent for noise-level schedule: w(sigma) = w*(sigma/sigma_max)^alpha
+

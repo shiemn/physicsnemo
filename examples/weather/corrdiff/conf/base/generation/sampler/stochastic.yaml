@@ -17,4 +17,8 @@
 # limitations under the License.
 
 type: stochastic
+# guidance_schedule_alpha is intentionally absent here so it can be set via
+# either sampler.guidance_schedule_alpha=X or generation.guidance_schedule_alpha=X
+# Power exponent for noise-level guidance schedule: w(sigma) = w * (sigma/sigma_max)^alpha
+# 0 = constant (default), >0 = stronger at high noise (coarse structure), <0 = stronger at low noise (fine detail)
 #overlap_pix has to be no less than 2*boundary_pix

@@ -1,0 +1,941 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unified evaluation script for CorrDiff models.
+
+Generates predictions for a fixed set of evaluation timesteps and computes
+standardised probabilistic metrics (RMSE, CRPS, twCRPS, Spread-Skill).
+Results are logged to a fresh W&B run and saved as a JSON backup.
+
+Diagnostic plots (spread-skill reliability, log histogram, RAPSD, georeferenced
+event maps) are generated on rank 0 and logged to W&B as images.
+
+Time-step parallelism: each GPU handles a disjoint subset of the evaluation
+timesteps.  All ensemble members for a given timestep are generated on the
+same GPU.  Metrics are reduced via all_reduce so every rank holds the same
+global totals at the end.
+
+Supported inference modes:
+    regression   – deterministic ensemble from the regression model only
+                   (all N members are the same prediction, spread = 0)
+    all          – regression mean + stochastic diffusion residuals
+
+Usage:
+    # Single GPU:
+    python evaluate.py --config-name=evaluate run_tag=my_experiment \\
+        generation.io.reg_ckpt_filename=/path/to/reg.mdlus \\
+        generation.io.res_ckpt_filename=/path/to/diff.mdlus
+
+    # Multi-GPU (4 GPUs):
+    torchrun --nproc_per_node=4 evaluate.py --config-name=evaluate \\
+        run_tag=my_experiment \\
+        generation.io.reg_ckpt_filename=/path/to/reg.mdlus \\
+        generation.io.res_ckpt_filename=/path/to/diff.mdlus
+"""
+
+import json
+import os
+
+import hydra
+import matplotlib.pyplot as plt
+import netCDF4 as nc
+import numpy as np
+import torch
+import wandb
+from hydra.utils import to_absolute_path
+from omegaconf import DictConfig, OmegaConf
+
+from physicsnemo.distributed import DistributedManager
+from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
+from physicsnemo.launch.logging.wandb import initialize_wandb
+from physicsnemo.utils.corrdiff import get_time_from_range, regression_step, diffusion_step
+from physicsnemo.utils.corrdiff.utils import NetCDFWriter
+
+from datasets.dataset import register_dataset
+from helpers.generate_helpers import (
+    build_sampler_fn,
+    get_dataset_and_sampler,
+    load_model,
+    load_models,
+    maybe_compile_models,
+    save_images,
+    setup_patching,
+)
+from helpers.metrics import MetricsAccumulator
+from helpers.plots import (
+    HistogramAccumulator,
+    RAPSDAccumulator,
+    plot_diagnostic_panel,
+    plot_example_event,
+)
+
+
+
+def _diagnostic_plot_payload(
+    acc_label: str,
+    metrics_dict: dict,
+    hist_acc: "HistogramAccumulator",
+    rapsd_acc: "RAPSDAccumulator",
+    rapsd_dx_km: float,
+) -> dict:
+    """Generate a combined diagnostic panel and return a dict of {key: wandb.Image}.
+
+    Does NOT call wandb.log — the caller collects all payloads into a single log call.
+    """
+    payload = {}
+    fig = plot_diagnostic_panel(
+        metrics_dict=metrics_dict,
+        acc_label=acc_label,
+        hist_acc=hist_acc,
+        rapsd_acc=rapsd_acc,
+        rapsd_dx_km=rapsd_dx_km,
+    )
+    if fig is not None:
+        payload[f"{acc_label}/diagnostics"] = wandb.Image(fig)
+        plt.close(fig)
+    return payload
+
+
+def _load_predictions_netcdf(path: str) -> dict:
+    """Load predictions and truth from a NetCDF file produced by generate.py or evaluate.py.
+
+    NetCDF structure (groups created by NetCDFWriter):
+        Root: lat(y,x), lon(y,x), time(time)
+        /truth/{channel}(time, y, x)                — ground truth (denormalized)
+        /prediction/{channel}(ensemble, time, y, x) — ensemble predictions (denormalized)
+        /input/{channel}(time, y, x)                — LR inputs (denormalized)
+
+    Returns:
+        dict with keys:
+            lat:            (H, W) numpy array
+            lon:            (H, W) numpy array
+            channel_names:  list[str]
+            n_times:        int
+            n_ensemble:     int
+            truth:          (T, C, H, W) numpy — stacked over channels
+            prediction:     (N_ens, T, C, H, W) numpy
+    """
+    f = nc.Dataset(path, "r")
+
+    if "truth" not in f.groups or "prediction" not in f.groups:
+        f.close()
+        raise ValueError(
+            f"NetCDF file {path} is missing required groups (truth/prediction). "
+            "The file may be corrupt or incomplete from a crashed run."
+        )
+
+    lat = f["lat"][:]
+    lon = f["lon"][:]
+
+    truth_group = f.groups["truth"]
+    pred_group = f.groups["prediction"]
+    channel_names = list(truth_group.variables.keys())
+
+    # Stack channels: truth is (time, y, x) per channel -> (T, C, H, W)
+    truth_arrays = [truth_group[ch][:] for ch in channel_names]  # list of (T, H, W)
+    truth = np.stack(truth_arrays, axis=1)  # (T, C, H, W)
+
+    pred_arrays = [pred_group[ch][:] for ch in channel_names]  # list of (N, T, H, W)
+    prediction = np.stack(pred_arrays, axis=2)  # (N, T, C, H, W)
+
+    f.close()
+    return {
+        "lat": lat,
+        "lon": lon,
+        "channel_names": channel_names,
+        "n_times": truth.shape[0],
+        "n_ensemble": prediction.shape[0],
+        "truth": truth,
+        "prediction": prediction,
+    }
+
+
+def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
+    """Offline evaluation: load predictions + truth from NetCDF, compute metrics.
+
+    No models, dataset, or GPU needed. Runs on a single process.
+    """
+    logger = PythonLogger("evaluate")
+    logger.file_logging("evaluate.log")
+
+    run_tag = cfg.get("run_tag", "eval")
+    precip_threshold = cfg.eval.get("precip_threshold", 1.0)
+    output_json = cfg.eval.get("output_json", "eval_results.json")
+    twcrps_thresholds = list(cfg.eval.get("twcrps_thresholds", [5.0, 10.0]))
+    n_plot_events = cfg.eval.get("n_plot_events", 5)
+    plot_events = list(cfg.eval.get("plot_events", None) or [])
+    rapsd_dx_km = float(cfg.eval.get("rapsd_dx_km", 2.0))
+    spread_skill_bin_mode = cfg.eval.get("spread_skill_bin_mode", "quantile")
+
+    logger.info(f"Loading predictions from: {predictions_path}")
+    data = _load_predictions_netcdf(predictions_path)
+    n_times = data["n_times"]
+    n_ens = data["n_ensemble"]
+    channel_names = data["channel_names"]
+    lat_np = data["lat"]
+    lon_np = data["lon"]
+    img_shape = (data["truth"].shape[2], data["truth"].shape[3])
+
+    logger.info(f"  Loaded {n_times} timesteps, {n_ens} ensemble members, "
+                f"{len(channel_names)} channels, shape {img_shape}")
+
+    if n_times == 0:
+        logger.warning(
+            f"Predictions file {predictions_path} contains 0 timesteps — "
+            "it may be corrupt or incomplete from a crashed run. "
+            "Delete the file and re-run to regenerate predictions."
+        )
+        return
+
+    # Determine if regression-only (1 member) or ensemble
+    is_regression = n_ens == 1
+
+    # W&B init
+    initialize_wandb(
+        project=cfg.wandb.get("project", "evaluation"),
+        entity=cfg.wandb.get("entity", "shiemn"),
+        name=f"eval-{run_tag}",
+        group="CorrDiff-Eval",
+        mode=cfg.wandb.get("mode", "online"),
+        config=OmegaConf.to_container(cfg, resolve=True),
+        results_dir=cfg.wandb.get("results_dir", "./wandb"),
+    )
+
+    device = torch.device("cpu")
+    metrics_acc = MetricsAccumulator(
+        precip_threshold=precip_threshold,
+        device=device,
+        twcrps_thresholds=twcrps_thresholds,
+        skip_spread_skill=is_regression,
+        bin_mode=spread_skill_bin_mode,
+    )
+    hist_acc = HistogramAccumulator(device=device)
+    rapsd_acc = RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
+
+    event_candidates = []
+
+    for t in range(n_times):
+        pred_t = torch.from_numpy(data["prediction"][:, t])  # (N_ens, C, H, W)
+        tar_t = torch.from_numpy(data["truth"][t])            # (C, H, W)
+
+        metrics_acc.update(pred_t, tar_t)
+        hist_acc.update(pred_t, tar_t)
+        rapsd_acc.update(pred_t, tar_t)
+        event_candidates.append((t, float(tar_t.max()), t))
+
+    acc_label = "regression" if is_regression else "diffusion"
+    metrics_dict = metrics_acc.to_dict(prefix=f"{acc_label}/")
+
+    wandb_payload = {}
+    wandb_payload.update(metrics_dict)
+
+    # Console summary
+    logger.info("=" * 70)
+    logger.info("EVALUATION RESULTS (from file)")
+    logger.info("=" * 70)
+    for k, v in metrics_dict.items():
+        if isinstance(v, float):
+            logger.info(f"  {k}: {v:.6f}")
+        elif not isinstance(v, list):
+            logger.info(f"  {k}: {v}")
+
+    # JSON backup
+    with open(output_json, "w") as f:
+        json.dump(metrics_dict, f, indent=2)
+    logger.info(f"Results saved to: {output_json}")
+
+    # Diagnostic plots
+    wandb_payload.update(_diagnostic_plot_payload(
+        acc_label=acc_label,
+        metrics_dict=metrics_dict,
+        hist_acc=hist_acc,
+        rapsd_acc=rapsd_acc,
+        rapsd_dx_km=rapsd_dx_km,
+    ))
+
+    # Event plots
+    explicit_set = set(plot_events)
+    sorted_cands = sorted(event_candidates, key=lambda x: -x[1])
+    auto_set = {c[0] for c in sorted_cands[:n_plot_events]}
+    plot_set = explicit_set | auto_set
+
+    # Step 0: diagnostic panels + scalar metrics
+    scalar_payload = {k: v for k, v in wandb_payload.items() if not isinstance(v, wandb.Image)}
+    wandb.summary.update(scalar_payload)
+    wandb.log(wandb_payload, step=0, commit=True)
+
+    # Steps 1..N: one step per event so the slider navigates between events
+    if plot_set:
+        logger.info(f"Generating {len(plot_set)} example event plot(s)...")
+        for event_step, time_idx in enumerate(sorted(plot_set), start=1):
+            if time_idx >= n_times:
+                continue
+            pred_ens_np = data["prediction"][:, time_idx]  # (N_ens, C, H, W)
+            target_np = data["truth"][time_idx]             # (C, H, W)
+            reg_mean_np = pred_ens_np.mean(axis=0)          # (C, H, W)
+            max_precip = float(target_np.max())
+
+            fig = plot_example_event(
+                pred_ens_np=pred_ens_np,
+                target_np=target_np,
+                reg_mean_np=reg_mean_np,
+                time_str=str(time_idx),
+                channel_names=channel_names,
+                lat=lat_np,
+                lon=lon_np,
+            )
+            wandb.log(
+                {
+                    "event/plot": wandb.Image(fig, caption=f"t{time_idx} max={max_precip:.1f}mm"),
+                    "event/time_idx": time_idx,
+                    "event/max_precip_mm": max_precip,
+                },
+                step=event_step,
+                commit=True,
+            )
+            plt.close(fig)
+
+    wandb.finish()
+    logger.info("Evaluation from file complete.")
+
+
+def _run_single_timestep(
+    dataset,
+    dataset_idx: int,
+    net_reg,
+    net_res,
+    sampler_fn,
+    img_shape: tuple[int, int],
+    img_out_channels: int,
+    device,
+    hr_mean_conditioning: bool,
+    diffusion_kwargs: dict,
+    seed_batches,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run regression + diffusion inference for a single timestep on one GPU.
+
+    Returns:
+        reg_mean_np:  (C, H, W) regression prediction in physical units (mm).
+        ens_pred_np:  (N_ens, C, H, W) full ensemble in physical units, or same
+                      as reg_mean_np if net_res is None.
+        target_np:    (C, H, W) ground truth in physical units (mm).
+    """
+    image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
+    if isinstance(image_tar, np.ndarray):
+        image_tar = torch.from_numpy(image_tar)
+    if isinstance(image_lr, np.ndarray):
+        image_lr = torch.from_numpy(image_lr)
+
+    image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
+    image_lr = (
+        image_lr.unsqueeze(0)
+        .to(device=device, dtype=torch.float32)
+        .to(memory_format=torch.channels_last)
+    )
+    if lead_time_label:
+        lt = lead_time_label[0]
+        if isinstance(lt, np.ndarray):
+            lt = torch.from_numpy(lt)
+        lead_time_label = lt.unsqueeze(0).to(device).contiguous()
+    else:
+        lead_time_label = None
+
+    with torch.no_grad():
+        image_reg = regression_step(
+            net=net_reg,
+            img_lr=image_lr,
+            latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+            lead_time_label=lead_time_label,
+        )
+    reg_mean = image_reg[0:1]  # (1, C, H, W)
+
+    reg_mean_np = dataset.denormalize_output(reg_mean.cpu().numpy())[0]  # (C, H, W)
+    target_np = dataset.denormalize_output(image_tar.cpu().numpy())[0]   # (C, H, W)
+
+    if net_res is not None and sampler_fn is not None:
+        mean_hr = reg_mean if hr_mean_conditioning else None
+        all_residuals = []
+        for seed_batch in seed_batches:
+            batch_size = len(seed_batch)
+            rank_batches = [torch.tensor(seed_batch)]
+            with torch.no_grad():
+                res = diffusion_step(
+                    net=net_res,
+                    sampler_fn=sampler_fn,
+                    img_shape=img_shape,
+                    img_out_channels=img_out_channels,
+                    rank_batches=rank_batches,
+                    img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
+                        memory_format=torch.channels_last
+                    ),
+                    rank=0,
+                    device=device,
+                    mean_hr=mean_hr,
+                    lead_time_label=lead_time_label,
+                    **diffusion_kwargs,
+                )
+            all_residuals.append(res)
+        diffusion_residuals = torch.cat(all_residuals, dim=0)  # (N_ens, C, H, W)
+        ens_pred = reg_mean + diffusion_residuals               # (N_ens, C, H, W)
+        ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())  # (N_ens, C, H, W)
+    else:
+        ens_pred_np = reg_mean_np[np.newaxis]  # (1, C, H, W)
+
+    return reg_mean_np, ens_pred_np, target_np
+
+
+@hydra.main(version_base="1.2", config_path="conf", config_name="evaluate")
+def main(cfg: DictConfig) -> None:
+    """Evaluate a CorrDiff checkpoint on the configured eval timesteps."""
+
+    DistributedManager.initialize()
+    dist = DistributedManager()
+    device = dist.device
+
+    logger = PythonLogger("evaluate")
+    logger0 = RankZeroLoggingWrapper(logger, dist)
+    logger.file_logging("evaluate.log")
+
+    # ------------------------------------------------------------------
+    # Config extraction
+    # ------------------------------------------------------------------
+    run_tag = cfg.get("run_tag", "eval")
+    inference_mode = cfg.generation.inference_mode
+    if inference_mode not in ("regression", "all"):
+        raise ValueError(
+            f'Unsupported inference_mode={inference_mode!r}. '
+            f'Must be "regression" or "all" (regression + diffusion).'
+        )
+    num_ensembles = cfg.generation.num_ensembles
+    seed_batch_size = cfg.generation.seed_batch_size
+    precip_threshold = cfg.eval.get("precip_threshold", 1.0)
+    output_json = cfg.eval.get("output_json", "eval_results.json")
+    twcrps_thresholds = list(cfg.eval.get("twcrps_thresholds", [5.0, 10.0]))
+    n_plot_events = cfg.eval.get("n_plot_events", 5)
+    plot_events = list(cfg.eval.get("plot_events", None) or [])
+    rapsd_dx_km = float(cfg.eval.get("rapsd_dx_km", 2.0))
+    predictions_file_cfg = cfg.eval.get("predictions_file", None)
+
+    # Resolve "auto" → derive filename from the primary checkpoint name.
+    # Done early so the offline-load check works, but we need the checkpoint
+    # path from the config (not the loaded model).
+    if predictions_file_cfg == "auto":
+        # Use diffusion checkpoint if available, otherwise regression
+        if inference_mode == "all":
+            _ckpt = cfg.generation.io.res_ckpt_filename
+        else:
+            _ckpt = cfg.generation.io.reg_ckpt_filename
+        _stem = os.path.splitext(os.path.basename(str(_ckpt)))[0]
+        predictions_file = f"eval_{_stem}.nc"
+    else:
+        predictions_file = predictions_file_cfg  # explicit path or None
+
+    # ------------------------------------------------------------------
+    # Offline mode: load predictions from existing NetCDF file
+    # ------------------------------------------------------------------
+    if predictions_file is not None:
+        abs_pred_path = to_absolute_path(predictions_file)
+        if os.path.isfile(abs_pred_path):
+            logger0.info(f"Predictions file exists — running offline evaluation from: {abs_pred_path}")
+            if dist.rank == 0:
+                _evaluate_from_file(cfg, abs_pred_path)
+            if dist.world_size > 1:
+                torch.distributed.barrier()
+            return
+
+    logger0.info(f"=== CorrDiff Unified Evaluation ===")
+    logger0.info(f"  Run tag:        {run_tag}")
+    logger0.info(f"  Inference mode: {inference_mode}")
+    logger0.info(f"  Ensembles:      {num_ensembles}")
+    logger0.info(f"  Threshold:      {precip_threshold} mm")
+    logger0.info(f"  twCRPS at:      {twcrps_thresholds} mm")
+    logger0.info(f"  Plot events:    top-{n_plot_events} (+ {len(plot_events)} explicit)")
+    logger0.info(f"  GPUs:           {dist.world_size}")
+
+    # ------------------------------------------------------------------
+    # W&B initialisation (rank 0 only)
+    # ------------------------------------------------------------------
+    if dist.rank == 0:
+        guidance_scale = float(cfg.generation.get("guidance_scale", 0.0))
+        guidance_schedule_alpha = float(cfg.generation.get("guidance_schedule_alpha", 0.0))
+        wandb_name = f"eval-{run_tag}-g{guidance_scale}" if guidance_scale != 0.0 else f"eval-{run_tag}"
+        if guidance_schedule_alpha != 0.0:
+            wandb_name += f"-a{guidance_schedule_alpha}"
+        initialize_wandb(
+            project=cfg.wandb.get("project", "evaluation"),
+            entity=cfg.wandb.get("entity", "shiemn"),
+            name=wandb_name,
+            group="CorrDiff-Eval",
+            mode=cfg.wandb.get("mode", "online"),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            results_dir=cfg.wandb.get("results_dir", "./wandb"),
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset and eval timesteps
+    # ------------------------------------------------------------------
+    has_times_range = (
+        hasattr(cfg.generation, "times_range")
+        and cfg.generation.times_range is not None
+    )
+    has_times = (
+        hasattr(cfg.generation, "times") and cfg.generation.times is not None
+    )
+    if has_times_range and has_times:
+        raise ValueError("Provide times_range or times, not both.")
+    elif has_times_range:
+        times = get_time_from_range(cfg.generation.times_range)
+    elif has_times:
+        times = list(cfg.generation.times)
+    else:
+        raise ValueError("Either times_range or times must be set in cfg.generation.")
+
+    dataset_cfg = OmegaConf.to_container(cfg.dataset)
+    register_dataset(cfg.dataset.type)
+
+    has_lead_time = cfg.generation.get("has_lead_time", False)
+    dataset, sampler = get_dataset_and_sampler(
+        dataset_cfg=dataset_cfg, times=times, has_lead_time=has_lead_time
+    )
+    total_times = len(sampler)
+
+    # Rebuild times as cftime objects (needed by NetCDFWriter.write_time)
+    all_dataset_times = dataset.time()
+    times = [all_dataset_times[i] for i in sampler] if sampler else all_dataset_times
+
+    img_shape = dataset.image_shape()
+    img_out_channels = len(dataset.output_channels())
+    channel_names = list(dataset.output_channels())
+
+    # Lat/lon for georeferenced plots (xarray.DataArray -> numpy)
+    try:
+        lat_np = np.array(dataset.latitude())
+        lon_np = np.array(dataset.longitude())
+    except AttributeError:
+        lat_np = None
+        lon_np = None
+
+    logger0.info(f"  Eval timesteps: {total_times} (matched {total_times}/{len(times)})")
+
+    if total_times == 0:
+        logger0.error("No matching timesteps found in dataset. Aborting.")
+        return
+
+    # ------------------------------------------------------------------
+    # Patching
+    # ------------------------------------------------------------------
+    patching, img_shape = setup_patching(cfg, img_shape)
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+    # Build EDM2 kwargs if config section is present (needed for .pt checkpoints)
+    edm2_kwargs = None
+    if cfg.generation.get("edm2") is not None:
+        img_in_channels = len(dataset.input_channels())
+        if cfg.generation.hr_mean_conditioning:
+            img_in_channels += img_out_channels
+        edm2_kwargs = {
+            "img_resolution": list(img_shape),
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": cfg.generation.perf.get("use_fp16", False),
+            "sigma_data": cfg.generation.edm2.get("sigma_data", 0.5),
+        }
+        edm2_model_args = cfg.generation.edm2.get("model_args", None)
+        if edm2_model_args is not None:
+            edm2_kwargs.update(OmegaConf.to_container(edm2_model_args))
+
+    guidance_scale = float(cfg.generation.get("guidance_scale", 0.0))
+    guidance_schedule_alpha = float(cfg.generation.get("guidance_schedule_alpha", 0.0))
+    guide_ckpt = cfg.generation.io.get("guide_ckpt_filename", None)
+
+    logger0.info("Loading models...")
+    net_reg, net_res = load_models(
+        cfg, device,
+        load_net_reg=True,
+        load_net_res=(inference_mode == "all"),
+        edm2_kwargs=edm2_kwargs,
+    )
+    net_guide = None
+    if guidance_scale != 0.0 and guide_ckpt:
+        logger0.info(f"Loading guidance model (scale={guidance_scale}): {guide_ckpt}")
+        net_guide = load_model(to_absolute_path(guide_ckpt), device, cfg.generation.perf, edm2_kwargs)
+    elif guidance_scale != 0.0:
+        logger0.warning("guidance_scale != 0 but no guide_ckpt_filename — running without guidance")
+    net_reg, net_res = maybe_compile_models(cfg, net_reg, net_res)
+
+    # ------------------------------------------------------------------
+    # Sampler function (diffusion only)
+    # ------------------------------------------------------------------
+    sampler_fn = build_sampler_fn(cfg.sampler, patching, net_guide=net_guide, guidance_scale=guidance_scale, guidance_schedule_alpha=guidance_schedule_alpha) if net_res else None
+
+    # ------------------------------------------------------------------
+    # Seed batches for ensemble generation
+    # ------------------------------------------------------------------
+    seeds = list(np.arange(num_ensembles))
+    num_seed_batches = (len(seeds) - 1) // seed_batch_size + 1
+    seed_batches = np.array_split(seeds, num_seed_batches)
+
+    # ------------------------------------------------------------------
+    # Metric accumulators (one per inference mode that is active)
+    # ------------------------------------------------------------------
+    metrics_reg = MetricsAccumulator(
+        precip_threshold=precip_threshold,
+        device=device,
+        twcrps_thresholds=twcrps_thresholds,
+        skip_spread_skill=True,
+    )
+    metrics_diff = (
+        MetricsAccumulator(
+            precip_threshold=precip_threshold,
+            device=device,
+            twcrps_thresholds=twcrps_thresholds,
+        )
+        if inference_mode == "all"
+        else None
+    )
+
+    # Histogram and RAPSD accumulators
+    hist_acc_reg = HistogramAccumulator(device=device)
+    rapsd_acc_reg = RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
+    hist_acc_diff = HistogramAccumulator(device=device) if inference_mode == "all" else None
+    rapsd_acc_diff = (
+        RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
+        if inference_mode == "all"
+        else None
+    )
+
+    # Event candidates for auto-selection of plot timesteps: (time_idx, max_precip, dataset_idx)
+    local_event_candidates: list[tuple[int, float, int]] = []
+
+    # Buffer for NetCDF save (normalized tensors, CPU)
+    local_save_data: list[dict] = [] if predictions_file else []
+    save_predictions = predictions_file is not None
+
+    # ------------------------------------------------------------------
+    # Distribution kwargs for diffusion_step
+    # ------------------------------------------------------------------
+    diffusion_kwargs = {}
+    for cfg_key, kwarg_key in [
+        ("distribution", "distribution"),
+        ("student_t_nu", "nu"),
+        ("P_mean", "P_mean"),
+        ("P_std", "P_std"),
+    ]:
+        val = cfg.generation.get(cfg_key, None)
+        if val is not None:
+            diffusion_kwargs[kwarg_key] = val
+
+    # ------------------------------------------------------------------
+    # Main evaluation loop
+    # ------------------------------------------------------------------
+    if dist.world_size > 1:
+        torch.distributed.barrier()
+
+    max_iters = (total_times + dist.world_size - 1) // dist.world_size
+    logger0.info("Starting evaluation loop...")
+
+    for iteration in range(max_iters):
+        time_idx = dist.rank + iteration * dist.world_size
+        if time_idx >= total_times:
+            continue
+
+        dataset_idx = sampler[time_idx]
+        logger.info(
+            f"[GPU {dist.rank}] {iteration + 1}/{max_iters}: time_idx={time_idx}"
+        )
+
+        # Load data (normalized)
+        image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
+        if isinstance(image_tar, np.ndarray):
+            image_tar = torch.from_numpy(image_tar)
+        if isinstance(image_lr, np.ndarray):
+            image_lr = torch.from_numpy(image_lr)
+
+        image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
+        image_lr = (
+            image_lr.unsqueeze(0)
+            .to(device=device, dtype=torch.float32)
+            .to(memory_format=torch.channels_last)
+        )
+        if lead_time_label:
+            lt = lead_time_label[0]
+            if isinstance(lt, np.ndarray):
+                lt = torch.from_numpy(lt)
+            lead_time_label = lt.unsqueeze(0).to(device).contiguous()
+        else:
+            lead_time_label = None
+
+        # -- Regression forward pass --
+        with torch.no_grad():
+            image_reg = regression_step(
+                net=net_reg,
+                img_lr=image_lr,
+                latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+                lead_time_label=lead_time_label,
+            )
+        reg_mean = image_reg[0:1]  # (1, C, H, W)
+
+        # Denormalize regression prediction and target
+        reg_pred_np = dataset.denormalize_output(reg_mean.cpu().numpy())          # (1, C, H, W)
+        tar_np = dataset.denormalize_output(image_tar.cpu().numpy())              # (1, C, H, W)
+        reg_pred_t = torch.from_numpy(reg_pred_np).to(device)                    # (1, C, H, W)
+        tar_t = torch.from_numpy(tar_np).to(device)                               # (1, C, H, W)
+
+        # Regression metrics: treat single pred as a 1-member ensemble
+        metrics_reg.update(reg_pred_t, tar_t)
+        hist_acc_reg.update(reg_pred_t, tar_t.squeeze(0))
+        rapsd_acc_reg.update(reg_pred_t, tar_t.squeeze(0))
+
+        # Track as event candidate for auto-selection of plot timesteps
+        local_event_candidates.append((time_idx, float(tar_t.max()), dataset_idx))
+
+        # -- Diffusion forward pass (when mode == "all") --
+        if net_res is not None and metrics_diff is not None:
+            mean_hr = reg_mean if cfg.generation.hr_mean_conditioning else None
+            all_residuals = []
+            for seed_batch in seed_batches:
+                batch_size = len(seed_batch)
+                rank_batches = [torch.tensor(seed_batch)]
+                with torch.no_grad():
+                    res = diffusion_step(
+                        net=net_res,
+                        sampler_fn=sampler_fn,
+                        img_shape=img_shape,
+                        img_out_channels=img_out_channels,
+                        rank_batches=rank_batches,
+                        img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
+                            memory_format=torch.channels_last
+                        ),
+                        rank=0,
+                        device=device,
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        **diffusion_kwargs,
+                    )
+                all_residuals.append(res)
+
+            # Full ensemble: regression mean + diffusion residuals
+            diffusion_residuals = torch.cat(all_residuals, dim=0)   # (N_ens, C, H, W)
+            ens_pred = reg_mean + diffusion_residuals                # (N_ens, C, H, W)
+
+            ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())
+            ens_pred_t = torch.from_numpy(ens_pred_np).to(device)    # (N_ens, C, H, W)
+
+            metrics_diff.update(ens_pred_t, tar_t)
+            hist_acc_diff.update(ens_pred_t, tar_t.squeeze(0))
+            rapsd_acc_diff.update(ens_pred_t, tar_t.squeeze(0))
+
+        # Buffer normalized predictions for NetCDF save
+        if save_predictions:
+            # Use the diffusion ensemble if available, otherwise regression only
+            if net_res is not None and metrics_diff is not None:
+                image_out = ens_pred.cpu()  # (N_ens, C, H, W), normalized
+            else:
+                image_out = reg_mean.cpu()  # (1, C, H, W), normalized
+            local_save_data.append({
+                "time_idx": time_idx,
+                "dataset_idx": dataset_idx,
+                "image_out": image_out,
+                "image_tar": image_tar.cpu(),  # (1, C, H, W), normalized
+                "image_lr": image_lr.cpu(),    # (1, C_lr, H, W), normalized
+            })
+
+    # ------------------------------------------------------------------
+    # Distributed reduce (all_reduce so every rank has global totals)
+    # ------------------------------------------------------------------
+    metrics_reg.reduce()
+    hist_acc_reg.reduce()
+    rapsd_acc_reg.reduce()
+    if metrics_diff is not None:
+        metrics_diff.reduce()
+    if hist_acc_diff is not None:
+        hist_acc_diff.reduce()
+    if rapsd_acc_diff is not None:
+        rapsd_acc_diff.reduce()
+
+    # Gather event candidates from all ranks (plain Python objects, no GPU tensors)
+    if dist.world_size > 1:
+        all_candidates: list[tuple[int, float, int]] = [None] * dist.world_size
+        torch.distributed.all_gather_object(all_candidates, local_event_candidates)
+        all_candidates = [item for sublist in all_candidates for item in sublist]
+    else:
+        all_candidates = local_event_candidates
+
+    # ------------------------------------------------------------------
+    # Save predictions to NetCDF (rank 0 gathers from all ranks and writes)
+    # ------------------------------------------------------------------
+    if save_predictions:
+        if dist.world_size > 1:
+            all_save_data_nested = [None] * dist.world_size
+            torch.distributed.all_gather_object(all_save_data_nested, local_save_data)
+            all_save_data = sorted(
+                [d for rank_data in all_save_data_nested for d in rank_data],
+                key=lambda x: x["time_idx"],
+            )
+        else:
+            all_save_data = sorted(local_save_data, key=lambda x: x["time_idx"])
+
+        if dist.rank == 0:
+            abs_pred_path = to_absolute_path(predictions_file)
+            tmp_path = abs_pred_path + ".tmp"
+            logger.info(f"Saving predictions to: {abs_pred_path}")
+            nc_file = nc.Dataset(tmp_path, "w")
+            nc_file.cfg = str(cfg)
+            nc_writer = NetCDFWriter(
+                nc_file,
+                lat=np.array(dataset.latitude()),
+                lon=np.array(dataset.longitude()),
+                input_channels=dataset.input_channels(),
+                output_channels=dataset.output_channels(),
+                has_lead_time=cfg.generation.get("has_lead_time", False),
+            )
+            for write_idx, d in enumerate(all_save_data):
+                save_images(
+                    writer=nc_writer,
+                    dataset=dataset,
+                    times=list(times),
+                    image_out=d["image_out"],
+                    image_tar=d["image_tar"],
+                    image_lr=d["image_lr"],
+                    time_index=write_idx,
+                    t_index=d["time_idx"],
+                    has_lead_time=cfg.generation.get("has_lead_time", False),
+                )
+            nc_file.close()
+            os.rename(tmp_path, abs_pred_path)
+            logger.info(f"Saved {len(all_save_data)} timesteps to {abs_pred_path}")
+
+    # ------------------------------------------------------------------
+    # Log metrics and plots (rank 0 only)
+    # ------------------------------------------------------------------
+    if dist.rank == 0:
+        wandb_payload = {}
+
+        reg_dict = metrics_reg.to_dict(prefix="regression/")
+        wandb_payload.update(reg_dict)
+
+        diff_dict = {}
+        if metrics_diff is not None:
+            diff_dict = metrics_diff.to_dict(prefix="diffusion/")
+            wandb_payload.update(diff_dict)
+
+        all_metrics = {**reg_dict, **diff_dict}
+
+        # Console summary
+        logger.info("=" * 70)
+        logger.info("EVALUATION RESULTS")
+        logger.info("=" * 70)
+        for k, v in all_metrics.items():
+            if isinstance(v, float):
+                logger.info(f"  {k}: {v:.6f}")
+            elif not isinstance(v, list):
+                logger.info(f"  {k}: {v}")
+
+        # JSON backup
+        with open(output_json, "w") as f:
+            json.dump(all_metrics, f, indent=2)
+        logger.info(f"Results saved to: {output_json}")
+
+        # --------------------------------------------------------------
+        # Diagnostic plots — regression
+        # --------------------------------------------------------------
+        wandb_payload.update(_diagnostic_plot_payload(
+            acc_label="regression",
+            metrics_dict=reg_dict,
+            hist_acc=hist_acc_reg,
+            rapsd_acc=rapsd_acc_reg,
+            rapsd_dx_km=rapsd_dx_km,
+        ))
+
+        # Diagnostic plots — diffusion
+        if metrics_diff is not None and hist_acc_diff is not None:
+            wandb_payload.update(_diagnostic_plot_payload(
+                acc_label="diffusion",
+                metrics_dict=diff_dict,
+                hist_acc=hist_acc_diff,
+                rapsd_acc=rapsd_acc_diff,
+                rapsd_dx_km=rapsd_dx_km,
+            ))
+
+        # --------------------------------------------------------------
+        # Example event plots (georeferenced, cartopy)
+        # --------------------------------------------------------------
+        explicit_set = set(plot_events)
+        sorted_cands = sorted(all_candidates, key=lambda x: -x[1])
+        auto_set = {c[0] for c in sorted_cands[:n_plot_events]}
+        plot_set = explicit_set | auto_set
+
+        # Step 0: diagnostic panels + scalar metrics
+        scalar_payload = {k: v for k, v in wandb_payload.items() if not isinstance(v, wandb.Image)}
+        wandb.summary.update(scalar_payload)
+        wandb.log(wandb_payload, step=0, commit=True)
+
+        # Steps 1..N: one step per event so the slider navigates between events
+        if plot_set:
+            logger.info(f"Generating {len(plot_set)} example event plot(s)...")
+            candidate_map = {c[0]: c for c in all_candidates}
+
+            for event_step, time_idx in enumerate(sorted(plot_set), start=1):
+                if time_idx not in candidate_map:
+                    logger.warning(f"time_idx {time_idx} not in any rank's candidates; skipping.")
+                    continue
+                _, max_precip, dataset_idx = candidate_map[time_idx]
+
+                reg_mean_np, ens_pred_np, target_np = _run_single_timestep(
+                    dataset=dataset,
+                    dataset_idx=dataset_idx,
+                    net_reg=net_reg,
+                    net_res=net_res,
+                    sampler_fn=sampler_fn,
+                    img_shape=img_shape,
+                    img_out_channels=img_out_channels,
+                    device=device,
+                    hr_mean_conditioning=cfg.generation.hr_mean_conditioning,
+                    diffusion_kwargs=diffusion_kwargs,
+                    seed_batches=seed_batches,
+                )
+
+                time_label = str(times[time_idx]) if time_idx < len(times) else str(time_idx)
+                fig = plot_example_event(
+                    pred_ens_np=ens_pred_np,
+                    target_np=target_np,
+                    reg_mean_np=reg_mean_np,
+                    time_str=time_label,
+                    channel_names=channel_names,
+                    lat=lat_np,
+                    lon=lon_np,
+                )
+                wandb.log(
+                    {
+                        "event/plot": wandb.Image(fig, caption=f"t{time_idx} {time_label} max={max_precip:.1f}mm"),
+                        "event/time_idx": time_idx,
+                        "event/max_precip_mm": max_precip,
+                    },
+                    step=event_step,
+                    commit=True,
+                )
+                plt.close(fig)
+                logger.info(f"  Logged event plot for time_idx={time_idx} ({time_label})")
+
+        wandb.finish()
+
+    logger0.info("Evaluation complete.")
+
+
+if __name__ == "__main__":
+    main()

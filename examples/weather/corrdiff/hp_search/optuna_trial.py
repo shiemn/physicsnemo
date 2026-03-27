@@ -258,7 +258,7 @@ def run_single_evaluation(
     num_gpus: int = 4,
 ) -> Dict[str, float]:
     """Run evaluation with a single generation config (multi-node via srun + apptainer)."""
-    gen_script = CORRDIFF_ROOT / 'generate_parallel_times.py'
+    gen_script = CORRDIFF_ROOT / 'generate.py'
 
     # Get container and paths from environment (set by SLURM script)
     container = os.environ.get('HP_CONTAINER', '')

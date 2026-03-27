@@ -254,6 +254,7 @@ def main(cfg: DictConfig) -> None:
         "lt_aware_patched_diffusion",
         "heteroscedastic_diffusion",
         "heteroscedastic_patched_diffusion",
+        "edm2_diffusion",
     ]:
         raise ValueError(
             f"cfg.training.distribution should only be specified for diffusion models."
@@ -828,6 +829,14 @@ def main(cfg: DictConfig) -> None:
                         rank_0_only=True,
                     )
                     if ptt:
+                        if dist.rank == 0:
+                            wandb_train_payload = {
+                                "training_loss": average_loss,
+                                "training_loss_running_mean": average_loss_running_mean,
+                            }
+                            for key, value in averaged_loss_components.items():
+                                wandb_train_payload[f"training_components/{key}"] = value
+                            wandb.log(wandb_train_payload, step=cur_nimg)
                         # reset running mean of average loss
                         average_loss_running_mean = 0
                         n_average_loss_running_mean = 1

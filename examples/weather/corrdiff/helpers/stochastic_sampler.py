@@ -93,6 +93,7 @@ def stochastic_sampler(
     S_noise: float = 1,
     net_guide: Optional[torch.nn.Module] = None,
     guidance_scale: float = 0.0,
+    guidance_schedule_alpha: float = 0.0,
 ) -> Tensor:
     r"""
     Proposed EDM sampler (Algorithm 2) with minor changes to enable
@@ -288,8 +289,9 @@ def stochastic_sampler(
         if isinstance(denoised, tuple):
             denoised = denoised[0]
 
-        # Autoguidance: D_guided = D_main + w * (D_main - D_weak)
+        # Autoguidance: D_guided = D_main + w(sigma) * (D_main - D_weak)
         if net_guide is not None and guidance_scale != 0.0:
+            effective_scale = guidance_scale * (float(t_hat) / sigma_max) ** guidance_schedule_alpha
             with torch.no_grad():
                 denoised_weak = net_guide(
                     x_hat_batch, x_lr, t_hat, class_labels,
@@ -298,7 +300,7 @@ def stochastic_sampler(
                 )
             if isinstance(denoised_weak, tuple):
                 denoised_weak = denoised_weak[0]
-            denoised = denoised + guidance_scale * (denoised - denoised_weak)
+            denoised = denoised + effective_scale * (denoised - denoised_weak)
 
         if patching:
             # Un-patch the denoised image
@@ -332,6 +334,7 @@ def stochastic_sampler(
 
             # Autoguidance on 2nd-order correction step
             if net_guide is not None and guidance_scale != 0.0:
+                effective_scale = guidance_scale * (float(t_next) / sigma_max) ** guidance_schedule_alpha
                 with torch.no_grad():
                     denoised_weak = net_guide(
                         x_next_batch, x_lr, t_next, class_labels,
@@ -340,7 +343,7 @@ def stochastic_sampler(
                     )
                 if isinstance(denoised_weak, tuple):
                     denoised_weak = denoised_weak[0]
-                denoised = denoised + guidance_scale * (denoised - denoised_weak)
+                denoised = denoised + effective_scale * (denoised - denoised_weak)
 
             if patching:
                 # Un-patch the denoised image

@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Training config for EDM2 v2 diffusion model on the Norway (large) domain.
+#
+# Key fixes vs edm2_norwayW.yaml (v1):
+#   1. channel_mult extended to 6 levels so attention at [16] actually fires
+#      (v1 had only 4 levels on 512px input — resolution 16 was never reached)
+#   2. sigma_data set to value from HP grid search (~1.0 vs incorrect default 0.5)
+#   3. P_mean / P_std from HP search now enabled
+
+hydra:
+    job:
+        chdir: false
+        name: edm2_v2_norwayW
+    run:
+        dir: ./output/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base # Do not modify
+
+
+defaults:
+    - dataset: custom
+    - model: edm2_diffusion
+    - training: ${model}
+    # Note: model_size is intentionally omitted — that config sets SongUNet-specific
+    # channel_mult=[1,2,2,2,2] which conflicts with EDM2's paper-recommended layout.
+
+
+model:
+    name: edm2_diffusion
+    hr_mean_conditioning: True
+
+    model_args:
+        model_channels: 128
+        # 128 channels with [1,2,3,4,4,4] gives ~233M params — 3× the original SongUNet
+        # (~79M) with working attention. Same channels at 512×512 as the original, so
+        # memory per sample is comparable at batch=4 on H100.
+
+        channel_mult: [1, 2, 3, 4, 4, 4]
+        # 6 levels → resolutions 512, 256, 128, 64, 32, 16 for a 512px input.
+        # Level 5 (res=16) is where attn_resolutions=[16] now correctly fires.
+        # Previously 4 levels only reached res=64, so attention never applied.
+
+        attn_resolutions: [16]
+        # Fires at level 5 (res=16×16). Matches the training config in v1 but
+        # now actually takes effect. Add 8 and use [1,2,3,4,4,4,4] (7 levels)
+        # to also apply attention at res=8 (full EDM2 paper recommendation).
+
+        num_blocks: 3
+
+
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+
+    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+
+validation:
+    years: [2003, 2004]
+
+
+training:
+    hp:
+        training_duration: 2000000
+        batch_size_per_gpu: 8
+        total_batch_size: 256
+        lr: 0.000175
+
+        # Noise distribution parameters from HP grid search (previously commented out).
+        # These were found to be optimal for this dataset but were not applied in v1.
+        distribution: normal
+        P_mean: 0.33279831106168106
+        P_std: 1.2828802382850724
+
+        # sigma_data from HP search. v1 used the generic EDM2 default of 0.5, which
+        # miscalibrates all four preconditioning scalars (c_skip, c_out, c_in, c_noise).
+        sigma_data: 0.9991313898136948
+
+        # LR schedule: warm up then decay once in the second half of training.
+        # EDM2 paper recommends exponential/cosine LR decay; this approximates it
+        # with a single halving step after the 1M-sample mark.
+        lr_rampup: 100000   # ramp from 0 to lr over first 100k samples
+        lr_decay: 0.5       # multiply LR by this factor each decay step
+        lr_decay_rate: 2000000  # halve once: fires at ~2.1M — outside a 2M run; kicks in if extended to 4M
+
+    io:
+        print_progress_freq: 10000
+        regression_checkpoint_path: /checkpoints/hp_reg_grid/reg_07_flexi_p125/checkpoints_regression/UNet.0.1700096.mdlus
+
+        checkpoint_dir: /checkpoints/edm2_v2_norwayW
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: 20
+
+
+wandb:
+    mode: online
+    results_dir: "./wandb"
+    watch_model: false

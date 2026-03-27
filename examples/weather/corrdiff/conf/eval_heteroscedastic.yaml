@@ -20,8 +20,8 @@
 # multiple T values and D_std strategies without re-running diffusion.
 #
 # Usage:
-#   python generate_eval.py --config-name=eval_heteroscedastic
-#   torchrun --nproc_per_node=4 generate_eval.py --config-name=eval_heteroscedastic
+#   python generate.py --config-name=eval_heteroscedastic
+#   torchrun --nproc_per_node=4 generate.py --config-name=eval_heteroscedastic
 
 hydra:
     job:

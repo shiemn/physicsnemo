@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # Example config for time-parallel generation
-# Use with: torchrun --nproc_per_node=4 generate_parallel_times.py --config-name=gen_test_parallel_times
+# Use with: torchrun --nproc_per_node=4 generate.py --config-name=gen_test_parallel_times
 
 hydra:
     job:

@@ -20,15 +20,18 @@ call signature matches the existing ``EDMPrecondSuperResolution`` used
 throughout CorrDiff's training and generation code.
 """
 
-from typing import List, Literal, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
+from physicsnemo import Module
+from physicsnemo.models.meta import ModelMetaData
+
 from helpers.edm2_networks import EDM2UNet, mp_cat
 
 
-class EDM2PrecondSuperResolution(torch.nn.Module):
+class EDM2PrecondSuperResolution(Module):
     """EDM2 preconditioning for super-resolution with spatial positional grid.
 
     Implements the same preconditioning as ``EDMPrecondSuperResolution``
@@ -82,6 +85,11 @@ class EDM2PrecondSuperResolution(torch.nn.Module):
         ``attn_resolutions``, ``dropout``, ``res_balance``, …).
     """
 
+    # Allow evaluate.py to pass use_apex_gn (a SongUNet-specific kwarg) via
+    # Module.from_checkpoint(override_args=...) without raising ValueError.
+    # EDM2 does not use apex GroupNorm; this override is silently ignored.
+    _overridable_args = {"use_apex_gn"}
+
     def __init__(
         self,
         img_resolution: Union[int, List[int], Tuple[int, int]],
@@ -90,13 +98,16 @@ class EDM2PrecondSuperResolution(torch.nn.Module):
         use_fp16: bool = False,
         sigma_data: float = 0.5,
         sigma_min: float = 0.0,
-        sigma_max: float = float("inf"),
+        sigma_max: Optional[float] = None,  # None = inf (float("inf") is not JSON-serializable)
         N_grid_channels: int = 4,
         gridtype: Literal["sinusoidal", "linear"] = "sinusoidal",
         grid_mp_balance: float = 0.5,
         **unet_kwargs,
     ):
-        super().__init__()
+        super().__init__(meta=ModelMetaData(name="EDM2PrecondSuperResolution"))
+
+        # Drop SongUNet-specific kwargs that evaluate.py may inject via override_args.
+        unet_kwargs.pop("use_apex_gn", None)
 
         # Unpack resolution: [H, W] for grid generation, min(H,W) for U-Net.
         if isinstance(img_resolution, (list, tuple)):
@@ -113,7 +124,7 @@ class EDM2PrecondSuperResolution(torch.nn.Module):
         self.img_out_channels = img_out_channels
         self.sigma_data = sigma_data
         self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
+        self.sigma_max = sigma_max if sigma_max is not None else float("inf")
         self._use_fp16 = use_fp16
         self.N_grid_channels = N_grid_channels
         self.grid_mp_balance = grid_mp_balance

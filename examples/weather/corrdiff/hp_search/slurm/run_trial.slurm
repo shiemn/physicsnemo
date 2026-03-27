@@ -231,7 +231,7 @@ if [ -n "$DIFF_CKPT" ] && [ $TRAIN_EXIT -eq 0 ]; then
             --nproc_per_node=${NUM_GPUS} \
             --rdzv_backend=c10d \
             --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-            generate_parallel_times.py \
+            generate.py \
             --config-name=hp_base_gen \
             generation.io.reg_ckpt_filename=${REG_CKPT} \
             generation.io.res_ckpt_filename=${DIFF_CKPT} \

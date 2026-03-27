@@ -12,6 +12,9 @@ hp_search/visualizations/
 hp_search/slurm/logs/
 hp_search/archive/
 
+# Archived/obsolete scripts
+jobs/archive/
+
 # Optuna databases (local testing)
 *.db
 

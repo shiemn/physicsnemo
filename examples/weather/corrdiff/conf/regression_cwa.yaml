@@ -14,19 +14,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Dataset type. Must be overridden.
-type: ???
-# Path to .nc data file. Must be overridden.
-data_path: ???
-# Path to json stats file. Must be overriden.
-stats_path: ???
-# Names of input channels. Must be overridden.
-input_variables: ???
-# Names of output channels. Must be overridden.
-output_variables: ???
-# Names of invariants variables. Optional.
-invariant_variables: ???
-# Size of the input patch. Optional.
-bounds: ???
-# Use log-space normalisation for precipitation output. Optional.
-log_precip: false
+hydra:
+    job:
+          chdir: false
+          name: cwa_regression
+    run:
+          dir: ./output/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base # Do not modify
+
+defaults:
+    - dataset: cwb
+    - model: regression
+    - model_size: normal
+    - training: ${model}
+
+dataset:
+    data_path: /data/cwa_dataset.zarr
+
+training:
+    hp:
+        training_duration: 2000000 #200000000
+        lr_rampup: 10000
+        batch_size_per_gpu: 4
+    io:
+        checkpoint_dir: /checkpoints/taiwan_regression
+        save_checkpoint_freq: 100000
+wandb:
+    mode: online
+    results_dir: "./wandb"
+    watch_model: false

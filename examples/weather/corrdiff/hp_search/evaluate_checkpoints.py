@@ -239,7 +239,7 @@ def create_evaluation_script(
 
             # Base command
             if diff_path:
-                cmd = f"""torchrun --nproc_per_node={num_gpus} generate_parallel_times.py \\
+                cmd = f"""torchrun --nproc_per_node={num_gpus} generate.py \\
         --config-name=hp_base_gen \\
         generation.io.reg_ckpt_filename={reg_path} \\
         generation.io.res_ckpt_filename={diff_path} \\
@@ -248,7 +248,7 @@ def create_evaluation_script(
         {overrides_str}"""
             else:
                 # Regression-only: skip diffusion checkpoint
-                cmd = f"""torchrun --nproc_per_node={num_gpus} generate_parallel_times.py \\
+                cmd = f"""torchrun --nproc_per_node={num_gpus} generate.py \\
         --config-name=hp_base_gen \\
         generation.io.reg_ckpt_filename={reg_path} \\
         generation.io.output_filename={output_file} \\

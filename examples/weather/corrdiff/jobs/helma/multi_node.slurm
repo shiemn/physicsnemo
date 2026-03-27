@@ -1,16 +1,16 @@
 #!/bin/bash -l
-#SBATCH -J twCRPS
+#SBATCH -J Train-CorrDiff
 #SBATCH --time=24:00:00
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:h100:4
 #SBATCH --partition=h100
-#SBATCH --output=output/train_twcrps-%j.out
+#SBATCH --output=output/job-%j.out
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
 
 echo "=================================================="
-echo "Heteroscedastic twCRPS Training"
+echo "Training"
 echo "=================================================="
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Nodes: ${SLURM_JOB_NODELIST}"
@@ -36,13 +36,14 @@ echo "MASTER_PORT: ${MASTER_PORT}"
 # Copy data to all nodes
 srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/copy.sh
 
-# Run distributed training: 2 nodes x 4 GPUs = 8 GPUs total
+# Run distributed training: $SLURM_NNODES nodes x 4 GPUs each
+echo "Launching torchrun: ${SLURM_NNODES} nodes x 4 GPUs = $((SLURM_NNODES * 4)) GPUs total"
 srun apptainer run --nv \
                         --bind /scratch/:/data/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
                         /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif \
-                        torchrun --nnodes=2 \
+                        torchrun --nnodes=${SLURM_NNODES} \
                                  --nproc_per_node=4 \
                                  --rdzv_id=${SLURM_JOB_ID} \
                                  --rdzv_backend=c10d \

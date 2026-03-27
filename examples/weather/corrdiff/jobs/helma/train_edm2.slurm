@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:h100:4
 #SBATCH --partition=h100
 #SBATCH --output=output/train_edm2-%j.out
-#SBATCH --mail-type=ALL
+#SBATCH --mail-type=FAILED,TIME_LIMIT,END
 #SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
 
 # Set up environment
@@ -27,4 +27,4 @@ srun apptainer run --nv \
     --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
     /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif \
     torchrun --nproc_per_node=$NGPUS \
-        $HOME/bjerknes/corrdiff/train.py --config-name edm2_norwayW_helma
+        $HOME/bjerknes/corrdiff/train.py --config-name edm2_v2_norwayW
