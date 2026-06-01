@@ -18,7 +18,8 @@
 
 All metrics operate on **denormalized (physical unit)** predictions.
 Callers must denormalize model outputs before calling update().
-Predictions and targets are automatically clipped to >= 0 (precipitation).
+Precipitation metrics clip predictions and targets to >= 0 unless
+``skip_conditional_metrics`` is enabled for non-precipitation variables.
 
 Key correctness guarantees vs. the legacy MetricsAccumulator:
 
@@ -28,13 +29,17 @@ Key correctness guarantees vs. the legacy MetricsAccumulator:
 
 * Spread-Skill ratio: accumulated as separate sums (spread_sum, skill_sum)
   and divided *after* all_reduce so the ratio is computed from the global
-  totals, not as an average of per-rank ratios.
+  totals, not as an average of per-rank ratios. Spread uses the unbiased
+  sample variance before applying the finite-ensemble correction.
 
 * Conditional metrics (>threshold, 95th, wet-95th): run on physical-unit
   values so the thresholds have meaningful units (mm).
 
 * Distributed reduce: uses all_reduce so every rank ends up with the same
   final accumulators — no gather/scatter boilerplate needed.
+
+New metrics (bias, mae, pcc, hrre, mppe) are appended to the scalar tensor
+so they participate in all_reduce automatically.
 """
 
 import math
@@ -100,6 +105,9 @@ class MetricsAccumulator:
 
     Metrics computed:
         - RMSE of ensemble mean
+        - Bias (mean signed error)
+        - MAE  (mean absolute error)
+        - PCC  (Pearson correlation coefficient, global across all pixels × timesteps)
         - Proper finite-ensemble CRPS
         - Threshold-weighted CRPS (twCRPS) at configurable mm thresholds (default 5, 10 mm)
         - Spread  (mean ensemble std across pixels)
@@ -109,6 +117,8 @@ class MetricsAccumulator:
         - RMSE / CRPS for 95th-percentile pixels  (per sample)
         - RMSE / CRPS for wet-95th pixels  (95th pct over wet pixels only)
         - Spread-Skill reliability bins  (for calibration diagnostics)
+        - HRRE  Heavy Rain Region Error: mean_t |count(pred≥thr) - count(target≥thr)|
+        - MPPE  Mesoscale Peak Precipitation Error: RMSE of per-sample p99.9 differences
 
     Usage (single GPU):
         acc = MetricsAccumulator(precip_threshold=1.0, device=device)
@@ -133,6 +143,8 @@ class MetricsAccumulator:
         device=None,
         spread_skill_bin_edges=None,
         twcrps_thresholds=None,
+        hrre_threshold: float = 10.0,
+        skip_conditional_metrics: bool = False,
         skip_spread_skill: bool = False,
         bin_mode: str = "fixed",
         n_quantile_bins: int = 20,
@@ -146,6 +158,12 @@ class MetricsAccumulator:
                 Ignored when bin_mode="quantile".
             twcrps_thresholds: List of precipitation thresholds (mm) for twCRPS.
                 Defaults to [5.0, 10.0].
+            hrre_threshold: Precipitation threshold (mm) for HRRE pixel counts.
+                Defaults to 10.0 mm.
+            skip_conditional_metrics: If True, skip all conditional/threshold-based
+                metrics (>precip_threshold, 95th, wet-95th, twCRPS, HRRE, MPPE).
+                Useful for non-precipitation variables where these metrics are
+                not physically meaningful.
             skip_spread_skill: If True, skip spread/skill/spread-skill ratio
                 computation and omit those keys from to_dict(). Use for
                 regression-only evaluation where spread is always 0.
@@ -159,6 +177,8 @@ class MetricsAccumulator:
         self.precip_threshold = precip_threshold
         self.device = device if device is not None else torch.device("cpu")
         self.twcrps_thresholds = list(twcrps_thresholds) if twcrps_thresholds is not None else [5.0, 10.0]
+        self.hrre_threshold = hrre_threshold
+        self.skip_conditional_metrics = skip_conditional_metrics
         self.skip_spread_skill = skip_spread_skill
         self.bin_mode = bin_mode
         self.n_quantile_bins = n_quantile_bins
@@ -207,6 +227,23 @@ class MetricsAccumulator:
         self.twcrps_sums = [0.0] * len(self.twcrps_thresholds)
         self.twcrps_n = [0] * len(self.twcrps_thresholds)
 
+        # Bias and MAE
+        self.bias_sum = 0.0
+        self.ae_sum = 0.0
+
+        # PCC — online Pearson from accumulated sums (all pixels × all timesteps)
+        self.pcc_sum_xy = 0.0
+        self.pcc_sum_x = 0.0
+        self.pcc_sum_y = 0.0
+        self.pcc_sum_x2 = 0.0
+        self.pcc_sum_y2 = 0.0
+
+        # HRRE — event-wise absolute error in heavy-rain pixel count.
+        self.hrre_abs_count_error_sum = 0.0
+
+        # MPPE — RMSE of per-timestep p99.9 differences
+        self.mppe_se_sum = 0.0
+
         # Spread-Skill reliability bins (float64 tensors)
         if self.bin_mode == "quantile":
             # Fine grid (500 bins, 0–30 mm) accumulates (count, skill_sum) per
@@ -238,6 +275,13 @@ class MetricsAccumulator:
         # Append twCRPS: [sum_t0, n_t0, sum_t1, n_t1, ...]
         for s, n in zip(self.twcrps_sums, self.twcrps_n):
             base.extend([s, float(n)])
+        # Bias, MAE, PCC, HRRE, MPPE
+        base.extend([
+            self.bias_sum, self.ae_sum,
+            self.pcc_sum_xy, self.pcc_sum_x, self.pcc_sum_y,
+            self.pcc_sum_x2, self.pcc_sum_y2,
+            self.hrre_abs_count_error_sum, self.mppe_se_sum,
+        ])
         return torch.tensor(base, dtype=torch.float64, device=self.device)
 
     def _load_scalars_from_tensor(self, t: torch.Tensor):
@@ -265,6 +309,17 @@ class MetricsAccumulator:
             offset = 19 + 2 * i
             self.twcrps_sums[i] = t[offset].item()
             self.twcrps_n[i] = int(t[offset + 1].item())
+        # Bias, MAE, PCC, HRRE, MPPE start after twCRPS
+        o = 19 + 2 * len(self.twcrps_thresholds)
+        self.bias_sum = t[o].item()
+        self.ae_sum = t[o + 1].item()
+        self.pcc_sum_xy = t[o + 2].item()
+        self.pcc_sum_x = t[o + 3].item()
+        self.pcc_sum_y = t[o + 4].item()
+        self.pcc_sum_x2 = t[o + 5].item()
+        self.pcc_sum_y2 = t[o + 6].item()
+        self.hrre_abs_count_error_sum = t[o + 7].item()
+        self.mppe_se_sum = t[o + 8].item()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -284,16 +339,42 @@ class MetricsAccumulator:
         if target.ndim == 4:
             target = target.squeeze(0)  # -> (C, H, W)
 
-        # Clip to >= 0 (precipitation cannot be negative)
-        pred_ens = torch.clamp(pred_ens, min=0.0)
-        target = torch.clamp(target, min=0.0)
+        # Clip to >= 0 for precipitation variables (skip for non-precip channels)
+        if not self.skip_conditional_metrics:
+            pred_ens = torch.clamp(pred_ens, min=0.0)
+            target = torch.clamp(target, min=0.0)
 
         ens_mean = pred_ens.mean(dim=0)  # (C, H, W)
 
         # RMSE
-        se = (ens_mean - target) ** 2
+        err = ens_mean - target
+        se = err ** 2
         self.se_sum += se.sum().item()
         self.n_elements += se.numel()
+
+        # Bias & MAE
+        self.bias_sum += err.sum().item()
+        self.ae_sum += err.abs().sum().item()
+
+        # PCC — accumulate online Pearson sums (double precision)
+        x = ens_mean.flatten().double()
+        y = target.flatten().double()
+        self.pcc_sum_xy += (x * y).sum().item()
+        self.pcc_sum_x += x.sum().item()
+        self.pcc_sum_y += y.sum().item()
+        self.pcc_sum_x2 += (x * x).sum().item()
+        self.pcc_sum_y2 += (y * y).sum().item()
+
+        if not self.skip_conditional_metrics:
+            # HRRE
+            pred_heavy_count = (ens_mean >= self.hrre_threshold).sum().item()
+            target_heavy_count = (target >= self.hrre_threshold).sum().item()
+            self.hrre_abs_count_error_sum += abs(pred_heavy_count - target_heavy_count)
+
+            # MPPE — 99.9th percentile error, per timestep
+            p999_pred = torch.quantile(ens_mean.flatten(), 0.999).item()
+            p999_target = torch.quantile(target.flatten(), 0.999).item()
+            self.mppe_se_sum += (p999_pred - p999_target) ** 2
 
         # Proper finite-ensemble CRPS
         crps_vals = proper_crps(pred_ens, target)
@@ -301,54 +382,59 @@ class MetricsAccumulator:
         self.crps_elements += crps_vals.numel()
 
         # Threshold-weighted CRPS
-        for i, thresh in enumerate(self.twcrps_thresholds):
-            tw = proper_twcrps(pred_ens, target, thresh)
-            self.twcrps_sums[i] += tw.sum().item()
-            self.twcrps_n[i] += tw.numel()
+        if not self.skip_conditional_metrics:
+            for i, thresh in enumerate(self.twcrps_thresholds):
+                tw = proper_twcrps(pred_ens, target, thresh)
+                self.twcrps_sums[i] += tw.sum().item()
+                self.twcrps_n[i] += tw.numel()
 
         self.n_samples += 1
 
         # Spread & Skill (per-sample, averaged in to_dict)
         # Fortin et al. (2014): aggregate spread = sqrt(mean(variance)), not mean(std).
-        # Accumulate mean variance with finite-ensemble correction (R+1)/R, take sqrt in to_dict().
+        # Use unbiased sample variance, then apply the finite-ensemble correction (R+1)/R.
         n_ens = pred_ens.shape[0]
         if not self.skip_spread_skill:
-            ens_var = pred_ens.var(dim=0, unbiased=False) * (1.0 + 1.0 / n_ens)
+            if n_ens > 1:
+                ens_var = pred_ens.var(dim=0, unbiased=True) * (1.0 + 1.0 / n_ens)
+            else:
+                ens_var = torch.zeros_like(ens_mean)
             self.variance_sum += ens_var.mean().item()
             self.skill_sum += torch.sqrt(se.mean()).item()
 
-        # Conditional: target > threshold
-        mask_gt = target > self.precip_threshold
-        if mask_gt.any():
-            self.se_sum_gt += se[mask_gt].sum().item()
-            self.n_gt += mask_gt.sum().item()
-            self.crps_sum_gt += crps_vals[mask_gt].sum().item()
-            self.crps_n_gt += mask_gt.sum().item()
+        if not self.skip_conditional_metrics:
+            # Conditional: target > threshold
+            mask_gt = target > self.precip_threshold
+            if mask_gt.any():
+                self.se_sum_gt += se[mask_gt].sum().item()
+                self.n_gt += mask_gt.sum().item()
+                self.crps_sum_gt += crps_vals[mask_gt].sum().item()
+                self.crps_n_gt += mask_gt.sum().item()
 
-        # Conditional: 95th percentile (per sample)
-        p95 = torch.quantile(target.flatten(), 0.95)
-        mask_95 = target >= p95
-        if mask_95.any():
-            self.se_sum_95 += se[mask_95].sum().item()
-            self.n_95 += mask_95.sum().item()
-            self.crps_sum_95 += crps_vals[mask_95].sum().item()
-            self.crps_n_95 += mask_95.sum().item()
+            # Conditional: 95th percentile (per sample)
+            p95 = torch.quantile(target.flatten(), 0.95)
+            mask_95 = target >= p95
+            if mask_95.any():
+                self.se_sum_95 += se[mask_95].sum().item()
+                self.n_95 += mask_95.sum().item()
+                self.crps_sum_95 += crps_vals[mask_95].sum().item()
+                self.crps_n_95 += mask_95.sum().item()
 
-        # Conditional: wet-95th (95th pct over wet pixels only)
-        wet = target > 0.0
-        if wet.any():
-            p95_wet = torch.quantile(target[wet], 0.95)
-            mask_w95 = wet & (target >= p95_wet)
-            if mask_w95.any():
-                self.se_sum_w95 += se[mask_w95].sum().item()
-                self.n_w95 += mask_w95.sum().item()
-                self.crps_sum_w95 += crps_vals[mask_w95].sum().item()
-                self.crps_n_w95 += mask_w95.sum().item()
+            # Conditional: wet-95th (95th pct over wet pixels only)
+            wet = target > 0.0
+            if wet.any():
+                p95_wet = torch.quantile(target[wet], 0.95)
+                mask_w95 = wet & (target >= p95_wet)
+                if mask_w95.any():
+                    self.se_sum_w95 += se[mask_w95].sum().item()
+                    self.n_w95 += mask_w95.sum().item()
+                    self.crps_sum_w95 += crps_vals[mask_w95].sum().item()
+                    self.crps_n_w95 += mask_w95.sum().item()
 
         # Spread-Skill reliability bins
         if not self.skip_spread_skill:
             spread_flat = torch.sqrt(ens_var).flatten()
-            skill_flat = torch.sqrt(se).flatten()
+            skill_flat = se.flatten()  # squared error; converted to RMSE in to_dict()
             if self.bin_mode == "quantile":
                 idx = (spread_flat / self._fine_max * self._fine_n).long().clamp(0, self._fine_n - 1)
                 ones = torch.ones(len(idx), dtype=torch.float64, device=self.device)
@@ -367,15 +453,29 @@ class MetricsAccumulator:
                         self.skill_bin_sum[b] += skill_flat[in_bin].sum().to(torch.float64)
                         self.bin_count[b] += in_bin.sum().to(torch.float64)
 
-        # Rank histogram: for each pixel, count how many members are below target
-        # Rank ranges from 0 (target below all members) to n_ens (target above all)
+        # Rank histogram: for each pixel, count how many members are below target.
+        # If members tie the target (common for clipped precipitation zeros), the
+        # contribution is split evenly over all possible tied ranks.
+        # Rank ranges from 0 (target below all members) to n_ens (target above all).
         target_flat = target.flatten()  # (C*H*W,)
         pred_flat = pred_ens.flatten(1)  # (n_ens, C*H*W)
-        ranks = (pred_flat < target_flat.unsqueeze(0)).sum(dim=0)  # (C*H*W,)
+        less = (pred_flat < target_flat.unsqueeze(0)).sum(dim=0).long()  # (C*H*W,)
+        equal = (pred_flat == target_flat.unsqueeze(0)).sum(dim=0).long()  # (C*H*W,)
         if self.rank_counts is None:
             self.rank_counts = torch.zeros(n_ens + 1, device=self.device, dtype=torch.float64)
-        counts = torch.bincount(ranks.long(), minlength=n_ens + 1).to(torch.float64)
-        self.rank_counts += counts[:n_ens + 1]
+
+        for n_tied in range(n_ens + 1):
+            tied_mask = equal == n_tied
+            if not tied_mask.any():
+                continue
+            starts = less[tied_mask]
+            weight = 1.0 / (n_tied + 1)
+            for offset in range(n_tied + 1):
+                counts = torch.bincount(
+                    starts + offset,
+                    minlength=n_ens + 1,
+                ).to(torch.float64)
+                self.rank_counts += counts[:n_ens + 1] * weight
 
     def reduce(self) -> None:
         """All-reduce raw accumulators across all distributed ranks (in-place).
@@ -428,24 +528,55 @@ class MetricsAccumulator:
             "crps": float(self.crps_sum / self.crps_elements)
                     if self.crps_elements > 0 else 0.0,
             "n_samples": n,
-            f"rmse_gt_{self.precip_threshold}mm":
-                float(np.sqrt(self.se_sum_gt / self.n_gt)) if self.n_gt > 0 else 0.0,
-            f"crps_gt_{self.precip_threshold}mm":
-                float(self.crps_sum_gt / self.crps_n_gt) if self.crps_n_gt > 0 else 0.0,
-            "rmse_95th":
-                float(np.sqrt(self.se_sum_95 / self.n_95)) if self.n_95 > 0 else 0.0,
-            "crps_95th":
-                float(self.crps_sum_95 / self.crps_n_95) if self.crps_n_95 > 0 else 0.0,
-            "rmse_w95th":
-                float(np.sqrt(self.se_sum_w95 / self.n_w95)) if self.n_w95 > 0 else 0.0,
-            "crps_w95th":
-                float(self.crps_sum_w95 / self.crps_n_w95) if self.crps_n_w95 > 0 else 0.0,
         }
 
+        if not self.skip_conditional_metrics:
+            out.update({
+                f"rmse_gt_{self.precip_threshold}mm":
+                    float(np.sqrt(self.se_sum_gt / self.n_gt)) if self.n_gt > 0 else 0.0,
+                f"crps_gt_{self.precip_threshold}mm":
+                    float(self.crps_sum_gt / self.crps_n_gt) if self.crps_n_gt > 0 else 0.0,
+                "rmse_95th":
+                    float(np.sqrt(self.se_sum_95 / self.n_95)) if self.n_95 > 0 else 0.0,
+                "crps_95th":
+                    float(self.crps_sum_95 / self.crps_n_95) if self.crps_n_95 > 0 else 0.0,
+                "rmse_w95th":
+                    float(np.sqrt(self.se_sum_w95 / self.n_w95)) if self.n_w95 > 0 else 0.0,
+                "crps_w95th":
+                    float(self.crps_sum_w95 / self.crps_n_w95) if self.crps_n_w95 > 0 else 0.0,
+            })
+
         # Threshold-weighted CRPS
-        for thresh, s, tw_n in zip(self.twcrps_thresholds, self.twcrps_sums, self.twcrps_n):
-            key = f"twcrps_{thresh}mm"
-            out[key] = float(s / tw_n) if tw_n > 0 else 0.0
+        if not self.skip_conditional_metrics:
+            for thresh, s, tw_n in zip(self.twcrps_thresholds, self.twcrps_sums, self.twcrps_n):
+                key = f"twcrps_{thresh}mm"
+                out[key] = float(s / tw_n) if tw_n > 0 else 0.0
+
+        # Bias, MAE
+        n_px = self.n_elements
+        out["bias"] = float(self.bias_sum / n_px) if n_px > 0 else 0.0
+        out["mae"] = float(self.ae_sum / n_px) if n_px > 0 else 0.0
+
+        # PCC — global Pearson correlation
+        if n_px > 0:
+            denom = math.sqrt(
+                max(self.pcc_sum_x2 * n_px - self.pcc_sum_x ** 2, 0.0) *
+                max(self.pcc_sum_y2 * n_px - self.pcc_sum_y ** 2, 0.0)
+            )
+            out["pcc"] = float(
+                (self.pcc_sum_xy * n_px - self.pcc_sum_x * self.pcc_sum_y) / denom
+            ) if denom > 0 else 0.0
+        else:
+            out["pcc"] = 0.0
+
+        if not self.skip_conditional_metrics:
+            # HRRE
+            out[f"hrre_{self.hrre_threshold}mm"] = (
+                float(self.hrre_abs_count_error_sum / n) if n > 0 else 0.0
+            )
+
+            # MPPE
+            out["mppe"] = float(math.sqrt(self.mppe_se_sum / n)) if n > 0 else 0.0
 
         # Spread, Skill, Spread-Skill ratio & reliability diagnostics
         if not self.skip_spread_skill:
@@ -465,21 +596,38 @@ class MetricsAccumulator:
                         (torch.arange(self._fine_n, dtype=torch.float64, device=self.device) + 0.5)
                         / self._fine_n * self._fine_max
                     )
-                    cdf = torch.cumsum(self.fine_count, 0) / total
-                    # Assign each fine bin to a quantile bin by where its CDF value falls
-                    q_boundaries = torch.linspace(0, 1, self.n_quantile_bins + 1, device=self.device)[1:-1]
-                    q_bin_ids = torch.bucketize(cdf, q_boundaries, right=False).clamp(0, self.n_quantile_bins - 1)
-                    mean_spread_q = torch.zeros(self.n_quantile_bins, dtype=torch.float64, device=self.device)
-                    mean_skill_q = torch.zeros(self.n_quantile_bins, dtype=torch.float64, device=self.device)
-                    bin_count_q = torch.zeros(self.n_quantile_bins, dtype=torch.float64, device=self.device)
-                    for b in range(self.n_quantile_bins):
-                        m = (q_bin_ids == b) & (self.fine_count > 0)
-                        if m.any():
-                            cnt = self.fine_count[m].sum()
-                            mean_spread_q[b] = (fine_centers[m] * self.fine_count[m]).sum() / cnt
-                            mean_skill_q[b] = self.fine_skill_sum[m].sum() / cnt
-                            bin_count_q[b] = cnt
+                    cdf_end = torch.cumsum(self.fine_count, 0) / total  # (fine_n,)
+                    cdf_start = torch.cat([
+                        torch.zeros(1, dtype=torch.float64, device=self.device),
+                        cdf_end[:-1],
+                    ])  # (fine_n,)
+
+                    # Proportional split: a fine bin spanning [cdf_start, cdf_end] may
+                    # overlap multiple quantile bins. Distribute its count and skill sum
+                    # proportionally so every quantile bin receives equal total count.
+                    q_starts = (torch.arange(self.n_quantile_bins, dtype=torch.float64, device=self.device)
+                                / self.n_quantile_bins)                      # (Q,)
+                    q_ends = q_starts + 1.0 / self.n_quantile_bins           # (Q,)
+
+                    # overlap[i, q] = fraction of fine bin i that falls in quantile bin q
+                    cs = cdf_start.unsqueeze(1)   # (fine_n, 1)
+                    ce = cdf_end.unsqueeze(1)     # (fine_n, 1)
+                    span = (ce - cs).clamp(min=1e-30)
+                    overlap = (torch.min(ce, q_ends) - torch.max(cs, q_starts)).clamp(min=0.0) / span
+                    overlap = overlap * (self.fine_count > 0).unsqueeze(1).to(torch.float64)
+
+                    # Weighted aggregation into quantile bins
+                    count_mat = overlap * self.fine_count.unsqueeze(1)        # (fine_n, Q)
+                    bin_count_q = count_mat.sum(0)                            # (Q,)
+                    spread_num  = (count_mat * fine_centers.unsqueeze(1)).sum(0)
+                    skill_num   = (overlap * self.fine_skill_sum.unsqueeze(1)).sum(0)
+
                     valid = bin_count_q > 0
+                    mean_spread_q = torch.zeros(self.n_quantile_bins, dtype=torch.float64, device=self.device)
+                    mean_skill_q  = torch.zeros(self.n_quantile_bins, dtype=torch.float64, device=self.device)
+                    mean_spread_q[valid] = spread_num[valid] / bin_count_q[valid]
+                    mean_skill_q[valid]  = torch.sqrt(skill_num[valid] / bin_count_q[valid])
+
                     if valid.any():
                         x, y, w = mean_skill_q[valid], mean_spread_q[valid], bin_count_q[valid]
                         out["spread_skill_bin_mean_spread"] = mean_spread_q[valid].cpu().tolist()
@@ -491,7 +639,7 @@ class MetricsAccumulator:
                     mean_spread = torch.zeros_like(self.bin_count)
                     mean_skill = torch.zeros_like(self.bin_count)
                     mean_spread[valid] = self.spread_bin_sum[valid] / self.bin_count[valid]
-                    mean_skill[valid] = self.skill_bin_sum[valid] / self.bin_count[valid]
+                    mean_skill[valid] = torch.sqrt(self.skill_bin_sum[valid] / self.bin_count[valid])
                     x, y, w = mean_skill[valid], mean_spread[valid], self.bin_count[valid]
                     out["spread_skill_bin_edges"] = self.bin_edges.cpu().tolist()
                     out["spread_skill_bin_mean_spread"] = mean_spread.cpu().tolist()

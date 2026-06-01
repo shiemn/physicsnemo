@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate_taiwan
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base   # Do not modify
+
+defaults:
+    - dataset: cwb
+    - generation: non_patched
+    - times: taiwan256
+
+# ── Experiment identifier ─────────────────────────────────────────────────────
+run_tag: ???
+
+# ── W&B settings ─────────────────────────────────────────────────────────────
+wandb:
+    mode: online
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+# ── Evaluation settings ───────────────────────────────────────────────────────
+# CWB output channels: 0=maximum_radar_reflectivity (dBZ), 1=temperature_2m,
+#   2=eastward_wind_10m, 3=northward_wind_10m
+eval:
+    output_json: eval_results.json
+    n_plot_events: 5
+    plot_events: null
+    plot_channels: [0, 1, 2, 3]  # show all 4 channels in event plots
+    rapsd_dx_km: 3.0             # CWB Taiwan grid spacing ≈ 3 km
+    predictions_file: auto
+    diagnostic_channel: maximum_radar_reflectivity
+    spread_skill_bin_mode: quantile
+
+    # One accumulator per output channel — basic metrics only (rmse, mae, bias, pcc, crps, spread-skill)
+    # Conditional/threshold metrics (twCRPS, HRRE, MPPE, >threshold, 95th) are skipped
+    per_channel_metrics: true
+    skip_conditional_metrics: true
+    twcrps_thresholds: []
+    log_regression: false   # suppress regression/ keys; diffusion/ metrics are what matter
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+dataset:
+    data_path: /data/CorrDiff/cwa_dataset.zarr.zip
+    train: false
+    all_times: true
+
+# ── Sampler (diffusion only) ──────────────────────────────────────────────────
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 0
+    S_min: 0
+    S_max: .inf
+
+# ── Generation ────────────────────────────────────────────────────────────────
+generation:
+    inference_mode: all    # "regression" | "all" (regression + diffusion)
+    num_ensembles: 10
+    seed_batch_size: 10
+    hr_mean_conditioning: true
+
+    perf:
+        use_fp16: true
+        use_torch_compile: true
+
+    io:
+        reg_ckpt_filename: /checkpoints/taiwan_regression/checkpoints_regression/UNet.0.2000128.mdlus
+        res_ckpt_filename: /checkpoints/taiwan_diffusion_cond/checkpoints_diffusion/EDMPrecondSuperResolution.0.12000000.mdlus
+        output_filename: /dev/null   # evaluate.py does not write NetCDF
+        guide_ckpt_filename: null
+
+    guidance_scale: 0.0
+    guidance_schedule_alpha: 0.0

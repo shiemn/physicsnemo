@@ -1,0 +1,40 @@
+# Temporal regression training based on tr_reg_hp / hp_reg07 settings.
+
+defaults:
+  - /hp_base_trainreg
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_hp_temporal
+  run:
+    dir: ./output/${hydra:job.name}
+
+dataset:
+  temporal_inputs:
+    offsets: [-1, 0, 1]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 256
+    batch_size_per_gpu: 4
+    lr: 1.0e-4
+    lr_decay: 1.0
+    loss_function: flexiloss
+    flexi_loss_p: [1.25]
+    flexi_loss_d: [1]
+  io:
+    print_progress_freq: 100000
+    checkpoint_dir: /checkpoints/hp_reg_grid/reg_07_flexi_p125_temporal
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 20
+    validation_freq: 100000
+    validation_steps: 10
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false

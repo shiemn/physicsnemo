@@ -1,0 +1,38 @@
+# Temporal regression smoke test based on tr_reg_hp / hp_reg07 settings.
+# Uses one local batch of 4 samples per optimizer step for a short direct run.
+
+defaults:
+  - /hp_base_trainreg
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_hp_temporal_smoke
+  run:
+    dir: ./output/${hydra:job.name}
+
+dataset:
+  temporal_inputs:
+    offsets: [-1, 0, 1]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  hp:
+    lr: 1.0e-4
+    lr_decay: 1.0
+    loss_function: flexiloss
+    flexi_loss_p: [1.25]
+    flexi_loss_d: [1]
+    batch_size_per_gpu: 4
+    total_batch_size: 4
+    training_duration: 8
+  io:
+    print_progress_freq: 4
+    validation_freq: 8
+    validation_steps: 1
+    save_checkpoint_freq: 1000000000
+    checkpoint_dir: /tmp/corrdiff_temporal_reg_smoke
+
+wandb:
+  mode: disabled

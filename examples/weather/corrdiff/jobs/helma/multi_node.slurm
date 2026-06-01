@@ -33,8 +33,9 @@ export APPTAINERENV_MASTER_PORT=${MASTER_PORT}
 echo "MASTER_ADDR: ${MASTER_ADDR}"
 echo "MASTER_PORT: ${MASTER_PORT}"
 
-# Copy data to all nodes
-srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/copy.sh
+# Copy data to all nodes (default: copy.sh; override via second argument)
+COPY_SCRIPT=${2:-copy.sh}
+srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/${COPY_SCRIPT}
 
 # Run distributed training: $SLURM_NNODES nodes x 4 GPUs each
 echo "Launching torchrun: ${SLURM_NNODES} nodes x 4 GPUs = $((SLURM_NNODES * 4)) GPUs total"
@@ -42,7 +43,7 @@ srun apptainer run --nv \
                         --bind /scratch/:/data/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
                         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
-                        /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif \
+                        /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/corrdiff_ngc.sif \
                         torchrun --nnodes=${SLURM_NNODES} \
                                  --nproc_per_node=4 \
                                  --rdzv_id=${SLURM_JOB_ID} \

@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+hydra:
+    job:
+          chdir: false
+          name: dit_regression_norway_v2
+    run:
+          dir: ./output/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base
+
+defaults:
+    - dataset: custom
+    - model: dit_regression_v2
+    - training: dit_regression
+
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    output_variables: ['precipitation']
+    invariant_variables: ["elevation"]
+    invariant_variables_path: /data/Norway/HCLIM3/
+    bounds: large   # 512x512; patch_size=8 → 4096 tokens
+    years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+
+validation:
+    years: [2003, 2004]
+
+training:
+    patch_shift_aug: true   # Randomly shift patch grid each step to prevent boundary artifacts
+    hp:
+        training_duration: 2000000
+        batch_size_per_gpu: 32
+        total_batch_size: 256
+        loss_function: flexiloss
+        flexi_loss_p: [1.25]
+        flexi_loss_d: [1]
+    io:
+        checkpoint_dir: /checkpoints/dit_regression_norway_v2
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: 0
+        validation_freq: 100000
+        print_progress_freq: 10000
+
+wandb:
+    mode: online
+    results_dir: "./wandb"
+    watch_model: false

@@ -1,0 +1,77 @@
+# Evaluation config for models trained with temporal inputs (offsets [-1, 0, 1]).
+# Full diffusion eval (regression + diffusion), mirrors evaluate.yaml.
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base
+
+defaults:
+    - dataset: custom
+    - generation: non_patched
+    - times: random512
+
+run_tag: ???
+
+wandb:
+    mode: online
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+eval:
+    precip_threshold: 1.0
+    output_json: eval_results.json
+    twcrps_thresholds: [5.0, 10.0]
+    n_plot_events: 5
+    plot_events: null
+    rapsd_dx_km: 2.0
+    predictions_file: auto
+    spread_skill_bin_mode: quantile
+    skip_conditional_metrics: false
+    plot_channels: null
+
+dataset:
+    type: norway
+    data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+    invariant_variables_path: /data/Norway/HCLIM3/
+    output_variables: ['precipitation']
+    input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+    invariant_variables: ["elevation"]
+    bounds: large
+    years: [2005]
+    temporal_inputs:
+        offsets: [-1, 0, 1]
+        boundary: drop
+        strict_time_step_hours: 3
+
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 40
+    S_min: 0
+    S_max: .inf
+
+generation:
+    inference_mode: all
+    num_ensembles: 10
+    seed_batch_size: 10
+    hr_mean_conditioning: true
+
+    perf:
+        use_fp16: true
+        use_torch_compile: true
+
+    io:
+        reg_ckpt_filename: ???
+        res_ckpt_filename: ???
+        output_filename: /dev/null
+        guide_ckpt_filename: null
+
+    guidance_scale: 0.0
+    guidance_schedule_alpha: 0.0

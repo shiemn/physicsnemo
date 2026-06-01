@@ -19,7 +19,7 @@ export APPTAINERENV_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 export APPTAINERENV_OMP_NUM_THREADS=16
 echo ${CUDA_VISIBLE_DEVICES}
 
-CONFIG=${1:?"Usage: sbatch train.slurm <config-name> [--direct]"}
+CONFIG=${1:?"Usage: sbatch train.slurm <config-name> [--direct|<tar-file>]"}
 DATA_MODE=${2:-scratch}
 
 HNVME=/hnvme/workspace/b214cb11-helma-ecodata/downscaling
@@ -28,6 +28,10 @@ NGPUS=$(nvidia-smi -L | wc -l)
 if [ "$DATA_MODE" = "--direct" ]; then
     echo "Data mode: direct (binding hnvme)"
     DATA_BIND="$HNVME/"
+elif [ -f "$DATA_MODE" ]; then
+    echo "Data mode: tar extraction ($(basename $DATA_MODE))"
+    bash $HOME/bjerknes/corrdiff/jobs/helma/copy_taiwan.sh
+    DATA_BIND="/scratch/"
 else
     echo "Data mode: scratch (copying to /scratch)"
     bash $HOME/bjerknes/corrdiff/jobs/helma/copy.sh
@@ -38,6 +42,6 @@ srun apptainer run --nv \
     --bind ${DATA_BIND}:/data/ \
     --bind ${HNVME}/checkpoints/corrdiff:/checkpoints/ \
     --bind ${HNVME}/outputs/corrdiff:/outputs/ \
-    ${HNVME}/apptainer/new_corrdiff.sif \
+    ${HNVME}/apptainer/corrdiff_ngc.sif \
     torchrun --nproc_per_node=$NGPUS \
         $HOME/bjerknes/corrdiff/train.py --config-name $CONFIG

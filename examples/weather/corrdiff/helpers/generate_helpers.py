@@ -134,7 +134,7 @@ def maybe_compile_models(cfg, net_reg, net_res):
     return net_reg, net_res
 
 
-def build_sampler_fn(sampler_cfg, patching, net_guide=None, guidance_scale: float = 0.0, guidance_schedule_alpha: float = 0.0):
+def build_sampler_fn(sampler_cfg, patching, net_guide=None, guidance_scale: float = 0.0, guidance_schedule_alpha: float = 0.0, trajectory_callback=None):
     """Create a sampler partial from config (accepts dict or OmegaConf)."""
     from helpers.stochastic_sampler import stochastic_sampler, uncertainty_aware_stochastic_sampler
 
@@ -162,6 +162,7 @@ def build_sampler_fn(sampler_cfg, patching, net_guide=None, guidance_scale: floa
             net_guide=net_guide,
             guidance_scale=guidance_scale,
             guidance_schedule_alpha=_get(sampler_cfg, "guidance_schedule_alpha", guidance_schedule_alpha),
+            trajectory_callback=trajectory_callback,
         )
     elif sampler_type == "uncertainty_aware":
         return partial(
@@ -257,7 +258,6 @@ def save_images(
         image_out2 = dataset.denormalize_output(image_out2.cpu().numpy())
 
         time = times[t_index]
-        print(f"Saving image for t_index {t_index}, time {time}")
         writer.write_time(time_index, time)
         for channel_idx in range(image_out2.shape[1]):
             info = dataset.output_channels()[channel_idx]

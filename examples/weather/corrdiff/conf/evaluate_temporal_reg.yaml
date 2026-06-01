@@ -1,3 +1,12 @@
+# Evaluation config for regression models trained with temporal inputs.
+# Identical to evaluate.yaml but adds dataset.temporal_inputs to match
+# the tr_reg_hp_temporal training config (offsets: [-1, 0, 1]).
+#
+# Usage:
+#   sbatch jobs/helma/eval.slurm evaluate_temporal_reg <run_tag> \
+#       generation.io.reg_ckpt_filename=/checkpoints/.../<model>.mdlus \
+#       generation.io.res_ckpt_filename=/dev/null
+
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -14,19 +23,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unified evaluation configuration for evaluate.py
-#
-# Usage (single GPU):
-#   python evaluate.py --config-name=evaluate run_tag=my_run \
-#       generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
-#       generation.io.res_ckpt_filename=/path/to/diff.mdlus
-#
-# Usage (multi-GPU):
-#   torchrun --nproc_per_node=4 evaluate.py --config-name=evaluate \
-#       run_tag=my_run \
-#       generation.io.reg_ckpt_filename=/path/to/reg.mdlus \
-#       generation.io.res_ckpt_filename=/path/to/diff.mdlus
-
 hydra:
     job:
         chdir: false
@@ -42,39 +38,27 @@ defaults:
     - times: random512   # switch to "custom128" for targeted high-precip eval
 
 # ── Experiment identifier ─────────────────────────────────────────────────────
-# Set this to a short descriptive tag; used as the W&B run name (eval-<run_tag>)
 run_tag: ???
 
 # ── W&B settings ─────────────────────────────────────────────────────────────
 wandb:
-    mode: online           # "online" | "offline" | "disabled"
+    mode: online
     project: evaluation
     entity: shiemn
     results_dir: ./wandb
 
 # ── Evaluation settings ───────────────────────────────────────────────────────
 eval:
-    precip_threshold: 1.0  # mm — threshold for conditional high-precip metrics
+    precip_threshold: 1.0
     output_json: eval_results.json
-    twcrps_thresholds: [5.0, 10.0]  # mm — thresholds for threshold-weighted CRPS
-    n_plot_events: 5                 # auto-select top-N timesteps by max precipitation for maps
-    plot_events: null                # optional explicit list of time_idx integers to plot
-    rapsd_dx_km: 2.0                 # grid spacing in km for RAPSD (Norway AROME ≈ 2 km)
-    predictions_file: auto  # "auto" = derive from checkpoint name; explicit path to save/load; null to disable
-    spread_skill_bin_mode: quantile  # "fixed" (legacy 8-bin) or "quantile" (20 equal-count bins)
-    skip_conditional_metrics: false  # set true to skip >threshold, 95th, wet-95th, twCRPS, HRRE, MPPE
-    plot_channels: null              # null = all channels; e.g. [0] to show only first channel in event plots
-    # metric_groups: null            # null = single accumulator (uses metric_channels above)
-    # To compute different metrics per variable, replace metric_channels with metric_groups:
-    # metric_groups:
-    #   precip:
-    #     channels: [0]
-    #     precip_threshold: 1.0
-    #     twcrps_thresholds: [5.0, 10.0]
-    #   temperature:
-    #     channels: [1]
-    #     skip_conditional_metrics: true
-    #     skip_spread_skill: true
+    twcrps_thresholds: [5.0, 10.0]
+    n_plot_events: 5
+    plot_events: null
+    rapsd_dx_km: 2.0
+    predictions_file: auto
+    spread_skill_bin_mode: quantile
+    skip_conditional_metrics: false
+    plot_channels: null
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 dataset:
@@ -86,7 +70,11 @@ dataset:
     input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
     invariant_variables: ["elevation"]
     bounds: large
-    years: [2005]   # must include all eval timestep years
+    years: [2005]
+    temporal_inputs:
+        offsets: [-1, 0, 1]
+        boundary: drop
+        strict_time_step_hours: 3
 
 # ── Sampler (diffusion only) ──────────────────────────────────────────────────
 sampler:
@@ -98,7 +86,7 @@ sampler:
 
 # ── Generation ────────────────────────────────────────────────────────────────
 generation:
-    inference_mode: all    # "regression" | "all" (regression + diffusion)
+    inference_mode: regression
     num_ensembles: 10
     seed_batch_size: 10
     hr_mean_conditioning: true
@@ -108,12 +96,10 @@ generation:
         use_torch_compile: true
 
     io:
-        # Checkpoint paths — override on the command line
         reg_ckpt_filename: ???
-        res_ckpt_filename: ???
-        output_filename: /dev/null   # evaluate.py does not write NetCDF
-        guide_ckpt_filename: null   # optional: path to guidance model checkpoint
+        res_ckpt_filename: /dev/null
+        output_filename: /dev/null
+        guide_ckpt_filename: null
 
-    guidance_scale: 0.0             # autoguidance scale; 0 = no guidance
-    guidance_schedule_alpha: 0.0    # power exponent for noise-level schedule: w(sigma) = w*(sigma/sigma_max)^alpha
-
+    guidance_scale: 0.0
+    guidance_schedule_alpha: 0.0

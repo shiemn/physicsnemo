@@ -94,6 +94,7 @@ def stochastic_sampler(
     net_guide: Optional[torch.nn.Module] = None,
     guidance_scale: float = 0.0,
     guidance_schedule_alpha: float = 0.0,
+    trajectory_callback: Optional[Callable] = None,
 ) -> Tensor:
     r"""
     Proposed EDM sampler (Algorithm 2) with minor changes to enable
@@ -172,6 +173,19 @@ def stochastic_sampler(
         Maximum time step for applying churn. By default ``float("inf")``.
     S_noise : float
         Noise scaling factor applied during the churn step. By default 1.
+    net_guide : Optional[torch.nn.Module], optional
+        Guidance model for autoguidance. By default ``None``.
+    guidance_scale : float
+        Guidance weight ``w`` in ``D_guided = D_main + w * (D_main - D_weak)``.
+        By default 0.0 (no guidance).
+    guidance_schedule_alpha : float
+        Exponent for sigma-dependent guidance schedule:
+        ``w_eff = scale * (sigma / sigma_max) ** alpha``. By default 0.0.
+    trajectory_callback : Optional[Callable], optional
+        If provided, called at the end of each denoising step with keyword
+        arguments ``step`` (int), ``sigma`` (float), ``sigma_next`` (float),
+        ``x_next`` (Tensor), ``denoised`` (Tensor). Useful for capturing
+        intermediate states for visualization. By default ``None``.
 
     Returns
     -------
@@ -354,6 +368,15 @@ def stochastic_sampler(
 
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+        if trajectory_callback is not None:
+            trajectory_callback(
+                step=i,
+                sigma=float(t_cur),
+                sigma_next=float(t_next),
+                x_next=x_next.detach(),
+                denoised=denoised.detach(),
+            )
     return x_next
 
 

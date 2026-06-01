@@ -6,6 +6,8 @@ __pycache__/
 tensorboard/
 wandb/
 outputs/
+*.xlsx
+*.csv
 
 # HP Search generated outputs
 hp_search/visualizations/
@@ -14,12 +16,14 @@ hp_search/archive/
 
 # Archived/obsolete scripts
 jobs/archive/
+/archive/
 
 # Optuna databases (local testing)
 *.db
 
 # Notebooks outputs
 notebooks/
+planning/
 
 # Multi-checkpoint tools (user-specific checkpoint lists)
 multi_checkpoint_tools/
@@ -28,7 +32,9 @@ multi_checkpoint_tools/
 .vscode/
 .idea/
 .claude/
+.codex/
+.opencode/
 
 
 # MacOs specific
-.DS_Store
+*.DS_Store

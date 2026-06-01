@@ -65,7 +65,10 @@ class _ZarrDataset(DownscalingDataset):
         self, path: str, get_target_normalization=get_target_normalizations_v1
     ):
         self.path = path
-        self.group = zarr.open_consolidated(path)
+        if path.endswith(".zip"):
+            self.group = zarr.open_consolidated(zarr.ZipStore(path, mode="r"))
+        else:
+            self.group = zarr.open_consolidated(path)
         self.get_target_normalization = get_target_normalization
 
         # valid indices

@@ -1,0 +1,77 @@
+# Regression-only evaluation for Taiwan (CWB) dataset — with temporal conditioning.
+# Shared by mini-temporal and large-temporal regression models; pass checkpoint as CLI override.
+#
+# Usage (via eval.slurm, which binds hnvme as /data/ and sets run_tag/output paths):
+#   sbatch --gres=gpu:h100:1 jobs/helma/eval.slurm evaluate_taiwan_temporal_reg <run_tag> \
+#       generation.io.reg_ckpt_filename=/checkpoints/<dir>/checkpoints_regression/UNet.0.2000128.mdlus
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate_taiwan_temporal_reg
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base   # Do not modify
+
+defaults:
+    - dataset: cwb
+    - generation: non_patched
+    - times: taiwan256
+
+run_tag: ???
+
+wandb:
+    mode: online
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+eval:
+    output_json: eval_results.json
+    n_plot_events: 5
+    plot_events: null
+    plot_channels: [0, 1, 2, 3]
+    rapsd_dx_km: 3.0
+    predictions_file: auto
+    diagnostic_channel: maximum_radar_reflectivity
+    spread_skill_bin_mode: quantile
+    per_channel_metrics: true
+    skip_conditional_metrics: true
+    twcrps_thresholds: []
+    log_regression: true
+
+dataset:
+    data_path: /data/CorrDiff/cwa_dataset.zarr.zip
+    train: false
+    all_times: true
+    temporal_inputs:
+        offsets: [-1, 0, 1]
+        boundary: drop
+        strict_time_step_hours: 1
+
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 0
+    S_min: 0
+    S_max: .inf
+
+generation:
+    inference_mode: regression
+    num_ensembles: 1
+    seed_batch_size: 1
+    hr_mean_conditioning: true
+
+    perf:
+        use_fp16: true
+        use_torch_compile: true
+
+    io:
+        reg_ckpt_filename: ???
+        res_ckpt_filename: /dev/null
+        output_filename: /dev/null
+        guide_ckpt_filename: null
+
+    guidance_scale: 0.0
+    guidance_schedule_alpha: 0.0

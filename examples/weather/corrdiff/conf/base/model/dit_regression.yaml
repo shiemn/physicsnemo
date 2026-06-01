@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: dit_regression
+hr_mean_conditioning: false
+
+# DiT architecture parameters for the regression (mean-prediction) model.
+model_args:
+  N_grid_channels: 4
+  gridtype: sinusoidal
+  embedding_type: zero   # absorbed/ignored by DiTRegressionUNet (kept for compat)
+
+  patch_size: 8
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+
+  attention_backend: transformer_engine
+  layernorm_backend: torch

@@ -1,0 +1,53 @@
+# DiT V2 diffusion on top of dit_regression_norway_v2_p4 (patch_size=4, step 2000128).
+# patch_size must match regression model tokenization (4 → 128 patches/side, 16384 tokens).
+
+hydra:
+  job:
+    chdir: false
+    name: dit_diffusion_norway_v2_p4
+  run:
+    dir: ./output/${hydra:job.name}
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - dataset: custom
+  - model: dit_diffusion_v2
+  - training: dit_diffusion
+
+dataset:
+  type: norway
+  data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+  output_variables: ['precipitation']
+  invariant_variables: ["elevation"]
+  invariant_variables_path: /data/Norway/HCLIM3/
+  bounds: large
+  years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+
+validation:
+  years: [2003, 2004]
+
+model:
+  model_args:
+    patch_size: 4
+
+training:
+  patch_shift_aug: true
+  hp:
+    training_duration: 2000000
+    batch_size_per_gpu: 4
+    total_batch_size: 64
+  io:
+    checkpoint_dir: /checkpoints/dit_diffusion_norway_v2_p4
+    regression_checkpoint_path: /checkpoints/dit_regression_norway_v2_p4/checkpoints_dit_regression_v2/DiTRegressionUNetV2.0.2000128.mdlus
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 0
+    validation_freq: 100000
+    print_progress_freq: 10000
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: dit_diffusion
+hr_mean_conditioning: True
+
+# DiT architecture parameters for the diffusion model.
+# img_resolution, img_in_channels, img_out_channels, use_fp16, and sigma_data
+# are set automatically by train.py from the dataset and training config.
+model_args:
+  N_grid_channels: 4     # positional grid channels; must be 4 or multiple of 4 for sinusoidal
+  gridtype: sinusoidal   # "sinusoidal" or "linear" (linear requires N_grid_channels=2)
+
+  # Patch size: use 8 for 256x256 (Norway, 1024 tokens),
+  #             use 16 for 448x448 (Taiwan, 784 tokens).
+  patch_size: 8
+
+  # DiT-B scale: ~133M parameters.
+  # For DiT-L scale: hidden_size=1024, depth=24, num_heads=16 (~500M params).
+  hidden_size: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4.0
+
+  # Attention backend: "transformer_engine" is optimised for H100 (requires TE).
+  # Use "timm" as a portable fallback.
+  attention_backend: transformer_engine
+  layernorm_backend: torch

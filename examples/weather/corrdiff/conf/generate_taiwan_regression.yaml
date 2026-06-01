@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hydra:
+    job:
+          chdir: false
+          name: generate_taiwan_regression
+    run:
+          dir: ./outputs/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base # Do not modify
+
+defaults:
+    - dataset: cwb
+    - generation: non_patched
+
+dataset:
+    data_path: /data/cwa_dataset.zarr
+    train: False
+    all_times: True
+
+generation:
+    num_ensembles: 1
+    seed_batch_size: 1
+    hr_mean_conditioning: false
+    inference_mode: regression
+    times:
+        # Winter / NE monsoon
+        - 2021-01-10T00:00:00
+        - 2021-01-25T00:00:00
+        - 2021-02-08T00:00:00
+        - 2021-02-22T00:00:00
+        # Spring
+        - 2021-03-15T00:00:00
+        - 2021-04-05T00:00:00
+        - 2021-04-20T00:00:00
+        - 2021-05-10T00:00:00
+        - 2021-05-25T00:00:00
+        # Mei-yu / early summer
+        - 2021-06-08T00:00:00
+        - 2021-06-22T00:00:00
+        - 2021-07-10T00:00:00
+        - 2021-07-28T00:00:00
+        # Typhoon season peak
+        - 2021-08-15T00:00:00
+        - 2021-09-12T00:00:00
+        - 2021-09-12T12:00:00
+        - 2021-09-28T00:00:00
+        - 2021-10-12T00:00:00
+        # Fall / NE monsoon onset
+        - 2021-11-05T00:00:00
+        - 2021-12-01T00:00:00
+        - 2021-12-20T00:00:00
+    io:
+        reg_ckpt_filename: /checkpoints/taiwan_regression/checkpoints_regression/UNet.0.2000128.mdlus
+        output_filename: /outputs/taiwan_regression_examples.nc
+
+wandb:
+    mode: offline
+    results_dir: "./wandb"
+    watch_model: false

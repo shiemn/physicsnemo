@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Training hyperparameters for DiT regression model.
+
+hp:
+  training_duration: 200000000
+  total_batch_size: 256
+  batch_size_per_gpu: "auto"
+  lr: 0.0001
+  grad_clip_threshold: 1.0
+  lr_decay: 1
+  lr_rampup: 0
+  lr_decay_rate: 5e5
+
+perf:
+  fp_optimizations: amp-bf16
+  dataloader_workers: 4
+  songunet_checkpoint_level: 0
+
+io:
+  regression_checkpoint_path: null
+  print_progress_freq: 1000
+  save_checkpoint_freq: 5000
+  save_n_recent_checkpoints: -1
+  validation_freq: 5000
+  validation_steps: 10

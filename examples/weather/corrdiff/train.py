@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import os
+import random
 import time
 import signal
 from contextlib import nullcontext
@@ -84,6 +85,12 @@ from helpers.custom_losses import IntensityResidualLoss, CalibratedResidualLoss,
 from helpers.custom_tweedie_losses import FlexiLoss
 from helpers.preconditioning import HeteroscedasticEDMPrecondSR
 from helpers.edm2_preconditioning import EDM2PrecondSuperResolution
+from helpers.dit_preconditioning import (
+    DiTPrecondSuperResolution,
+    DiTRegressionUNet,
+    DiTPrecondSuperResolutionV2,
+    DiTRegressionUNetV2,
+)
 
 torch._dynamo.reset()
 # Increase the cache size limit
@@ -255,6 +262,8 @@ def main(cfg: DictConfig) -> None:
         "heteroscedastic_diffusion",
         "heteroscedastic_patched_diffusion",
         "edm2_diffusion",
+        "dit_diffusion",
+        "dit_diffusion_v2",
     ]:
         raise ValueError(
             f"cfg.training.distribution should only be specified for diffusion models."
@@ -423,6 +432,48 @@ def main(cfg: DictConfig) -> None:
         if hasattr(cfg.model, "model_args"):
             edm2_args.update(OmegaConf.to_container(cfg.model.model_args))
         model = EDM2PrecondSuperResolution(**edm2_args)
+    elif cfg.model.name == "dit_diffusion":
+        dit_args = {
+            "img_resolution": list(img_shape),
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": fp16,
+            "sigma_data": sigma_data or 0.5,
+        }
+        if hasattr(cfg.model, "model_args"):
+            dit_args.update(OmegaConf.to_container(cfg.model.model_args))
+        model = DiTPrecondSuperResolution(**dit_args)
+    elif cfg.model.name == "dit_regression":
+        dit_reg_args = {
+            "img_resolution": list(img_shape),
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": fp16,
+        }
+        if hasattr(cfg.model, "model_args"):
+            dit_reg_args.update(OmegaConf.to_container(cfg.model.model_args))
+        model = DiTRegressionUNet(**dit_reg_args)
+    elif cfg.model.name == "dit_diffusion_v2":
+        dit_args = {
+            "img_resolution": list(img_shape),
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": fp16,
+            "sigma_data": sigma_data or 0.5,
+        }
+        if hasattr(cfg.model, "model_args"):
+            dit_args.update(OmegaConf.to_container(cfg.model.model_args))
+        model = DiTPrecondSuperResolutionV2(**dit_args)
+    elif cfg.model.name == "dit_regression_v2":
+        dit_reg_args = {
+            "img_resolution": list(img_shape),
+            "img_in_channels": img_in_channels,
+            "img_out_channels": img_out_channels,
+            "use_fp16": fp16,
+        }
+        if hasattr(cfg.model, "model_args"):
+            dit_reg_args.update(OmegaConf.to_container(cfg.model.model_args))
+        model = DiTRegressionUNetV2(**dit_reg_args)
     else:
         raise ValueError(f"Invalid model: {cfg.model.name}")
 
@@ -434,7 +485,7 @@ def main(cfg: DictConfig) -> None:
     # Check if regression model is used with patching
     if (
         cfg.model.name
-        in ["regression", "lt_aware_regression", "lt_aware_ce_regression"]
+        in ["regression", "lt_aware_regression", "lt_aware_ce_regression", "dit_regression", "dit_regression_v2"]
         and patching is not None
     ):
         raise ValueError(
@@ -557,6 +608,8 @@ def main(cfg: DictConfig) -> None:
         "heteroscedastic_diffusion",
         "heteroscedastic_patched_diffusion",
         "edm2_diffusion",
+        "dit_diffusion",
+        "dit_diffusion_v2",
     ):
         loss_init_kwargs = {}
         # Only add nu for student-t distribution (not for normal/gaussian)
@@ -577,7 +630,7 @@ def main(cfg: DictConfig) -> None:
             **loss_init_kwargs,
         )
         elif loss_function == "IntensityResidualLoss":
-            print("Using custom IntensityResidualLoss")
+            logger0.info("Using custom IntensityResidualLoss")
             loss_fn = IntensityResidualLoss(
                 regression_net=regression_net,
                 hr_mean_conditioning=cfg.model.hr_mean_conditioning,
@@ -585,7 +638,7 @@ def main(cfg: DictConfig) -> None:
                 maximum_intensity_weight=cfg.model.get("hp", {}).get("maximum_intensity_weight", None),
             )
         elif loss_function == "CalibratedResidualLoss":
-            print("Using CalibratedResidualLoss with Gaussian CRPS for uncertainty calibration")
+            logger0.info("Using CalibratedResidualLoss with Gaussian CRPS for uncertainty calibration")
             loss_fn = CalibratedResidualLoss(
                 regression_net=regression_net,
                 hr_mean_conditioning=cfg.model.hr_mean_conditioning,
@@ -595,7 +648,7 @@ def main(cfg: DictConfig) -> None:
             )
         elif loss_function == "CalibratedResidualLossV2":
             crps_dist = cfg.model.get("hp", {}).get("crps_distribution", "gaussian")
-            print(f"Using CalibratedResidualLossV2 with {crps_dist} CRPS + threshold-weighted CRPS")
+            logger0.info(f"Using CalibratedResidualLossV2 with {crps_dist} CRPS + threshold-weighted CRPS")
             loss_fn = CalibratedResidualLossV2(
                 regression_net=regression_net,
                 hr_mean_conditioning=cfg.model.hr_mean_conditioning,
@@ -607,12 +660,12 @@ def main(cfg: DictConfig) -> None:
                 **loss_init_kwargs,
             )
         
-    elif cfg.model.name == "regression" or cfg.model.name == "lt_aware_regression":
+    elif cfg.model.name in ("regression", "lt_aware_regression", "dit_regression", "dit_regression_v2"):
         loss_function = cfg.training.get("hp", {}).get("loss_function", None)
         if loss_function == None:
             loss_fn = RegressionLoss()
         elif loss_function == "flexiloss":
-            print(f"Using custom FlexiLoss using {cfg.training.hp.get('flexi_loss_p', [1.6])}, {cfg.training.hp.get('flexi_loss_d', [1])}")
+            logger0.info(f"Using custom FlexiLoss using {cfg.training.hp.get('flexi_loss_p', [1.6])}, {cfg.training.hp.get('flexi_loss_d', [1])}")
             loss_fn = FlexiLoss(cfg.training.hp.get("flexi_loss_p", [1.6]), cfg.training.hp.get("flexi_loss_d", [1]))
     elif cfg.model.name == "lt_aware_ce_regression":
         loss_fn = RegressionLossCE(prob_channels=prob_channels)
@@ -732,6 +785,20 @@ def main(cfg: DictConfig) -> None:
                                         .to(input_dtype)
                                         .contiguous()
                                     )
+                            # Patch shift augmentation: randomly shift the patch grid so the model
+                            # cannot rely on absolute patch-boundary positions → reduces grid artifacts
+                            if getattr(cfg.training, "patch_shift_aug", False):
+                                p = int(OmegaConf.select(cfg, "model.model_args.patch_size", default=8))
+                                dy = random.randrange(p)
+                                dx = random.randrange(p)
+                                if dy > 0 or dx > 0:
+                                    H_img, W_img = img_clean.shape[-2:]
+                                    img_clean = torch.nn.functional.pad(
+                                        img_clean, (dx, p - dx, dy, p - dy), mode="reflect"
+                                    )[:, :, dy:dy + H_img, dx:dx + W_img]
+                                    img_lr = torch.nn.functional.pad(
+                                        img_lr, (dx, p - dx, dy, p - dy), mode="reflect"
+                                    )[:, :, dy:dy + H_img, dx:dx + W_img]
                             loss_fn_kwargs = {
                                 "net": model,
                                 "img_clean": img_clean,

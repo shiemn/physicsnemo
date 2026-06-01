@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: dit_regression_v2
+hr_mean_conditioning: false
+
+# DiT V2 architecture: RoPE 2D + QK-RMSNorm, no sinusoidal positional grid.
+# img_resolution, img_in_channels, img_out_channels, and use_fp16 are set
+# automatically by train.py from the dataset config.
+model_args:
+  patch_size: 8          # 512/8=64 patches per side → 4096 tokens for 512×512
+  hidden_size: 768       # DiT-B scale (~131M parameters)
+  depth: 12
+  num_heads: 12          # head_dim = 768/12 = 64, divisible by 4 ✓
+  mlp_ratio: 4.0
+  use_qk_norm: true      # QK-RMSNorm before RoPE (FLUX/SD3 practice)

@@ -13,3 +13,4 @@ typer>=0.16.0
 psutil>=6.0.0
 optuna>=3.0.0
 matplotlib>=3.0.0
+openpyxl>=3.1

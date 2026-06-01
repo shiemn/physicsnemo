@@ -25,6 +25,6 @@ srun apptainer run --nv \
     --bind /scratch/:/data/ \
     --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
     --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
-    /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/new_corrdiff.sif \
+    /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/corrdiff_ngc.sif \
     torchrun --nproc_per_node=$NGPUS \
         $HOME/bjerknes/corrdiff/train.py --config-name edm2_v2_norwayW

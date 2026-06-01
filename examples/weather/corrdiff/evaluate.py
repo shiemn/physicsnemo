@@ -83,6 +83,115 @@ from helpers.plots import (
 )
 
 
+def _format_channel_label(channel) -> str:
+    """Convert dataset channel metadata to the string labels used in outputs."""
+    if isinstance(channel, str):
+        return channel
+
+    name = getattr(channel, "name", None)
+    if name is None:
+        return str(channel)
+
+    level = getattr(channel, "level", "") or ""
+    return f"{name}{level}"
+
+
+def _normalize_channel_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _infer_channel_type(channel_name: str) -> str:
+    normalized = _normalize_channel_name(channel_name)
+    if normalized in {
+        "maximumradarreflectivity",
+        "radarreflectivity",
+        "reflectivity",
+        "dbz",
+    }:
+        return "reflectivity"
+    if normalized in {
+        "t2m",
+        "temperature2m",
+        "airtemperature2m",
+        "tas",
+        "temperature",
+    }:
+        return "temperature"
+    if "wind" in normalized:
+        return "wind"
+    if any(token in normalized for token in ["precip", "rain", "tp", "rr"]):
+        return "precip"
+    return "generic"
+
+
+def _infer_channel_unit(channel_type: str) -> str | None:
+    if channel_type == "reflectivity":
+        return "dBZ"
+    if channel_type == "temperature":
+        return "K"
+    if channel_type == "wind":
+        return "m/s"
+    if channel_type == "precip":
+        return "mm"
+    return None
+
+
+def _select_diagnostic_group(cfg: DictConfig, groups: dict, channel_names: list[str]) -> tuple[object, dict]:
+    selection = cfg.eval.get("diagnostic_channel", "auto")
+
+    if selection == "auto":
+        gname, g = next(iter(groups.items()))
+        label = gname if gname is not None else channel_names[0]
+        return gname, {
+            "label": label,
+            "channel_type": _infer_channel_type(label),
+            "unit": _infer_channel_unit(_infer_channel_type(label)),
+        }
+
+    if isinstance(selection, int):
+        selected_index = int(selection)
+    elif isinstance(selection, str) and selection.isdigit():
+        selected_index = int(selection)
+    else:
+        selected_index = None
+
+    if selected_index is not None:
+        for gname, g in groups.items():
+            if g.get("channels") == [selected_index]:
+                label = channel_names[selected_index]
+                channel_type = _infer_channel_type(label)
+                return gname, {
+                    "label": label,
+                    "channel_type": channel_type,
+                    "unit": _infer_channel_unit(channel_type),
+                }
+        raise ValueError(
+            f"diagnostic_channel={selection!r} requires a matching single-channel metric group"
+        )
+
+    normalized_selection = _normalize_channel_name(str(selection))
+    for gname, g in groups.items():
+        candidate_names = []
+        if gname is not None:
+            candidate_names.append(str(gname))
+        channels = g.get("channels")
+        if channels is not None:
+            candidate_names.extend(channel_names[idx] for idx in channels)
+        else:
+            candidate_names.extend(channel_names)
+
+        for candidate in candidate_names:
+            if _normalize_channel_name(candidate) == normalized_selection:
+                channel_type = _infer_channel_type(candidate)
+                return gname, {
+                    "label": candidate,
+                    "channel_type": channel_type,
+                    "unit": _infer_channel_unit(channel_type),
+                }
+
+    raise ValueError(f"Could not resolve diagnostic_channel={selection!r}")
+
+
 
 def _diagnostic_plot_payload(
     acc_label: str,
@@ -90,6 +199,7 @@ def _diagnostic_plot_payload(
     hist_acc: "HistogramAccumulator",
     rapsd_acc: "RAPSDAccumulator",
     rapsd_dx_km: float,
+    diagnostic_info: dict,
 ) -> dict:
     """Generate a combined diagnostic panel and return a dict of {key: wandb.Image}.
 
@@ -102,6 +212,7 @@ def _diagnostic_plot_payload(
         hist_acc=hist_acc,
         rapsd_acc=rapsd_acc,
         rapsd_dx_km=rapsd_dx_km,
+        diagnostic_info=diagnostic_info,
     )
     if fig is not None:
         payload[f"{acc_label}/diagnostics"] = wandb.Image(fig)
@@ -215,13 +326,55 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
     )
 
     device = torch.device("cpu")
-    metrics_acc = MetricsAccumulator(
-        precip_threshold=precip_threshold,
-        device=device,
-        twcrps_thresholds=twcrps_thresholds,
-        skip_spread_skill=is_regression,
-        bin_mode=spread_skill_bin_mode,
+
+    # Build metric groups (per-channel or single accumulator)
+    per_channel_metrics = cfg.eval.get("per_channel_metrics", False)
+    _metric_groups_raw = cfg.eval.get("metric_groups", None)
+    metric_groups_cfg = (
+        OmegaConf.to_container(_metric_groups_raw, resolve=True)
+        if _metric_groups_raw is not None
+        else None
     )
+    if per_channel_metrics and metric_groups_cfg is None:
+        _skip_cond = cfg.eval.get("skip_conditional_metrics", False)
+        metric_groups_cfg = {
+            name: {"channels": [i], "skip_conditional_metrics": _skip_cond}
+            for i, name in enumerate(channel_names)
+        }
+
+    def _make_file_acc(gcfg):
+        return MetricsAccumulator(
+            precip_threshold=gcfg.get("precip_threshold", precip_threshold),
+            device=device,
+            twcrps_thresholds=gcfg.get("twcrps_thresholds", twcrps_thresholds),
+            hrre_threshold=gcfg.get("hrre_threshold", 10.0),
+            skip_conditional_metrics=gcfg.get("skip_conditional_metrics", False),
+            skip_spread_skill=is_regression or gcfg.get("skip_spread_skill", False),
+            bin_mode=spread_skill_bin_mode,
+        )
+
+    if metric_groups_cfg:
+        _groups = {
+            gname: {"channels": gcfg.get("channels"), "acc": _make_file_acc(gcfg)}
+            for gname, gcfg in metric_groups_cfg.items()
+        }
+    else:
+        _groups = {
+            None: {
+                "channels": None,
+                "acc": MetricsAccumulator(
+                    precip_threshold=precip_threshold,
+                    device=device,
+                    twcrps_thresholds=twcrps_thresholds,
+                    skip_spread_skill=is_regression,
+                    bin_mode=spread_skill_bin_mode,
+                ),
+            }
+        }
+
+    diagnostic_group_name, diagnostic_info = _select_diagnostic_group(cfg, _groups, channel_names)
+    diagnostic_group = _groups[diagnostic_group_name]
+    diagnostic_channels = diagnostic_group["channels"]
     hist_acc = HistogramAccumulator(device=device)
     rapsd_acc = RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
 
@@ -229,24 +382,33 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
 
     for t in range(n_times):
         pred_t = torch.from_numpy(data["prediction"][:, t])  # (N_ens, C, H, W)
-        tar_t = torch.from_numpy(data["truth"][t])            # (C, H, W)
+        tar_t = torch.from_numpy(data["truth"][t])          # (C, H, W)
 
-        metrics_acc.update(pred_t, tar_t)
-        hist_acc.update(pred_t, tar_t)
-        rapsd_acc.update(pred_t, tar_t)
+        for g in _groups.values():
+            ch = g["channels"]
+            p = pred_t[:, ch] if ch is not None else pred_t
+            tg = tar_t[ch] if ch is not None else tar_t
+            g["acc"].update(p, tg)
+
+        p_hist = pred_t[:, diagnostic_channels] if diagnostic_channels is not None else pred_t
+        tg_hist = tar_t[diagnostic_channels] if diagnostic_channels is not None else tar_t
+        hist_acc.update(p_hist, tg_hist)
+        rapsd_acc.update(p_hist, tg_hist)
         event_candidates.append((t, float(tar_t.max()), t))
 
     acc_label = "regression" if is_regression else "diffusion"
-    metrics_dict = metrics_acc.to_dict(prefix=f"{acc_label}/")
+    all_metrics = {}
+    for gname, g in _groups.items():
+        prefix = f"{acc_label}/" if gname is None else f"{acc_label}/{gname}/"
+        all_metrics.update(g["acc"].to_dict(prefix=prefix))
 
-    wandb_payload = {}
-    wandb_payload.update(metrics_dict)
+    wandb_payload = dict(all_metrics)
 
     # Console summary
     logger.info("=" * 70)
     logger.info("EVALUATION RESULTS (from file)")
     logger.info("=" * 70)
-    for k, v in metrics_dict.items():
+    for k, v in all_metrics.items():
         if isinstance(v, float):
             logger.info(f"  {k}: {v:.6f}")
         elif not isinstance(v, list):
@@ -254,16 +416,17 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
 
     # JSON backup
     with open(output_json, "w") as f:
-        json.dump(metrics_dict, f, indent=2)
+        json.dump(all_metrics, f, indent=2)
     logger.info(f"Results saved to: {output_json}")
 
-    # Diagnostic plots
+    diagnostic_acc_dict = diagnostic_group["acc"].to_dict(prefix=f"{acc_label}/")
     wandb_payload.update(_diagnostic_plot_payload(
         acc_label=acc_label,
-        metrics_dict=metrics_dict,
+        metrics_dict=diagnostic_acc_dict,
         hist_acc=hist_acc,
         rapsd_acc=rapsd_acc,
         rapsd_dx_km=rapsd_dx_km,
+        diagnostic_info=diagnostic_info,
     ))
 
     # Event plots
@@ -428,6 +591,20 @@ def main(cfg: DictConfig) -> None:
     plot_events = list(cfg.eval.get("plot_events", None) or [])
     rapsd_dx_km = float(cfg.eval.get("rapsd_dx_km", 2.0))
     predictions_file_cfg = cfg.eval.get("predictions_file", None)
+    # metric_groups: optional dict of {group_name: {channels, precip_threshold,
+    #   twcrps_thresholds, skip_conditional_metrics, skip_spread_skill, hrre_threshold}}
+    # If null, falls back to legacy single-accumulator behaviour using metric_channels.
+    _metric_groups_raw = cfg.eval.get("metric_groups", None)
+    metric_groups_cfg = (
+        OmegaConf.to_container(_metric_groups_raw, resolve=True)
+        if _metric_groups_raw is not None
+        else None
+    )
+    per_channel_metrics = cfg.eval.get("per_channel_metrics", False)
+    log_regression = cfg.eval.get("log_regression", True)
+    plot_channels_cfg = cfg.eval.get("plot_channels", None)
+    if plot_channels_cfg is not None:
+        plot_channels_cfg = list(plot_channels_cfg)
 
     # Resolve "auto" → derive filename from the primary checkpoint name.
     # Done early so the offline-load check works, but we need the checkpoint
@@ -457,12 +634,21 @@ def main(cfg: DictConfig) -> None:
             return
 
     logger0.info(f"=== CorrDiff Unified Evaluation ===")
+    metric_channels = cfg.eval.get("metric_channels", None)
+    if metric_channels is not None:
+        metric_channels = list(metric_channels)
+    spread_skill_bin_mode = cfg.eval.get("spread_skill_bin_mode", "quantile")
+
     logger0.info(f"  Run tag:        {run_tag}")
     logger0.info(f"  Inference mode: {inference_mode}")
     logger0.info(f"  Ensembles:      {num_ensembles}")
     logger0.info(f"  Threshold:      {precip_threshold} mm")
     logger0.info(f"  twCRPS at:      {twcrps_thresholds} mm")
     logger0.info(f"  Plot events:    top-{n_plot_events} (+ {len(plot_events)} explicit)")
+    if metric_groups_cfg:
+        logger0.info(f"  Metric groups:  {list(metric_groups_cfg.keys())}")
+    else:
+        logger0.info(f"  Metric channels:{metric_channels if metric_channels is not None else 'all'}")
     logger0.info(f"  GPUs:           {dist.world_size}")
 
     # ------------------------------------------------------------------
@@ -517,8 +703,17 @@ def main(cfg: DictConfig) -> None:
     times = [all_dataset_times[i] for i in sampler] if sampler else all_dataset_times
 
     img_shape = dataset.image_shape()
-    img_out_channels = len(dataset.output_channels())
-    channel_names = list(dataset.output_channels())
+    output_channels = list(dataset.output_channels())
+    img_out_channels = len(output_channels)
+    channel_names = [_format_channel_label(channel) for channel in output_channels]
+
+    # Auto-expand per_channel_metrics into one group per output channel
+    if per_channel_metrics and metric_groups_cfg is None:
+        _skip_cond = cfg.eval.get("skip_conditional_metrics", False)
+        metric_groups_cfg = {
+            name: {"channels": [i], "skip_conditional_metrics": _skip_cond}
+            for i, name in enumerate(channel_names)
+        }
 
     # Lat/lon for georeferenced plots (xarray.DataArray -> numpy)
     try:
@@ -591,23 +786,43 @@ def main(cfg: DictConfig) -> None:
     seed_batches = np.array_split(seeds, num_seed_batches)
 
     # ------------------------------------------------------------------
-    # Metric accumulators (one per inference mode that is active)
+    # Metric accumulators (one per inference mode × metric group)
     # ------------------------------------------------------------------
-    metrics_reg = MetricsAccumulator(
-        precip_threshold=precip_threshold,
-        device=device,
-        twcrps_thresholds=twcrps_thresholds,
-        skip_spread_skill=True,
-    )
-    metrics_diff = (
-        MetricsAccumulator(
-            precip_threshold=precip_threshold,
+    # _groups is an ordered dict: group_name -> {channels, reg_acc, diff_acc}
+    # group_name is None for the legacy single-accumulator case, which preserves
+    # the existing WandB key structure (regression/rmse, not regression/default/rmse).
+    def _make_acc(gcfg, skip_ss):
+        return MetricsAccumulator(
+            precip_threshold=gcfg.get("precip_threshold", precip_threshold),
             device=device,
-            twcrps_thresholds=twcrps_thresholds,
+            twcrps_thresholds=gcfg.get("twcrps_thresholds", twcrps_thresholds),
+            hrre_threshold=gcfg.get("hrre_threshold", 10.0),
+            skip_conditional_metrics=gcfg.get("skip_conditional_metrics", False),
+            skip_spread_skill=skip_ss or gcfg.get("skip_spread_skill", False),
+            bin_mode=spread_skill_bin_mode,
         )
-        if inference_mode == "all"
-        else None
-    )
+
+    if metric_groups_cfg:
+        _groups = {
+            gname: {
+                "channels": gcfg.get("channels"),  # list[int] or None = all
+                "reg_acc": _make_acc(gcfg, skip_ss=True),
+                "diff_acc": _make_acc(gcfg, skip_ss=False) if inference_mode == "all" else None,
+            }
+            for gname, gcfg in metric_groups_cfg.items()
+        }
+    else:
+        _groups = {
+            None: {  # None key → legacy prefix structure (no group sub-key)
+                "channels": metric_channels,
+                "reg_acc": _make_acc({}, skip_ss=True),
+                "diff_acc": _make_acc({}, skip_ss=False) if inference_mode == "all" else None,
+            }
+        }
+
+    diagnostic_group_name, diagnostic_info = _select_diagnostic_group(cfg, _groups, channel_names)
+    diagnostic_group = _groups[diagnostic_group_name]
+    diagnostic_channels = diagnostic_group["channels"]
 
     # Histogram and RAPSD accumulators
     hist_acc_reg = HistogramAccumulator(device=device)
@@ -682,30 +897,52 @@ def main(cfg: DictConfig) -> None:
 
         # -- Regression forward pass --
         with torch.no_grad():
-            image_reg = regression_step(
-                net=net_reg,
-                img_lr=image_lr,
-                latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
-                lead_time_label=lead_time_label,
-            )
+            try:
+                image_reg = regression_step(
+                    net=net_reg,
+                    img_lr=image_lr,
+                    latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+                    lead_time_label=lead_time_label,
+                )
+            except (RuntimeError, Exception) as _e:
+                _msg = str(_e)
+                if "channels" in _msg and image_lr is not None:
+                    n_got = image_lr.shape[1]
+                    raise RuntimeError(
+                        f"Regression model received {n_got} input channels but "
+                        f"expected a different number. If the model was trained with "
+                        f"temporal inputs, add 'dataset.temporal_inputs' to your eval "
+                        f"config (e.g. use --config-name=evaluate_temporal_reg). "
+                        f"Original error: {_e}"
+                    ) from _e
+                raise
         reg_mean = image_reg[0:1]  # (1, C, H, W)
 
         # Denormalize regression prediction and target
         reg_pred_np = dataset.denormalize_output(reg_mean.cpu().numpy())          # (1, C, H, W)
         tar_np = dataset.denormalize_output(image_tar.cpu().numpy())              # (1, C, H, W)
-        reg_pred_t = torch.from_numpy(reg_pred_np).to(device)                    # (1, C, H, W)
-        tar_t = torch.from_numpy(tar_np).to(device)                               # (1, C, H, W)
+        reg_pred_t = torch.from_numpy(reg_pred_np).to(device).clamp(min=0.0)       # (1, C, H, W)
+        tar_t = torch.from_numpy(tar_np).to(device).clamp(min=0.0)               # (1, C, H, W)
 
-        # Regression metrics: treat single pred as a 1-member ensemble
-        metrics_reg.update(reg_pred_t, tar_t)
-        hist_acc_reg.update(reg_pred_t, tar_t.squeeze(0))
-        rapsd_acc_reg.update(reg_pred_t, tar_t.squeeze(0))
+        # Regression metrics: update each group's accumulator with its channel subset
+        if log_regression:
+            for g in _groups.values():
+                ch = g["channels"]
+                r = reg_pred_t[:, ch] if ch is not None else reg_pred_t
+                t = tar_t[:, ch] if ch is not None else tar_t
+                g["reg_acc"].update(r, t)
+        # Diagnostic plots use the selected diagnostic group's channel subset.
+        reg_pred_m = reg_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else reg_pred_t
+        tar_m = tar_t[:, diagnostic_channels] if diagnostic_channels is not None else tar_t
+        hist_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
+        rapsd_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
 
         # Track as event candidate for auto-selection of plot timesteps
         local_event_candidates.append((time_idx, float(tar_t.max()), dataset_idx))
 
         # -- Diffusion forward pass (when mode == "all") --
-        if net_res is not None and metrics_diff is not None:
+        _any_diff_acc = any(g["diff_acc"] is not None for g in _groups.values())
+        if net_res is not None and _any_diff_acc:
             mean_hr = reg_mean if cfg.generation.hr_mean_conditioning else None
             all_residuals = []
             for seed_batch in seed_batches:
@@ -734,16 +971,23 @@ def main(cfg: DictConfig) -> None:
             ens_pred = reg_mean + diffusion_residuals                # (N_ens, C, H, W)
 
             ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())
-            ens_pred_t = torch.from_numpy(ens_pred_np).to(device)    # (N_ens, C, H, W)
+            ens_pred_t = torch.from_numpy(ens_pred_np).to(device).clamp(min=0.0)  # (N_ens, C, H, W)
 
-            metrics_diff.update(ens_pred_t, tar_t)
-            hist_acc_diff.update(ens_pred_t, tar_t.squeeze(0))
-            rapsd_acc_diff.update(ens_pred_t, tar_t.squeeze(0))
+            for g in _groups.values():
+                if g["diff_acc"] is None:
+                    continue
+                ch = g["channels"]
+                e = ens_pred_t[:, ch] if ch is not None else ens_pred_t
+                t = tar_t[:, ch] if ch is not None else tar_t
+                g["diff_acc"].update(e, t)
+            ens_pred_m = ens_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else ens_pred_t
+            hist_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
+            rapsd_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
 
         # Buffer normalized predictions for NetCDF save
         if save_predictions:
             # Use the diffusion ensemble if available, otherwise regression only
-            if net_res is not None and metrics_diff is not None:
+            if net_res is not None and _any_diff_acc:
                 image_out = ens_pred.cpu()  # (N_ens, C, H, W), normalized
             else:
                 image_out = reg_mean.cpu()  # (1, C, H, W), normalized
@@ -758,11 +1002,13 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # Distributed reduce (all_reduce so every rank has global totals)
     # ------------------------------------------------------------------
-    metrics_reg.reduce()
+    for g in _groups.values():
+        if log_regression:
+            g["reg_acc"].reduce()
+        if g["diff_acc"] is not None:
+            g["diff_acc"].reduce()
     hist_acc_reg.reduce()
     rapsd_acc_reg.reduce()
-    if metrics_diff is not None:
-        metrics_diff.reduce()
     if hist_acc_diff is not None:
         hist_acc_diff.reduce()
     if rapsd_acc_diff is not None:
@@ -825,16 +1071,26 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     if dist.rank == 0:
         wandb_payload = {}
+        all_metrics = {}
 
-        reg_dict = metrics_reg.to_dict(prefix="regression/")
-        wandb_payload.update(reg_dict)
+        for gname, g in _groups.items():
+            # WandB prefix: "regression/" for single group, "regression/{gname}/" for multi
+            if gname is None:
+                reg_prefix = "regression/"
+                diff_prefix = "diffusion/"
+            else:
+                reg_prefix = f"regression/{gname}/"
+                diff_prefix = f"diffusion/{gname}/"
 
-        diff_dict = {}
-        if metrics_diff is not None:
-            diff_dict = metrics_diff.to_dict(prefix="diffusion/")
-            wandb_payload.update(diff_dict)
+            if log_regression:
+                reg_dict = g["reg_acc"].to_dict(prefix=reg_prefix)
+                wandb_payload.update(reg_dict)
+                all_metrics.update(reg_dict)
 
-        all_metrics = {**reg_dict, **diff_dict}
+            if g["diff_acc"] is not None:
+                diff_dict = g["diff_acc"].to_dict(prefix=diff_prefix)
+                wandb_payload.update(diff_dict)
+                all_metrics.update(diff_dict)
 
         # Console summary
         logger.info("=" * 70)
@@ -852,24 +1108,28 @@ def main(cfg: DictConfig) -> None:
         logger.info(f"Results saved to: {output_json}")
 
         # --------------------------------------------------------------
-        # Diagnostic plots — regression
+        # Diagnostic plots — use the selected diagnostic group's accumulator.
         # --------------------------------------------------------------
-        wandb_payload.update(_diagnostic_plot_payload(
-            acc_label="regression",
-            metrics_dict=reg_dict,
-            hist_acc=hist_acc_reg,
-            rapsd_acc=rapsd_acc_reg,
-            rapsd_dx_km=rapsd_dx_km,
-        ))
+        if log_regression:
+            diagnostic_reg_dict = diagnostic_group["reg_acc"].to_dict(prefix="regression/")
+            wandb_payload.update(_diagnostic_plot_payload(
+                acc_label="regression",
+                metrics_dict=diagnostic_reg_dict,
+                hist_acc=hist_acc_reg,
+                rapsd_acc=rapsd_acc_reg,
+                rapsd_dx_km=rapsd_dx_km,
+                diagnostic_info=diagnostic_info,
+            ))
 
-        # Diagnostic plots — diffusion
-        if metrics_diff is not None and hist_acc_diff is not None:
+        if diagnostic_group["diff_acc"] is not None and hist_acc_diff is not None:
+            diagnostic_diff_dict = diagnostic_group["diff_acc"].to_dict(prefix="diffusion/")
             wandb_payload.update(_diagnostic_plot_payload(
                 acc_label="diffusion",
-                metrics_dict=diff_dict,
+                metrics_dict=diagnostic_diff_dict,
                 hist_acc=hist_acc_diff,
                 rapsd_acc=rapsd_acc_diff,
                 rapsd_dx_km=rapsd_dx_km,
+                diagnostic_info=diagnostic_info,
             ))
 
         # --------------------------------------------------------------
@@ -919,6 +1179,7 @@ def main(cfg: DictConfig) -> None:
                     channel_names=channel_names,
                     lat=lat_np,
                     lon=lon_np,
+                    plot_channels=plot_channels_cfg,
                 )
                 wandb.log(
                     {
