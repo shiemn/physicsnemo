@@ -48,11 +48,11 @@ the windowed attention module.
 ## Immediate Next Runs
 
 1. `python -m pytest tests/test_temporal_inputs.py`
-2. `python train.py --config-name=tr_reg_hp_temporal_smoke`
-3. Launch or schedule the Norway baseline ladder using overrides once data
+2. `python train.py --config-name=tr_reg_norway_sym3h_smoke`
+3. Launch or schedule the Norway baseline ladder using explicit configs once data
    paths are available on the target machine:
-   - `t0`: `python train.py --config-name=tr_reg_hp`
-   - `past_3h`: `python train.py --config-name=tr_reg_hp +dataset.temporal_inputs.offset_hours=[-3,0] +dataset.temporal_inputs.boundary=drop +dataset.temporal_inputs.strict_time_step_hours=3`
-   - `sym_3h`: `python train.py --config-name=tr_reg_hp +dataset.temporal_inputs.offset_hours=[-3,0,3] +dataset.temporal_inputs.boundary=drop +dataset.temporal_inputs.strict_time_step_hours=3`
-   - `past_6h`: `python train.py --config-name=tr_reg_hp +dataset.temporal_inputs.offset_hours=[-6,-3,0] +dataset.temporal_inputs.boundary=drop +dataset.temporal_inputs.strict_time_step_hours=3`
-   - `sym_6h`: `python train.py --config-name=tr_reg_hp +dataset.temporal_inputs.offset_hours=[-6,-3,0,3,6] +dataset.temporal_inputs.boundary=drop +dataset.temporal_inputs.strict_time_step_hours=3`
+   - `t0`: `python train.py --config-name=tr_reg_norway_t0`
+   - `past_3h`: `python train.py --config-name=tr_reg_norway_past3h`
+   - `sym_3h`: `python train.py --config-name=tr_reg_norway_sym3h`
+   - `past_6h`: `python train.py --config-name=tr_reg_norway_past6h`
+   - `sym_6h`: `python train.py --config-name=tr_reg_norway_sym6h`

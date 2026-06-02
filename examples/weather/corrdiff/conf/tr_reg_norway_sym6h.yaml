@@ -1,0 +1,22 @@
+# Norway symmetric 6-hour temporal regression.
+
+defaults:
+  - /base_regression_norway
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_sym6h
+  run:
+    dir: ./output/${hydra:job.name}
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-6, -3, 0, 3, 6]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_sym6h
+

@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Regression training config based on HP search best result (reg_07_flexi_p125)
+# Norway t0 regression baseline for the temporal-context matrix.
 # FlexiLoss p=1.25, lr=1e-4, batch=256, attn=[16]
 
 hydra:
     job:
           chdir: false
-          name: tr_reg_hp
+          name: tr_reg_norway_t0
     run:
           dir: ./output/${hydra:job.name}
     searchpath:
@@ -62,7 +62,7 @@ training:
         flexi_loss_d: [1]
     io:
         print_progress_freq: 100000
-        checkpoint_dir: /checkpoints/hp_reg_grid/reg_07_flexi_p125
+        checkpoint_dir: /checkpoints/temporal_regression/norway_t0
         save_checkpoint_freq: 100000
         save_n_recent_checkpoints: 20
         validation_freq: 100000

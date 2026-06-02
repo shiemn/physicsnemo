@@ -46,7 +46,7 @@ dataset:
     bounds: large
     years: [2005]
     temporal_inputs:
-        offsets: [-1, 0, 1]
+        offset_hours: [-3, 0, 3]
         boundary: drop
         strict_time_step_hours: 3
 

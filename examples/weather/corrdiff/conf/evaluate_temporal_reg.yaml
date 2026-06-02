@@ -1,6 +1,6 @@
 # Evaluation config for regression models trained with temporal inputs.
 # Identical to evaluate.yaml but adds dataset.temporal_inputs to match
-# the tr_reg_hp_temporal training config (offsets: [-1, 0, 1]).
+# the tr_reg_norway_sym3h training config (offset_hours: [-3, 0, 3]).
 #
 # Usage:
 #   sbatch jobs/helma/eval.slurm evaluate_temporal_reg <run_tag> \
@@ -72,7 +72,7 @@ dataset:
     bounds: large
     years: [2005]
     temporal_inputs:
-        offsets: [-1, 0, 1]
+        offset_hours: [-3, 0, 3]
         boundary: drop
         strict_time_step_hours: 3
 

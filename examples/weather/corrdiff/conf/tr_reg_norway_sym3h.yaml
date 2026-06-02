@@ -1,18 +1,18 @@
-# Temporal regression training based on tr_reg_hp / hp_reg07 settings.
+# Norway symmetric 3-hour temporal regression.
 
 defaults:
-  - /hp_base_trainreg
+  - /base_regression_norway
   - _self_
 
 hydra:
   job:
-    name: tr_reg_hp_temporal
+    name: tr_reg_norway_sym3h
   run:
     dir: ./output/${hydra:job.name}
 
 dataset:
   temporal_inputs:
-    offsets: [-1, 0, 1]
+    offset_hours: [-3, 0, 3]
     boundary: drop
     strict_time_step_hours: 3
 
@@ -28,7 +28,7 @@ training:
     flexi_loss_d: [1]
   io:
     print_progress_freq: 100000
-    checkpoint_dir: /checkpoints/hp_reg_grid/reg_07_flexi_p125_temporal
+    checkpoint_dir: /checkpoints/temporal_regression/norway_sym3h
     save_checkpoint_freq: 100000
     save_n_recent_checkpoints: 20
     validation_freq: 100000

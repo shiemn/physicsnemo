@@ -1,6 +1,6 @@
-# Diffusion training on top of tr_reg_hp_temporal (temporal UNet regression, step 2000128).
-# Uses HP search best settings from tr_diff_hp.yaml.
-# Temporal inputs must match the regression model (offsets [-1,0,1], 24-channel img_lr).
+# Diffusion training on top of tr_reg_norway_sym3h (temporal UNet regression, step 2000128).
+# Uses the established Norway diffusion hyperparameters.
+# Temporal inputs must match the regression model (offset_hours [-3,0,3], 24-channel img_lr).
 
 hydra:
   job:
@@ -32,7 +32,7 @@ dataset:
   bounds: large
   years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
   temporal_inputs:
-    offsets: [-1, 0, 1]
+    offset_hours: [-3, 0, 3]
     boundary: drop
     strict_time_step_hours: 3
 
@@ -50,7 +50,7 @@ training:
     P_std: 0.8440688577987278
     sigma_data: 0.8690460756242084
   io:
-    regression_checkpoint_path: /checkpoints/hp_reg_grid/reg_07_flexi_p125_temporal/checkpoints_regression/UNet.0.2000128.mdlus
+    regression_checkpoint_path: /checkpoints/temporal_regression/norway_sym3h/checkpoints_regression/UNet.0.2000128.mdlus
     checkpoint_dir: /checkpoints/tr_diff_temporal
     save_checkpoint_freq: 100000
     save_n_recent_checkpoints: 20

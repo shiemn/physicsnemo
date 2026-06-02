@@ -1,5 +1,5 @@
 # Temporal regression training for Taiwan (CWA/CWB) dataset.
-# Mirrors tr_reg_hp_temporal but adapted for the CWB hourly dataset.
+# Mirrors the Norway symmetric temporal regression setup, adapted for the CWB hourly dataset.
 
 hydra:
     job:

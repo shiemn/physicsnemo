@@ -1,19 +1,19 @@
-# Temporal regression smoke test based on tr_reg_hp / hp_reg07 settings.
+# Norway symmetric 3-hour temporal regression smoke test.
 # Uses one local batch of 4 samples per optimizer step for a short direct run.
 
 defaults:
-  - /hp_base_trainreg
+  - /base_regression_norway
   - _self_
 
 hydra:
   job:
-    name: tr_reg_hp_temporal_smoke
+    name: tr_reg_norway_sym3h_smoke
   run:
     dir: ./output/${hydra:job.name}
 
 dataset:
   temporal_inputs:
-    offsets: [-1, 0, 1]
+    offset_hours: [-3, 0, 3]
     boundary: drop
     strict_time_step_hours: 3
 
@@ -32,7 +32,7 @@ training:
     validation_freq: 8
     validation_steps: 1
     save_checkpoint_freq: 1000000000
-    checkpoint_dir: /tmp/corrdiff_temporal_reg_smoke
+    checkpoint_dir: /tmp/corrdiff_temporal_regression_norway_sym3h_smoke
 
 wandb:
   mode: disabled
