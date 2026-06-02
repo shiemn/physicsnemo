@@ -71,6 +71,44 @@ def test_maybe_wrap_temporal_inputs_disabled_returns_base_dataset():
     assert maybe_wrap_temporal_inputs(dataset, None) is dataset
 
 
+def test_temporal_inputs_accept_physical_hour_offsets():
+    dataset = maybe_wrap_temporal_inputs(
+        DummyTemporalDataset(),
+        {
+            "offset_hours": [-1, 0, 1],
+            "strict_time_step_hours": 1,
+        },
+    )
+
+    target, input_field, label = dataset[0]
+
+    assert len(dataset) == 3
+    np.testing.assert_array_equal(target, np.full((1, 2, 2), 1, dtype=np.float32))
+    assert label == 100
+    assert input_field.shape == (6, 2, 2)
+    np.testing.assert_array_equal(
+        input_field[:, 0, 0],
+        np.array([0, 10, 1, 11, 2, 12], dtype=np.float32),
+    )
+
+
+def test_temporal_inputs_reject_non_integral_physical_offsets():
+    dataset = DummyTemporalDataset()
+
+    try:
+        maybe_wrap_temporal_inputs(
+            dataset,
+            {
+                "offset_hours": [-1.5, 0, 1.5],
+                "strict_time_step_hours": 1,
+            },
+        )
+    except ValueError as exc:
+        assert "integer multiples" in str(exc)
+    else:
+        raise AssertionError("Expected non-integral physical offsets to fail")
+
+
 def test_temporal_inputs_stack_offsets_and_preserve_center_sample_extras():
     dataset = TemporalInputDataset(
         DummyTemporalDataset(),

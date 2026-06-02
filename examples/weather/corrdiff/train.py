@@ -16,9 +16,15 @@
 
 import os
 import random
-import time
 import signal
+import sys
+import time
 from contextlib import nullcontext
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import psutil
 

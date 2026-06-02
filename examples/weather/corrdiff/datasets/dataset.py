@@ -231,12 +231,35 @@ def maybe_wrap_temporal_inputs(
 
     temporal_cfg = copy.deepcopy(temporal_cfg)
     offsets = temporal_cfg.pop("offsets", None)
+    offset_hours = temporal_cfg.pop("offset_hours", None)
     boundary = temporal_cfg.pop("boundary", "drop")
     strict_time_step_hours = temporal_cfg.pop("strict_time_step_hours", None)
     if temporal_cfg:
         raise ValueError(
             f"Unknown temporal_inputs option(s): {', '.join(sorted(temporal_cfg))}"
         )
+    if offsets is not None and offset_hours is not None:
+        raise ValueError(
+            "temporal_inputs must define either offsets or offset_hours, not both"
+        )
+    if offset_hours is not None:
+        if strict_time_step_hours is None:
+            raise ValueError(
+                "temporal_inputs.offset_hours requires strict_time_step_hours so "
+                "physical-hour offsets can be converted to dataset indices"
+            )
+        offsets = []
+        for offset_hour in offset_hours:
+            offset = float(offset_hour) / float(strict_time_step_hours)
+            if not offset.is_integer():
+                raise ValueError(
+                    "temporal_inputs.offset_hours values must be integer multiples "
+                    f"of strict_time_step_hours; got {offset_hour} and "
+                    f"{strict_time_step_hours}"
+                )
+            offsets.append(int(offset))
+    if offsets is None:
+        raise ValueError("temporal_inputs requires offsets or offset_hours")
     return TemporalInputDataset(
         dataset,
         offsets=offsets,
