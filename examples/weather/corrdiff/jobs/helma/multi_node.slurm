@@ -9,6 +9,8 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
 
+set -euo pipefail
+
 echo "=================================================="
 echo "Training"
 echo "=================================================="
@@ -33,25 +35,54 @@ export APPTAINERENV_MASTER_PORT=${MASTER_PORT}
 echo "MASTER_ADDR: ${MASTER_ADDR}"
 echo "MASTER_PORT: ${MASTER_PORT}"
 
-# Copy data to all nodes (default: copy.sh; override via second argument)
-COPY_SCRIPT=${2:-copy.sh}
-srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/${COPY_SCRIPT}
+HNVME=/hnvme/workspace/b214cb11-helma-ecodata/downscaling
+CONFIG=${1:?"Usage: sbatch multi_node.slurm <config-name> [copy.sh|taiwan|europa] [hydra overrides...]"}
+shift
+DATA_MODE=${1:-copy.sh}
+if [ $# -gt 0 ]; then
+    shift
+fi
+USER_OVERRIDES=("$@")
+HYDRA_OVERRIDES=()
+
+# Copy data to all nodes (default: copy.sh; named zarr modes stage zipped zarrs).
+if [ "$DATA_MODE" = "taiwan" ]; then
+    echo "Data mode: taiwan zipped zarr staging"
+    srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/stage_zarr_zip.sh \
+        ${HNVME}/CorrDiff/cwa_dataset.zarr.zip \
+        /scratch/cwa_dataset/cwa_dataset.zarr
+    HYDRA_OVERRIDES+=("dataset.data_path=/data/cwa_dataset/cwa_dataset.zarr")
+elif [ "$DATA_MODE" = "europa" ]; then
+    echo "Data mode: europa zipped zarr staging"
+    srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/stage_zarr_zip.sh \
+        ${HNVME}/Europe/wuerzburg450_corrdiff_v2.zarr.zip \
+        /scratch/Europe/wuerzburg450_corrdiff_v2.zarr
+    HYDRA_OVERRIDES+=("dataset.data_path=/data/Europe/wuerzburg450_corrdiff_v2.zarr")
+else
+    COPY_SCRIPT=$DATA_MODE
+    echo "Data mode: copy script ${COPY_SCRIPT}"
+    srun --ntasks-per-node=1 /bin/bash $HOME/bjerknes/corrdiff/jobs/helma/${COPY_SCRIPT}
+fi
 
 # Run distributed training: $SLURM_NNODES nodes x 4 GPUs each
 echo "Launching torchrun: ${SLURM_NNODES} nodes x 4 GPUs = $((SLURM_NNODES * 4)) GPUs total"
+set +e
 srun apptainer run --nv \
                         --bind /scratch/:/data/ \
-                        --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
-                        --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
-                        /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/corrdiff_ngc.sif \
+                        --bind ${HNVME}/checkpoints/corrdiff:/checkpoints/ \
+                        --bind ${HNVME}/outputs/corrdiff:/outputs/ \
+                        ${HNVME}/apptainer/corrdiff_ngc.sif \
                         torchrun --nnodes=${SLURM_NNODES} \
                                  --nproc_per_node=4 \
                                  --rdzv_id=${SLURM_JOB_ID} \
                                  --rdzv_backend=c10d \
                                  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
-                                 $HOME/bjerknes/corrdiff/train.py --config-name $1
+                                 $HOME/bjerknes/corrdiff/train.py --config-name $CONFIG "${HYDRA_OVERRIDES[@]}" "${USER_OVERRIDES[@]}"
+status=$?
+set -e
 
 echo "=================================================="
-echo "Training Complete (exit code: $?)"
+echo "Training Complete (exit code: ${status})"
 echo "Finished: $(date)"
 echo "=================================================="
+exit ${status}
