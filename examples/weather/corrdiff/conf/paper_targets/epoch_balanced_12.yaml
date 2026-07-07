@@ -1,0 +1,64 @@
+# Epoch-balanced target set for Scandinavia future-confidence paper eval.
+# Two extreme and two normal controls per epoch.
+
+targets:
+  - epoch: current
+    kind: extreme
+    label: current_2005
+    timestamp: "2005-01-06 12:00:00"
+    time_idx: 3
+  - epoch: current
+    kind: extreme
+    label: current_2005
+    timestamp: "2005-06-09 12:00:00"
+    time_idx: 226
+  - epoch: current
+    kind: normal
+    label: current_2005
+    timestamp: "2005-03-11 09:00:00"
+    time_idx: 116
+  - epoch: current
+    kind: normal
+    label: current_2005
+    timestamp: "2005-04-05 00:00:00"
+    time_idx: 141
+  - epoch: mid
+    kind: extreme
+    label: mid_start_2041_2042
+    timestamp: "2042-07-09 06:00:00"
+    time_idx: 392
+  - epoch: mid
+    kind: extreme
+    label: mid_end_2059_2060
+    timestamp: "2060-07-08 15:00:00"
+    time_idx: 393
+  - epoch: mid
+    kind: normal
+    label: mid_start_2041_2042
+    timestamp: "2042-04-08 09:00:00"
+    time_idx: 329
+  - epoch: mid
+    kind: normal
+    label: mid_end_2059_2060
+    timestamp: "2059-08-20 06:00:00"
+    time_idx: 177
+  - epoch: end
+    kind: extreme
+    label: end_start_2081_2082
+    timestamp: "2081-12-06 12:00:00"
+    time_idx: 243
+  - epoch: end
+    kind: extreme
+    label: end_end_2099_2100
+    timestamp: "2099-07-11 18:00:00"
+    time_idx: 148
+  - epoch: end
+    kind: normal
+    label: end_end_2099_2100
+    timestamp: "2099-03-16 18:00:00"
+    time_idx: 53
+  - epoch: end
+    kind: normal
+    label: end_end_2099_2100
+    timestamp: "2100-01-24 00:00:00"
+    time_idx: 272

@@ -24,6 +24,8 @@ seed_batch_size: ???
 # Size of the batched inference. Should be overridden.
 inference_mode: all
 # Choose between "all" (regression + diffusion), "regression" or "diffusion"
+residual_model_type: diffusion
+# Choose "diffusion" for the EDM sampler path or "dropout_crps" for one-step residual sampling.
 hr_mean_conditioning: true
 # Whether to use hr_mean_conditioning
 times_range: null
@@ -48,4 +50,3 @@ perf:
     # Enable NVTX annotations for performance profiling
   io_syncronous: true
     # Synchronize I/O operations for writing inference results
-

@@ -1,0 +1,64 @@
+# @package _global_
+# Norway symmetric 3-hour raw-stacked regression with mid-resolution adapters.
+
+defaults:
+  - /base_regression_norway
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_midres_temporal_adapter_sym3h
+  run:
+    dir: ./output/${hydra:job.name}
+
+model:
+  name: midres_temporal_adapter_regression
+  temporal_adapter:
+    num_frames: 3
+    center_index: 1
+    dynamic_channels: 8
+    invariant_channels: 1
+    adapter_hidden_channels: 64
+    adapter_scale: 1.0
+    adapter_hook_names:
+      - 256x256_block3
+      - 128x128_block3
+    zero_init_output: true
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 256
+    batch_size_per_gpu: 4
+    lr: 1.0e-4
+    lr_decay: 1.0
+    loss_function: flexiloss
+    flexi_loss_p: [1.25]
+    flexi_loss_d: [1]
+  io:
+    print_progress_freq: 100000
+    checkpoint_dir: /checkpoints/temporal_regression/norway_midres_temporal_adapter_sym3h
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 20
+    validation_freq: 100000
+    validation_steps: 10
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false
+  group: norway_temporal_context_ladder
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - adapter:midres
+    - adapter_resolutions:1/2,1/4
+    - raw_stack:preserved
+    - offsets:-3,0,+3

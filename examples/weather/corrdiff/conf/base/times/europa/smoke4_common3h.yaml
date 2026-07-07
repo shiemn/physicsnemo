@@ -1,0 +1,8 @@
+# @package generation
+# Four Europe timesteps from europa/random512_common3h for quick diffusion sanity checks.
+# Valid for temporal context up to +/-3h.
+times:
+- 2018-01-02T05:00:00
+- 2018-01-02T16:00:00
+- 2018-01-05T17:00:00
+- 2018-01-07T00:00:00

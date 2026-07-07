@@ -1,0 +1,57 @@
+# @package _global_
+# Diffusion training for Europa, conditioned on the standard non-temporal regression.
+
+hydra:
+  job:
+    chdir: false
+    name: tr_diff_europa
+  run:
+    dir: ./output/${hydra:job.name}
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /dataset: europa
+  - /model: diffusion
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+
+model:
+  hr_mean_conditioning: true
+  model_args:
+    attn_resolutions: [16]
+
+validation:
+  train: false
+  all_times: false
+
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 128
+    batch_size_per_gpu: 4
+    lr: 5.185225311935692e-4
+    lr_rampup: 100000
+    distribution: normal
+    P_mean: 0.7499199835165111
+    P_std: 0.8440688577987278
+    sigma_data: 0.8690460756242084
+  io:
+    regression_checkpoint_path: /checkpoints/europa_regression_standard/checkpoints_regression/UNet.0.2000128.mdlus
+    checkpoint_dir: /checkpoints/europa_diffusion_standard
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 20
+    validation_freq: 100000
+    print_progress_freq: 100000
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false
+  group: europa_temporal_context_ladder
+  tags:
+    - europa
+    - diffusion
+    - temporal_context:none
+    - conditioner:europa_regression_standard

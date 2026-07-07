@@ -72,3 +72,5 @@ wandb:
     mode: online
     results_dir: "./wandb"
     watch_model: false
+    group: norway_temporal_context_ladder
+    tags: ["norway", "regression", "temporal_context:t0", "offsets:0"]

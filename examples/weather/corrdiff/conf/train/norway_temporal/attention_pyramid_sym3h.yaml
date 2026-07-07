@@ -1,0 +1,57 @@
+# @package _global_
+# Norway symmetric 3-hour pyramid local temporal attention regression.
+
+defaults:
+  - /base_regression_norway
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_pyramid_attention_sym3h
+  run:
+    dir: ./output/${hydra:job.name}
+
+model:
+  name: pyramid_local_temporal_attention_regression
+  temporal_attention:
+    num_frames: 3
+    center_index: 1
+    dynamic_channels: 8
+    invariant_channels: 1
+    levels:
+      - name: local
+        attention_stride: 4
+        window_radius: 2
+        embed_channels: 16
+        num_heads: 2
+      - name: mesoscale
+        attention_stride: 8
+        window_radius: 4
+        embed_channels: 32
+        num_heads: 4
+      - name: broad
+        attention_stride: 16
+        window_radius: 4
+        embed_channels: 32
+        num_heads: 4
+    fusion_channels: 32
+    output_mode: center_pyramid_elevation
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_pyramid_attention_sym3h
+
+wandb:
+  group: norway_temporal_context_ladder
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - temporal_mixer:pyramid_local_attention
+    - offsets:-3,0,+3

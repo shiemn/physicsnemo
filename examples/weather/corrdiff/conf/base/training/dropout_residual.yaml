@@ -1,0 +1,11 @@
+defaults:
+    - base_all
+
+hp:
+    crps_ensemble_size: null
+    # Defaults to training.hp.batch_size_per_gpu when null.
+    residual_mae_weight: 0.0
+
+io:
+    regression_checkpoint_path: ???
+    # Frozen deterministic regression checkpoint used to define the residual.

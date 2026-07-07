@@ -1,0 +1,23 @@
+# @package generation
+# 8 target days for the paper-protocol TARGETED analysis (evaluate_paper.py).
+#
+# TEMPLATE — replace the dates below with your dataset's actual targets.
+# Run `python select_targets.py --config-name=evaluate run_tag=select` to find
+# the extreme-precipitation candidates, then fill in:
+#   - the day with highest precipitation aggregated over the whole domain
+#   - the day with highest precipitation at any single gridpoint
+#   - 3 further precipitation-extreme days of interest
+#   - 3 fixed reference days (Historical / Mid-future / End-future), chosen as in
+#     Doury et al. (2024)
+#
+# The placeholders below are example high-precip 2005 timestamps copied from
+# custom128.yaml; confirm/replace them before generating the targets NetCDF.
+times:
+- 2005-01-06T12:00:00   # placeholder: domain-aggregate max (confirm)
+- 2005-02-11T06:00:00   # placeholder: single-gridpoint max (confirm)
+- 2005-03-12T15:00:00   # placeholder: extreme 3 (confirm)
+- 2005-06-09T15:00:00   # placeholder: extreme 4 (confirm)
+- 2005-09-12T12:00:00   # placeholder: extreme 5 (confirm)
+- 2005-01-02T00:00:00   # placeholder: Historical reference (confirm)
+- 2005-05-25T09:00:00   # placeholder: Mid-future reference (confirm)
+- 2005-11-01T00:00:00   # placeholder: End-future reference (confirm)

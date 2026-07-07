@@ -1,0 +1,9 @@
+# One-step stochastic residual model trained with MC-dropout CRPS.
+
+name: dropout_residual
+hr_mean_conditioning: true
+
+model_args:
+  gridtype: "sinusoidal"
+  N_grid_channels: 4
+  embedding_type: "zero"

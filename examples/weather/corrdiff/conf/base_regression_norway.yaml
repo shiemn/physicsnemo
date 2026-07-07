@@ -57,6 +57,9 @@ training:
         lr_decay: 1.0
         lr_rampup: 0
         lr_decay_rate: 500000.0
+        loss_function: flexiloss
+        flexi_loss_p: [1.25]
+        flexi_loss_d: [1]
     # Performance
     perf:
         fp_optimizations: amp-bf16
@@ -65,9 +68,9 @@ training:
     # IO
     io:
         regression_checkpoint_path: null
-        print_progress_freq: 10000
+        print_progress_freq: 100000
         save_checkpoint_freq: 100000
-        save_n_recent_checkpoints: 0
+        save_n_recent_checkpoints: 20
         validation_freq: 100000
         validation_steps: 10
 

@@ -1,0 +1,44 @@
+# @package _global_
+# Norway symmetric 3-hour feature-level temporal attention regression.
+
+defaults:
+  - /base_regression_norway
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_feature_attention_timeemb_sym3h
+  run:
+    dir: ./output/${hydra:job.name}
+
+model:
+  name: feature_temporal_attention_regression
+  temporal_attention:
+    num_frames: 3
+    center_index: 1
+    dynamic_channels: 8
+    invariant_channels: 1
+    embed_channels: 32
+    num_heads: 4
+    attention_stride: 4
+    window_radius: 2
+    output_mode: center_aligned_latents_elevation
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_feature_attention_timeemb_sym3h
+
+wandb:
+  group: norway_temporal_context_ladder
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - temporal_mixer:feature_cross_attention_timeemb
+    - offsets:-3,0,+3

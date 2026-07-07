@@ -1,0 +1,108 @@
+# @package _global_
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Paper-protocol evaluation (separate flow; see evaluate_paper.py).
+#
+# This config is fully standalone — it does not load or modify conf/evaluate.yaml.
+# It operates OFFLINE on ensemble prediction NetCDF files already produced by
+# evaluate.py / generate.py.  Produce those first, e.g.:
+#
+#   # climatology (whole period); start with the usual ensemble size
+#   python evaluate.py --config-name=evaluate run_tag=clim \
+#       generation.num_ensembles=10 eval.predictions_file=eval_clim.nc \
+#       generation.io.reg_ckpt_filename=/path/reg.mdlus \
+#       generation.io.res_ckpt_filename=/path/diff.mdlus
+#
+#   # 8 target days (optionally a larger ensemble)
+#   python evaluate.py --config-name=evaluate run_tag=targets times=paper/targets8 \
+#       generation.num_ensembles=10 eval.predictions_file=eval_targets.nc ...
+#
+# Then run the paper flow:
+#   python evaluate_paper.py --config-name=eval/paper/base run_tag=my_run \
+#       eval.climatology_predictions_file=eval_clim.nc \
+#       eval.targets_predictions_file=eval_targets.nc
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate_paper
+    run:
+        dir: ./outputs/${hydra:job.name}
+
+# ── Experiment identifier (W&B run name = paper-eval-<run_tag>) ────────────────
+run_tag: ???
+
+# ── W&B settings — NEW project, separate from the standard evaluation ─────────
+wandb:
+    mode: online            # "online" | "offline" | "disabled"
+    project: CorrDiff-Paper
+    entity: shiemn
+    results_dir: ./wandb
+
+# ── Evaluation settings ───────────────────────────────────────────────────────
+eval:
+    # Preferred schema for one or many prediction NetCDFs. Legacy
+    # prediction_files remains supported below.
+    inputs: null
+    target_set: null
+
+    outputs:
+        root: /outputs/paper_eval/${run_tag}
+        json: paper_eval_results.json
+        tables: tables
+        figures: figures
+        data: data
+        manifest: manifest.json
+
+    products:
+        climatology: true
+        targets: true
+        compare_models: false
+
+    # At least one of these must be set (absolute path or relative to CWD).
+    climatology_predictions_file: null   # ensemble .nc over the whole eval period
+    targets_predictions_file: null       # ensemble .nc over the selected target days
+    # Multi-file future-period pool. When set, the script streams all files once,
+    # producing climatology/all_periods plus one climatology/<epoch> group each.
+    prediction_files: null
+
+    # Approved epoch-balanced target set: two extremes and two normal controls
+    # per epoch. Targets are loaded directly from prediction_files.
+    targets: null
+
+    output_json: paper_eval_results.json
+    figure_title_context: CorrDiff paper evaluation
+
+    precip_channel: auto      # channel name, integer index, or "auto" (detect precip)
+    dry_threshold: 1.0        # mm — value below this counts as a dry day-gridpoint
+    wet_threshold: 1.0        # mm — value above this counts as a wet day-gridpoint
+
+    # Wet-value histogram used for Median/P99 (domain-wide, per member)
+    hist_max_mm: 300.0        # upper edge of the wet-value histogram
+    hist_bins: 3000           # ~0.1 mm resolution over [0, hist_max_mm]
+
+    compute_smoothed: true    # also compute every statistic on a 3x3 moving average
+    smooth_size: 3            # moving-window size (paper uses 3)
+
+    # Per-gridpoint Median/P99 bias maps (per-pixel histograms; memory grows with
+    # map_bins). Mean/SD maps are always produced (exact, cheap). Off by default.
+    compute_quantile_maps: false
+    map_bins: 100
+
+    sal_f_factor: 0.06667     # SAL object threshold factor: f = R95 * f_factor (=1/15)
+    sal_thr_quantile: 0.95    # pySTEPS SAL wet quantile used for object thresholding
+    rapsd_dx_km: 2.0          # grid spacing in km (Norway AROME ≈ 2 km)

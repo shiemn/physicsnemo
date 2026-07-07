@@ -1,0 +1,27 @@
+# @package _global_
+# 500k-step Norway symmetric 3-hour feature-level temporal attention regression.
+
+defaults:
+  - /train/norway_temporal/attention_feature_timeemb_sym3h
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_feature_attention_timeemb_sym3h_500k
+  run:
+    dir: ./output/${hydra:job.name}
+
+training:
+  hp:
+    training_duration: 500000
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_feature_attention_timeemb_sym3h_500k
+
+wandb:
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - temporal_mixer:feature_cross_attention_timeemb
+    - duration:500k
+    - offsets:-3,0,+3

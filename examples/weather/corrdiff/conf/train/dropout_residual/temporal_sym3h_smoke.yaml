@@ -1,0 +1,66 @@
+# @package _global_
+# Smoke test for replacing CorrDiff diffusion stage 2 with a one-step
+# MC-dropout residual model trained by finite-ensemble CRPS.
+
+hydra:
+  job:
+    chdir: false
+    name: tr_crps_residual_temporal_sym3h_smoke
+  run:
+    dir: ./output/${hydra:job.name}
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /dataset: custom
+  - /model: dropout_residual
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+
+model:
+  model_args:
+    attn_resolutions: [16]
+    dropout: 0.10
+
+dataset:
+  type: norway
+  data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  invariant_variables_path: /data/Norway/HCLIM3/
+  output_variables: ['precipitation']
+  input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+  invariant_variables: ["elevation"]
+  bounds: large
+  years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+  temporal_inputs:
+    offset_hours: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 3
+
+validation:
+  years: [2003, 2004]
+
+training:
+  hp:
+    training_duration: 100000
+    total_batch_size: 64
+    batch_size_per_gpu: 1
+    crps_ensemble_size: 2
+    lr: 1.0e-4
+    residual_mae_weight: 0.0
+  io:
+    regression_checkpoint_path: /checkpoints/temporal_regression/norway_sym3h/checkpoints_regression/UNet.0.2000128.mdlus
+    checkpoint_dir: /checkpoints/temporal_crps_residual/norway_sym3h_dropout
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 20
+    print_progress_freq: 100000
+    validation_freq: 100000
+    validation_steps: 10
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false
+  group: norway_temporal_crps_residual
+  tags: ["norway", "dropout_crps", "residual", "temporal_context:sym_3h", "offsets:-3,0,+3", "smoke"]

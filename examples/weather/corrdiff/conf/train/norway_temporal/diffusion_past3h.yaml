@@ -1,0 +1,65 @@
+# @package _global_
+# Full diffusion transfer test on top of tr_reg_norway_past3h.
+# Temporal inputs must match the regression model (offset_hours [-3, 0]).
+
+hydra:
+  job:
+    chdir: false
+    name: tr_diff_temporal_past3h
+  run:
+    dir: ./output/${hydra:job.name}
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /dataset: custom
+  - /model: diffusion
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+
+model:
+  model_args:
+    attn_resolutions: [16]
+
+dataset:
+  type: norway
+  data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  invariant_variables_path: /data/Norway/HCLIM3/
+  output_variables: ['precipitation']
+  input_variables: ["hus500","hus850","ua500","ua850","va500","va850","ta500","ta850"]
+  invariant_variables: ["elevation"]
+  bounds: large
+  years: [1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2001]
+  temporal_inputs:
+    offset_hours: [-3, 0]
+    boundary: drop
+    strict_time_step_hours: 3
+
+validation:
+  years: [2003, 2004]
+
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 128
+    batch_size_per_gpu: 4
+    lr: 5.185225311935692e-4
+    distribution: normal
+    P_mean: 0.7499199835165111
+    P_std: 0.8440688577987278
+    sigma_data: 0.8690460756242084
+  io:
+    regression_checkpoint_path: /checkpoints/temporal_regression/norway_past3h/checkpoints_regression/UNet.0.2000128.mdlus
+    checkpoint_dir: /checkpoints/tr_diff_temporal_past3h
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: 20
+    print_progress_freq: 100000
+
+wandb:
+  mode: online
+  results_dir: "./wandb"
+  watch_model: false
+  group: norway_temporal_diffusion_transfer
+  tags: ["norway", "diffusion", "temporal_context:past_3h", "offsets:-3,0", "duration:2M"]

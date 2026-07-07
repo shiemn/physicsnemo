@@ -1,0 +1,27 @@
+# @package _global_
+# Smoke test for Norway symmetric 3-hour local temporal attention regression.
+
+defaults:
+  - /train/norway_temporal/attention_local_sym3h
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_local_attention_sym3h_smoke
+  run:
+    dir: ./output/${hydra:job.name}
+
+training:
+  hp:
+    batch_size_per_gpu: 4
+    total_batch_size: 4
+    training_duration: 8
+  io:
+    print_progress_freq: 4
+    validation_freq: 8
+    validation_steps: 1
+    save_checkpoint_freq: 1000000000
+    checkpoint_dir: /tmp/corrdiff_local_attention_sym3h_smoke
+
+wandb:
+  mode: disabled

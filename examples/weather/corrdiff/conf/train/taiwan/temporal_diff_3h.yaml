@@ -1,0 +1,50 @@
+# @package _global_
+# Diffusion training for Taiwan (CWB), normal model, conditioned on normal 3h temporal regression.
+
+hydra:
+    job:
+          chdir: false
+          name: tr_diff_temporal3h_taiwan
+    run:
+          dir: ./output/${hydra:job.name}
+    searchpath:
+          - pkg://conf/base # Do not modify
+
+defaults:
+    - /dataset: cwb
+    - /model: diffusion
+    - /model_size: normal
+    - /training: ${model}
+    - _self_
+
+dataset:
+    data_path: /data/cwa_dataset/cwa_dataset.zarr
+    temporal_inputs:
+        offsets: [-3, 0, 3]
+        boundary: drop
+        strict_time_step_hours: 1
+
+model:
+    hr_mean_conditioning: true
+
+training:
+    hp:
+        training_duration: 2000000
+        lr_rampup: 100000
+        batch_size_per_gpu: 4
+    io:
+        checkpoint_dir: /checkpoints/taiwan_diffusion_temporal3h
+        regression_checkpoint_path: /checkpoints/taiwan_regression_temporal3h/checkpoints_regression/UNet.0.2000128.mdlus
+        save_checkpoint_freq: 100000
+        save_n_recent_checkpoints: -1
+        validation_freq: 100000
+        print_progress_freq: 100000
+
+validation:
+    train: false
+    all_times: false
+
+wandb:
+    mode: online
+    results_dir: "./wandb"
+    watch_model: false

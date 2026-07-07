@@ -1,0 +1,42 @@
+# @package _global_
+# Norway symmetric 3-hour temporal correction regression.
+
+defaults:
+  - /base_regression_norway
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_temporal_correction_sym3h
+  run:
+    dir: ./output/${hydra:job.name}
+
+model:
+  name: temporal_correction_regression
+  temporal_mixer:
+    num_frames: 3
+    center_index: 1
+    dynamic_channels: 8
+    invariant_channels: 1
+    hidden_multiplier: 1
+    kernel_size: 3
+    zero_init_output: true
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 3
+
+training:
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_temporal_correction_sym3h
+
+wandb:
+  group: norway_temporal_context_ladder
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - temporal_mixer:center_plus_correction
+    - offsets:-3,0,+3

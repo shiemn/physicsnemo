@@ -1,0 +1,28 @@
+# Europa (Wuerzburg) dataset, using the CWA/CWB-shaped zarr schema.
+type: cwb
+
+# Helma direct mode binds the hnvme downscaling root to /data/.
+data_path: /data/Europe/wuerzburg450_corrdiff_v2.zarr.zip
+
+# Europa contains exactly these 12 ERA5 conditioning channels:
+# 0 tcwv | 1-4 z/t/u/v @500 | 5-8 z/t/u/v @850 | 9-11 t2m/u10/v10
+in_channels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+# 0 T2 | 1 U10 | 2 V10 | 3 precipitation_amount_1hr
+out_channels: [0, 1, 2, 3]
+
+# Native grid is expected to be 450x450; crop to 448x448 like Taiwan.
+img_shape_x: 448
+img_shape_y: 448
+
+add_grid: true
+ds_factor: 4
+
+min_path: null
+max_path: null
+global_means_path: null
+global_stds_path: null
+
+# T2 uses empirical z-score, winds are zero-centered, and precipitation is
+# transformed with log1p before linear scaling.
+normalization: v3_europa

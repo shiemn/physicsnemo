@@ -1,0 +1,28 @@
+# @package _global_
+# Norway symmetric 3-hour pyramid local temporal attention regression with learned temporal embeddings.
+
+defaults:
+  - /train/norway_temporal/attention_pyramid_sym3h
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_pyramid_attention_timeemb_sym3h
+  run:
+    dir: ./output/${hydra:job.name}
+
+model:
+  temporal_attention:
+    use_temporal_embeddings: true
+
+training:
+  io:
+    checkpoint_dir: /checkpoints/temporal_regression/norway_pyramid_attention_timeemb_sym3h
+
+wandb:
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - temporal_mixer:pyramid_local_attention_timeemb
+    - offsets:-3,0,+3

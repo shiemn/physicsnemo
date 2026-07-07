@@ -1,0 +1,77 @@
+# @package _global_
+# Regression-only evaluation for Europa temporal channel-stacked model (+/-3h).
+#
+# Usage:
+#   sbatch --gres=gpu:h100:1 jobs/helma/eval.slurm eval/europa/temporal_reg_3h <run_tag> \
+#       generation.io.reg_ckpt_filename=/checkpoints/<dir>/checkpoints_regression/UNet.0.2000128.mdlus
+
+hydra:
+    job:
+        chdir: false
+        name: evaluate_europa_temporal_reg_3h
+    run:
+        dir: ./outputs/${hydra:job.name}
+    searchpath:
+        - pkg://conf/base
+
+defaults:
+    - /dataset: europa
+    - /generation: non_patched
+    - /times: europa/random512_common3h
+    - _self_
+
+run_tag: ???
+
+wandb:
+    mode: online
+    project: evaluation
+    entity: shiemn
+    results_dir: ./wandb
+
+eval:
+    output_json: eval_results.json
+    n_plot_events: 5
+    plot_events: null
+    plot_channels: [0, 1, 2, 3]
+    rapsd_dx_km: 3.0
+    predictions_file: auto
+    diagnostic_channel: precipitation_amount_1hr
+    spread_skill_bin_mode: quantile
+    per_channel_metrics: true
+    skip_conditional_metrics: true
+    twcrps_thresholds: []
+    log_regression: true
+
+dataset:
+    train: false
+    all_times: true
+    temporal_inputs:
+        offsets: [-3, 0, 3]
+        boundary: drop
+        strict_time_step_hours: 1
+
+sampler:
+    type: stochastic
+    num_steps: 18
+    S_churn: 0
+    S_min: 0
+    S_max: .inf
+
+generation:
+    inference_mode: regression
+    num_ensembles: 1
+    seed_batch_size: 1
+    hr_mean_conditioning: true
+
+    perf:
+        use_fp16: true
+        use_torch_compile: true
+
+    io:
+        reg_ckpt_filename: ???
+        res_ckpt_filename: /dev/null
+        output_filename: /dev/null
+        guide_ckpt_filename: null
+
+    guidance_scale: 0.0
+    guidance_schedule_alpha: 0.0

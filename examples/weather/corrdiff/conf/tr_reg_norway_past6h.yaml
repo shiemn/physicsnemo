@@ -20,3 +20,6 @@ training:
   io:
     checkpoint_dir: /checkpoints/temporal_regression/norway_past6h
 
+wandb:
+  group: norway_temporal_context_ladder
+  tags: ["norway", "regression", "temporal_context:past_6h", "offsets:-6,-3,0"]

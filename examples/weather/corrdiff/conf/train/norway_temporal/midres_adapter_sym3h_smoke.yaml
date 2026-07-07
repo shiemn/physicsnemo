@@ -1,0 +1,33 @@
+# @package _global_
+# Smoke test for mid-resolution temporal adapter regression.
+
+defaults:
+  - /train/norway_temporal/midres_adapter_sym3h
+  - _self_
+
+hydra:
+  job:
+    name: tr_reg_norway_midres_temporal_adapter_sym3h_smoke
+  run:
+    dir: ./output/${hydra:job.name}
+
+training:
+  hp:
+    training_duration: 512
+    total_batch_size: 4
+    batch_size_per_gpu: 1
+  io:
+    checkpoint_dir: /tmp/corrdiff_midres_temporal_adapter_sym3h_smoke
+    save_checkpoint_freq: 1000000000
+    validation_freq: 1000000000
+    validation_steps: 1
+
+wandb:
+  mode: disabled
+  group: norway_temporal_context_ladder_smoke
+  tags:
+    - norway
+    - regression
+    - temporal_context:sym_3h
+    - adapter:midres
+    - smoke

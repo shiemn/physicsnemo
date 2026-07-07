@@ -1,0 +1,30 @@
+# @package _global_
+# Small real-data smoke for the paper-protocol multi-file path.
+
+defaults:
+  - /eval/paper/base
+  - _self_
+
+run_tag: smoke_future_conf_s43_current
+
+wandb:
+    mode: disabled
+
+eval:
+    figure_title_context: Scandinavia future-confidence sym3h smoke (seed 43)
+    output_json: /outputs/paper_eval/smoke_future_conf_s43_current/paper_eval_results.json
+    inputs:
+      - epoch: current
+        label: current_2005
+        path: /outputs/eval/future_conf_s43_sym3h_current_2005/predictions.nc
+    targets:
+      - epoch: current
+        kind: extreme
+        label: current_2005
+        timestamp: "2005-01-06 12:00:00"
+        time_idx: 3
+      - epoch: current
+        kind: normal
+        label: current_2005
+        timestamp: "2005-03-11 09:00:00"
+        time_idx: 116
