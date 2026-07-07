@@ -88,8 +88,16 @@ from helpers.train_helpers import (
     is_time_for_periodic_task,
 )
 from helpers.custom_losses import IntensityResidualLoss, CalibratedResidualLoss, CalibratedResidualLossV2
+from helpers.dropout_residual import DropoutResidualCRPSLoss
 from helpers.custom_tweedie_losses import FlexiLoss
-from helpers.preconditioning import HeteroscedasticEDMPrecondSR
+from helpers.preconditioning import (
+    FeatureTemporalAttentionRegression,
+    HeteroscedasticEDMPrecondSR,
+    LocalTemporalAttentionRegression,
+    MidResTemporalAdapterRegression,
+    PyramidLocalTemporalAttentionRegression,
+    TemporalCorrectionRegression,
+)
 from helpers.edm2_preconditioning import EDM2PrecondSuperResolution
 from helpers.dit_preconditioning import (
     DiTPrecondSuperResolution,
@@ -171,11 +179,14 @@ def main(cfg: DictConfig) -> None:
             project="CorrDiff",
             entity="shiemn",
             name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
-            group="CorrDiff-DDP-Group",
+            group=cfg.wandb.get("group", "CorrDiff-DDP-Group"),
             mode=cfg.wandb.mode,
             config=OmegaConf.to_container(cfg),
             results_dir=cfg.wandb.results_dir,
         )
+        wandb_tags = cfg.wandb.get("tags", None)
+        if wandb_tags:
+            wandb.run.tags = tuple(OmegaConf.to_container(wandb_tags))
 
     logger = PythonLogger("main")  # General python logger
     logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
@@ -370,6 +381,56 @@ def main(cfg: DictConfig) -> None:
             img_in_channels=img_in_channels + model_args["N_grid_channels"],
             **model_args,
         )
+    elif cfg.model.name == "dropout_residual":
+        model = UNet(
+            img_in_channels=img_in_channels + model_args["N_grid_channels"],
+            **model_args,
+        )
+    elif cfg.model.name == "temporal_correction_regression":
+        temporal_mixer_args = {}
+        if hasattr(cfg.model, "temporal_mixer"):
+            temporal_mixer_args = OmegaConf.to_container(cfg.model.temporal_mixer)
+        model = TemporalCorrectionRegression(
+            img_in_channels=img_in_channels,
+            **model_args,
+            **temporal_mixer_args,
+        )
+    elif cfg.model.name == "local_temporal_attention_regression":
+        temporal_attention_args = {}
+        if hasattr(cfg.model, "temporal_attention"):
+            temporal_attention_args = OmegaConf.to_container(cfg.model.temporal_attention)
+        model = LocalTemporalAttentionRegression(
+            img_in_channels=img_in_channels,
+            **model_args,
+            **temporal_attention_args,
+        )
+    elif cfg.model.name == "pyramid_local_temporal_attention_regression":
+        temporal_attention_args = {}
+        if hasattr(cfg.model, "temporal_attention"):
+            temporal_attention_args = OmegaConf.to_container(cfg.model.temporal_attention)
+        model = PyramidLocalTemporalAttentionRegression(
+            img_in_channels=img_in_channels,
+            **model_args,
+            **temporal_attention_args,
+        )
+    elif cfg.model.name == "feature_temporal_attention_regression":
+        temporal_attention_args = {}
+        if hasattr(cfg.model, "temporal_attention"):
+            temporal_attention_args = OmegaConf.to_container(cfg.model.temporal_attention)
+        model = FeatureTemporalAttentionRegression(
+            img_in_channels=img_in_channels,
+            **model_args,
+            **temporal_attention_args,
+        )
+    elif cfg.model.name == "midres_temporal_adapter_regression":
+        temporal_adapter_args = {}
+        if hasattr(cfg.model, "temporal_adapter"):
+            temporal_adapter_args = OmegaConf.to_container(cfg.model.temporal_adapter)
+        model = MidResTemporalAdapterRegression(
+            img_in_channels=img_in_channels,
+            **model_args,
+            **temporal_adapter_args,
+        )
     elif (
         cfg.model.name == "lt_aware_ce_regression"
         or cfg.model.name == "lt_aware_regression"
@@ -491,7 +552,18 @@ def main(cfg: DictConfig) -> None:
     # Check if regression model is used with patching
     if (
         cfg.model.name
-        in ["regression", "lt_aware_regression", "lt_aware_ce_regression", "dit_regression", "dit_regression_v2"]
+        in [
+            "regression",
+            "feature_temporal_attention_regression",
+            "local_temporal_attention_regression",
+            "midres_temporal_adapter_regression",
+            "pyramid_local_temporal_attention_regression",
+            "temporal_correction_regression",
+            "lt_aware_regression",
+            "lt_aware_ce_regression",
+            "dit_regression",
+            "dit_regression_v2",
+        ]
         and patching is not None
     ):
         raise ValueError(
@@ -666,7 +738,32 @@ def main(cfg: DictConfig) -> None:
                 **loss_init_kwargs,
             )
         
-    elif cfg.model.name in ("regression", "lt_aware_regression", "dit_regression", "dit_regression_v2"):
+    elif cfg.model.name == "dropout_residual":
+        if regression_net is None:
+            raise ValueError("dropout_residual requires training.io.regression_checkpoint_path")
+        crps_ensemble_size = cfg.training.hp.get(
+            "crps_ensemble_size", batch_size_per_gpu
+        )
+        if crps_ensemble_size is None:
+            crps_ensemble_size = batch_size_per_gpu
+        loss_fn = DropoutResidualCRPSLoss(
+            regression_net=regression_net,
+            ensemble_size=crps_ensemble_size,
+            hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+            residual_mae_weight=cfg.training.hp.get("residual_mae_weight", 0.0),
+        )
+
+    elif cfg.model.name in (
+        "regression",
+        "feature_temporal_attention_regression",
+        "local_temporal_attention_regression",
+        "midres_temporal_adapter_regression",
+        "pyramid_local_temporal_attention_regression",
+        "temporal_correction_regression",
+        "lt_aware_regression",
+        "dit_regression",
+        "dit_regression_v2",
+    ):
         loss_function = cfg.training.get("hp", {}).get("loss_function", None)
         if loss_function == None:
             loss_fn = RegressionLoss()

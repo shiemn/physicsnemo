@@ -20,18 +20,1623 @@ Diffusion-Based Generative Models".
 """
 
 import importlib
+import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, List, Literal, Tuple, Union
+from typing import Any, Dict, List, Literal, Tuple, Union
 
 import numpy as np
 import torch
 
+from physicsnemo.models.diffusion.song_unet import UNetBlock, checkpoint, silu
 from physicsnemo.models.diffusion.utils import _wrapped_property
 from physicsnemo.models.meta import ModelMetaData
 from physicsnemo.models.module import Module
 
 network_module = importlib.import_module("physicsnemo.models.diffusion")
+
+
+class TemporalCorrectionRegression(Module):
+    """Regression UNet with a compact learned temporal correction input.
+
+    Temporal inputs are expected as frame-major channel stacks:
+    ``[frame0_dynamic, frame0_invariant, frame1_dynamic, ...]``.  The model
+    keeps the center dynamic channels and center invariants, learns a correction
+    from dynamic residuals relative to the center frame, and feeds
+    ``[center_dynamic, correction_dynamic, center_invariants]`` to the wrapped
+    regression UNet.
+    """
+
+    _overridable_args = {
+        "use_apex_gn",
+        "checkpoint_level",
+        "profile_mode",
+        "amp_mode",
+        "embedding_type",
+    }
+
+    def __init__(
+        self,
+        img_resolution: Union[int, Tuple[int, int], List[int]],
+        img_in_channels: int,
+        img_out_channels: int,
+        use_fp16: bool = False,
+        N_grid_channels: int = 4,
+        num_frames: int = 3,
+        center_index: int = 1,
+        dynamic_channels: int = 8,
+        invariant_channels: int = 1,
+        hidden_multiplier: int = 1,
+        kernel_size: int = 3,
+        zero_init_output: bool = True,
+        model_type: Literal[
+            "SongUNetPosEmbd", "SongUNetPosLtEmbd", "SongUNet", "DhariwalUNet"
+        ] = "SongUNetPosEmbd",
+        **model_kwargs: Any,
+    ):
+        super().__init__(meta=ModelMetaData(name="TemporalCorrectionRegression"))
+
+        if num_frames < 2:
+            raise ValueError("num_frames must be at least 2")
+        if not 0 <= center_index < num_frames:
+            raise ValueError(
+                f"center_index must be in [0, {num_frames}), got {center_index}"
+            )
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if invariant_channels < 0:
+            raise ValueError("invariant_channels must be non-negative")
+        frame_channels = dynamic_channels + invariant_channels
+        expected_channels = num_frames * frame_channels
+        if img_in_channels != expected_channels:
+            raise ValueError(
+                "TemporalCorrectionRegression expected "
+                f"{expected_channels} input channels "
+                f"({num_frames} frames x {frame_channels} channels), "
+                f"got {img_in_channels}."
+            )
+        if hidden_multiplier <= 0:
+            raise ValueError("hidden_multiplier must be positive")
+        if kernel_size % 2 != 1:
+            raise ValueError("kernel_size must be odd")
+
+        self.img_resolution = img_resolution
+        self.img_in_channels = img_in_channels
+        self.img_out_channels = img_out_channels
+        self.N_grid_channels = N_grid_channels
+        self.num_frames = num_frames
+        self.center_index = center_index
+        self.dynamic_channels = dynamic_channels
+        self.invariant_channels = invariant_channels
+        self.frame_channels = frame_channels
+        self.mixed_img_in_channels = dynamic_channels * 2 + invariant_channels
+        self._use_fp16 = use_fp16
+
+        residual_channels = (num_frames - 1) * dynamic_channels
+        hidden_channels = hidden_multiplier * dynamic_channels
+        padding = kernel_size // 2
+        self.temporal_mixer = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                residual_channels,
+                hidden_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                groups=dynamic_channels,
+            ),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(hidden_channels, dynamic_channels, kernel_size=1),
+        )
+        if zero_init_output:
+            torch.nn.init.zeros_(self.temporal_mixer[-1].weight)
+            if self.temporal_mixer[-1].bias is not None:
+                torch.nn.init.zeros_(self.temporal_mixer[-1].bias)
+
+        model_class = getattr(network_module, "UNet")
+        self.model = model_class(
+            img_resolution=img_resolution,
+            img_in_channels=self.mixed_img_in_channels + N_grid_channels,
+            img_out_channels=img_out_channels,
+            use_fp16=use_fp16,
+            model_type=model_type,
+            **model_kwargs,
+        )
+
+        if use_fp16:
+            self.to(torch.float16)
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        self._use_fp16 = bool(value)
+        self.model.use_fp16 = bool(value)
+
+    @staticmethod
+    def round_sigma(sigma):
+        return torch.as_tensor(sigma)
+
+    def mix_conditioning(self, img_lr: torch.Tensor) -> torch.Tensor:
+        """Return ``[center_dynamic, correction_dynamic, center_invariants]``."""
+        if img_lr.ndim != 4:
+            raise ValueError(
+                f"Expected img_lr with shape (B, C, H, W), got {tuple(img_lr.shape)}"
+            )
+        if img_lr.shape[1] != self.img_in_channels:
+            raise ValueError(
+                f"Expected {self.img_in_channels} temporal input channels, "
+                f"got {img_lr.shape[1]}"
+            )
+
+        b, _, h, w = img_lr.shape
+        frames = img_lr.reshape(
+            b, self.num_frames, self.frame_channels, h, w
+        )
+        dynamic = frames[:, :, : self.dynamic_channels]
+        center_dynamic = dynamic[:, self.center_index]
+
+        residuals = [
+            dynamic[:, frame_idx] - center_dynamic
+            for frame_idx in range(self.num_frames)
+            if frame_idx != self.center_index
+        ]
+        residuals = torch.cat(residuals, dim=1)
+        correction = self.temporal_mixer(residuals)
+
+        parts = [center_dynamic, correction]
+        if self.invariant_channels:
+            center_invariants = frames[
+                :,
+                self.center_index,
+                self.dynamic_channels : self.frame_channels,
+            ]
+            parts.append(center_invariants)
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        img_lr: torch.Tensor,
+        force_fp32: bool = False,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        mixed_img_lr = self.mix_conditioning(img_lr)
+        return self.model(
+            x=x,
+            img_lr=mixed_img_lr,
+            force_fp32=force_fp32,
+            **model_kwargs,
+        )
+
+
+class MidResolutionTemporalAdapter(torch.nn.Module):
+    """Small zero-initialized temporal residual adapter for one UNet resolution."""
+
+    def __init__(
+        self,
+        feature_channels: int,
+        dynamic_channels: int = 8,
+        hidden_channels: int = 64,
+        zero_init_output: bool = True,
+    ):
+        super().__init__()
+        if feature_channels <= 0:
+            raise ValueError("feature_channels must be positive")
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if hidden_channels <= 0:
+            raise ValueError("hidden_channels must be positive")
+
+        temporal_channels = dynamic_channels * 3
+        self.feature_proj = torch.nn.Conv2d(feature_channels, hidden_channels, 1)
+        self.temporal_proj = torch.nn.Sequential(
+            torch.nn.Conv2d(temporal_channels, hidden_channels, 3, padding=1),
+            torch.nn.SiLU(),
+        )
+        self.local_mixer = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                3,
+                padding=1,
+                groups=hidden_channels,
+            ),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(hidden_channels, hidden_channels, 1),
+            torch.nn.SiLU(),
+        )
+        self.output_proj = torch.nn.Conv2d(hidden_channels, feature_channels, 1)
+        if zero_init_output:
+            torch.nn.init.zeros_(self.output_proj.weight)
+            if self.output_proj.bias is not None:
+                torch.nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x: torch.Tensor, temporal_features: torch.Tensor) -> torch.Tensor:
+        output_dtype = x.dtype
+        adapter_dtype = self.feature_proj.weight.dtype
+        x = x.to(dtype=adapter_dtype)
+        temporal_features = temporal_features.to(device=x.device, dtype=adapter_dtype)
+        hidden = self.feature_proj(x) + self.temporal_proj(temporal_features)
+        hidden = self.local_mixer(hidden)
+        return self.output_proj(hidden).to(dtype=output_dtype)
+
+
+class MidResTemporalAdapterRegression(Module):
+    """Raw-stacked temporal regression UNet with mid-resolution residual adapters.
+
+    The raw temporal conditioning stack is passed unchanged into the underlying
+    UNet.  Lightweight adapters are inserted in the encoder after selected
+    resolution blocks and are initialized as no-ops.
+    """
+
+    _overridable_args = {
+        "use_apex_gn",
+        "checkpoint_level",
+        "profile_mode",
+        "amp_mode",
+        "embedding_type",
+    }
+
+    def __init__(
+        self,
+        img_resolution: Union[int, Tuple[int, int], List[int]],
+        img_in_channels: int,
+        img_out_channels: int,
+        use_fp16: bool = False,
+        N_grid_channels: int = 4,
+        num_frames: int = 3,
+        center_index: int = 1,
+        dynamic_channels: int = 8,
+        invariant_channels: int = 1,
+        adapter_hidden_channels: int = 64,
+        adapter_scale: float = 1.0,
+        adapter_hook_names: Union[Tuple[str, ...], List[str]] = (
+            "256x256_block3",
+            "128x128_block3",
+        ),
+        zero_init_output: bool = True,
+        model_type: Literal[
+            "SongUNetPosEmbd", "SongUNetPosLtEmbd", "SongUNet", "DhariwalUNet"
+        ] = "SongUNetPosEmbd",
+        **model_kwargs: Any,
+    ):
+        super().__init__(meta=ModelMetaData(name="MidResTemporalAdapterRegression"))
+
+        if num_frames != 3:
+            raise ValueError(
+                "MidResTemporalAdapterRegression currently expects exactly "
+                "3 frames: past, center, future."
+            )
+        if center_index != 1:
+            raise ValueError(
+                "MidResTemporalAdapterRegression currently expects center_index=1 "
+                "for [past, center, future] inputs."
+            )
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if invariant_channels < 0:
+            raise ValueError("invariant_channels must be non-negative")
+        if adapter_hidden_channels <= 0:
+            raise ValueError("adapter_hidden_channels must be positive")
+        if not adapter_hook_names:
+            raise ValueError("adapter_hook_names must contain at least one hook")
+
+        frame_channels = dynamic_channels + invariant_channels
+        expected_channels = num_frames * frame_channels
+        if img_in_channels != expected_channels:
+            raise ValueError(
+                "MidResTemporalAdapterRegression expected "
+                f"{expected_channels} input channels "
+                f"({num_frames} frames x {frame_channels} channels), "
+                f"got {img_in_channels}."
+            )
+
+        self.img_resolution = img_resolution
+        self.img_in_channels = img_in_channels
+        self.img_out_channels = img_out_channels
+        self.N_grid_channels = N_grid_channels
+        self.num_frames = num_frames
+        self.center_index = center_index
+        self.dynamic_channels = dynamic_channels
+        self.invariant_channels = invariant_channels
+        self.frame_channels = frame_channels
+        self.adapter_hidden_channels = adapter_hidden_channels
+        self.adapter_scale = adapter_scale
+        self.adapter_hook_names = tuple(adapter_hook_names)
+        self._use_fp16 = use_fp16
+
+        model_class = getattr(network_module, "UNet")
+        self.model = model_class(
+            img_resolution=img_resolution,
+            img_in_channels=img_in_channels + N_grid_channels,
+            img_out_channels=img_out_channels,
+            use_fp16=use_fp16,
+            model_type=model_type,
+            **model_kwargs,
+        )
+
+        enc = self.model.model.enc
+        adapters = {}
+        missing_hooks = [hook for hook in self.adapter_hook_names if hook not in enc]
+        if missing_hooks:
+            raise ValueError(
+                "MidResTemporalAdapterRegression adapter hooks not found in encoder: "
+                + ", ".join(missing_hooks)
+            )
+        for hook_name in self.adapter_hook_names:
+            feature_channels = getattr(enc[hook_name], "out_channels", None)
+            if feature_channels is None:
+                raise ValueError(
+                    f"Could not infer feature channels for adapter hook {hook_name}."
+                )
+            adapters[hook_name] = MidResolutionTemporalAdapter(
+                feature_channels=feature_channels,
+                dynamic_channels=dynamic_channels,
+                hidden_channels=adapter_hidden_channels,
+                zero_init_output=zero_init_output,
+            )
+        self.adapters = torch.nn.ModuleDict(adapters)
+
+        if use_fp16:
+            self.to(torch.float16)
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        self._use_fp16 = bool(value)
+        self.model.use_fp16 = bool(value)
+        self.adapters.to(torch.float16 if value else torch.float32)
+
+    @staticmethod
+    def round_sigma(sigma):
+        return torch.as_tensor(sigma)
+
+    def _split_dynamic(self, img_lr: torch.Tensor) -> torch.Tensor:
+        if img_lr.ndim != 4:
+            raise ValueError(
+                f"Expected img_lr with shape (B, C, H, W), got {tuple(img_lr.shape)}"
+            )
+        if img_lr.shape[1] != self.img_in_channels:
+            raise ValueError(
+                f"Expected {self.img_in_channels} temporal input channels, "
+                f"got {img_lr.shape[1]}"
+            )
+        b, _, h, w = img_lr.shape
+        frames = img_lr.reshape(b, self.num_frames, self.frame_channels, h, w)
+        return frames[:, :, : self.dynamic_channels]
+
+    def temporal_features_for_resolution(
+        self, img_lr: torch.Tensor, size: Tuple[int, int], dtype: torch.dtype
+    ) -> torch.Tensor:
+        dynamic = self._split_dynamic(img_lr)
+        center = dynamic[:, self.center_index]
+        past = dynamic[:, 0]
+        future = dynamic[:, 2]
+        temporal = torch.cat(
+            [past - center, future - center, future - past],
+            dim=1,
+        )
+        if temporal.shape[-2:] != size:
+            temporal = torch.nn.functional.interpolate(
+                temporal,
+                size=size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return temporal.to(dtype=dtype)
+
+    def _apply_adapter(
+        self, hook_name: str, x: torch.Tensor, img_lr: torch.Tensor
+    ) -> torch.Tensor:
+        temporal = self.temporal_features_for_resolution(
+            img_lr, size=x.shape[-2:], dtype=x.dtype
+        )
+        return x + self.adapter_scale * self.adapters[hook_name](x, temporal)
+
+    def _forward_songunet_with_adapters(
+        self,
+        x: torch.Tensor,
+        noise_labels: torch.Tensor,
+        class_labels: torch.Tensor | None,
+        img_lr: torch.Tensor,
+        global_index=None,
+        embedding_selector=None,
+        augment_labels=None,
+        lead_time_label=None,
+    ) -> torch.Tensor:
+        inner = self.model.model
+        if embedding_selector is not None and global_index is not None:
+            raise ValueError("Cannot provide both embedding_selector and global_index.")
+
+        if hasattr(inner, "pos_embd") and (
+            (inner.pos_embd is not None) or (inner.lt_embd is not None)
+        ):
+            if embedding_selector is not None:
+                selected_pos_embd = inner.positional_embedding_selector(
+                    x,
+                    embedding_selector,
+                    lead_time_label=lead_time_label,
+                )
+            else:
+                selected_pos_embd = inner.positional_embedding_indexing(
+                    x,
+                    global_index=global_index,
+                    lead_time_label=lead_time_label,
+                )
+            x = torch.cat((x, selected_pos_embd.to(x.dtype)), dim=1)
+
+        if (
+            inner.use_apex_gn
+            and (not x.is_contiguous(memory_format=torch.channels_last))
+            and x.dim() == 4
+        ):
+            x = x.to(memory_format=torch.channels_last)
+
+        if inner.embedding_type != "zero":
+            emb = inner.map_noise(noise_labels)
+            emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape)
+            if inner.map_label is not None:
+                tmp = class_labels
+                if inner.training and inner.label_dropout:
+                    tmp = tmp * (
+                        torch.rand([x.shape[0], 1], device=x.device)
+                        >= inner.label_dropout
+                    ).to(tmp.dtype)
+                emb = emb + inner.map_label(tmp * np.sqrt(inner.map_label.in_features))
+            if inner.map_augment is not None and augment_labels is not None:
+                emb = emb + inner.map_augment(augment_labels)
+            emb = silu(inner.map_layer0(emb))
+            emb = silu(inner.map_layer1(emb))
+        else:
+            emb = torch.zeros(
+                (noise_labels.shape[0], inner.emb_channels),
+                device=x.device,
+                dtype=x.dtype,
+            )
+
+        skips = []
+        aux = x
+        for name, block in inner.enc.items():
+            if "aux_down" in name:
+                aux = block(aux)
+            elif "aux_skip" in name:
+                x = skips[-1] = x + block(aux)
+            elif "aux_residual" in name:
+                x = skips[-1] = aux = (x + block(aux)) / np.sqrt(2)
+            elif "_conv" in name:
+                x = block(x)
+                if inner.additive_pos_embed:
+                    x = x + inner.spatial_emb.to(dtype=x.dtype)
+                skips.append(x)
+            else:
+                if isinstance(block, UNetBlock):
+                    if (
+                        math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                        > inner.checkpoint_threshold
+                    ):
+                        x = checkpoint(block, x, emb, use_reentrant=False)
+                    else:
+                        x = block(x, emb)
+                else:
+                    x = block(x)
+                if name in self.adapters:
+                    x = self._apply_adapter(name, x, img_lr)
+                skips.append(x)
+
+        aux = None
+        tmp = None
+        for name, block in inner.dec.items():
+            if "aux_up" in name:
+                aux = block(aux)
+            elif "aux_norm" in name:
+                tmp = block(x)
+            elif "aux_conv" in name:
+                tmp = block(silu(tmp))
+                aux = tmp if aux is None else tmp + aux
+            else:
+                if x.shape[1] != block.in_channels:
+                    x = torch.cat([x, skips.pop()], dim=1)
+                if (
+                    math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                    > inner.checkpoint_threshold
+                    and "_block" in name
+                ) or (
+                    math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                    > (inner.checkpoint_threshold / 2)
+                    and "_up" in name
+                ):
+                    x = checkpoint(block, x, emb, use_reentrant=False)
+                else:
+                    x = block(x, emb)
+
+        if getattr(inner, "lead_time_mode", False) and inner.prob_channels:
+            scalar = inner.scalar
+            if aux.dtype != scalar.dtype:
+                scalar = scalar.to(aux.dtype)
+            if inner.training:
+                aux[:, inner.prob_channels] = aux[:, inner.prob_channels] * scalar
+            else:
+                aux[:, inner.prob_channels] = (
+                    (aux[:, inner.prob_channels] * scalar)
+                    .softmax(dim=1)
+                    .to(aux.dtype)
+                )
+        return aux
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        img_lr: torch.Tensor,
+        force_fp32: bool = False,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        if img_lr is None:
+            raise ValueError("MidResTemporalAdapterRegression requires img_lr.")
+        self._split_dynamic(img_lr)
+        x = torch.cat((x, img_lr), dim=1)
+        dtype = (
+            torch.float16
+            if (self.use_fp16 and not force_fp32 and x.device.type == "cuda")
+            else torch.float32
+        )
+
+        F_x = self._forward_songunet_with_adapters(
+            x.to(dtype),
+            torch.zeros(x.shape[0], dtype=dtype, device=x.device),
+            class_labels=None,
+            img_lr=img_lr,
+            **model_kwargs,
+        )
+        if (F_x.dtype != dtype) and not torch.is_autocast_enabled():
+            raise ValueError(f"Expected the dtype to be {dtype}, but got {F_x.dtype}.")
+        return F_x.to(torch.float32)
+
+
+class LocalTemporalAttentionRegression(Module):
+    """Regression UNet with local temporal attention over dynamic inputs.
+
+    The wrapper preserves the existing regression API while replacing raw
+    temporal channel stacking with ``[center_dynamic, attended_context,
+    center_invariants]`` conditioning.  Attention is computed on a coarse grid
+    and attends from the center frame to local windows in non-center frames.
+    """
+
+    _overridable_args = {
+        "use_apex_gn",
+        "checkpoint_level",
+        "profile_mode",
+        "amp_mode",
+        "embedding_type",
+    }
+
+    def __init__(
+        self,
+        img_resolution: Union[int, Tuple[int, int], List[int]],
+        img_in_channels: int,
+        img_out_channels: int,
+        use_fp16: bool = False,
+        N_grid_channels: int = 4,
+        num_frames: int = 3,
+        center_index: int = 1,
+        dynamic_channels: int = 8,
+        invariant_channels: int = 1,
+        embed_channels: int = 32,
+        num_heads: int = 4,
+        attention_stride: int = 4,
+        window_radius: int = 2,
+        output_mode: Literal["center_attended_elevation"] = "center_attended_elevation",
+        model_type: Literal[
+            "SongUNetPosEmbd", "SongUNetPosLtEmbd", "SongUNet", "DhariwalUNet"
+        ] = "SongUNetPosEmbd",
+        **model_kwargs: Any,
+    ):
+        super().__init__(meta=ModelMetaData(name="LocalTemporalAttentionRegression"))
+
+        if output_mode != "center_attended_elevation":
+            raise ValueError(
+                "LocalTemporalAttentionRegression only supports "
+                "output_mode='center_attended_elevation'"
+            )
+        if num_frames < 2:
+            raise ValueError("num_frames must be at least 2")
+        if not 0 <= center_index < num_frames:
+            raise ValueError(
+                f"center_index must be in [0, {num_frames}), got {center_index}"
+            )
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if invariant_channels < 0:
+            raise ValueError("invariant_channels must be non-negative")
+        frame_channels = dynamic_channels + invariant_channels
+        expected_channels = num_frames * frame_channels
+        if img_in_channels != expected_channels:
+            raise ValueError(
+                "LocalTemporalAttentionRegression expected "
+                f"{expected_channels} input channels "
+                f"({num_frames} frames x {frame_channels} channels), "
+                f"got {img_in_channels}."
+            )
+        if embed_channels <= 0:
+            raise ValueError("embed_channels must be positive")
+        if num_heads <= 0 or embed_channels % num_heads != 0:
+            raise ValueError("embed_channels must be divisible by num_heads")
+        if attention_stride <= 0:
+            raise ValueError("attention_stride must be positive")
+        if window_radius < 0:
+            raise ValueError("window_radius must be non-negative")
+
+        self.img_resolution = img_resolution
+        self.img_in_channels = img_in_channels
+        self.img_out_channels = img_out_channels
+        self.N_grid_channels = N_grid_channels
+        self.num_frames = num_frames
+        self.center_index = center_index
+        self.dynamic_channels = dynamic_channels
+        self.invariant_channels = invariant_channels
+        self.frame_channels = frame_channels
+        self.embed_channels = embed_channels
+        self.num_heads = num_heads
+        self.head_dim = embed_channels // num_heads
+        self.attention_stride = attention_stride
+        self.window_radius = window_radius
+        self.window_size = 2 * window_radius + 1
+        self.source_indices = [
+            frame_idx for frame_idx in range(num_frames) if frame_idx != center_index
+        ]
+        self.mixed_img_in_channels = dynamic_channels * 2 + invariant_channels
+        self._use_fp16 = use_fp16
+
+        self.input_stem = torch.nn.Sequential(
+            torch.nn.Conv2d(dynamic_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+        )
+        self.query_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.key_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.value_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.context_proj = torch.nn.Sequential(
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, dynamic_channels, kernel_size=1),
+        )
+
+        model_class = getattr(network_module, "UNet")
+        self.model = model_class(
+            img_resolution=img_resolution,
+            img_in_channels=self.mixed_img_in_channels + N_grid_channels,
+            img_out_channels=img_out_channels,
+            use_fp16=use_fp16,
+            model_type=model_type,
+            **model_kwargs,
+        )
+
+        if use_fp16:
+            self.to(torch.float16)
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        self._use_fp16 = bool(value)
+        self.model.use_fp16 = bool(value)
+
+    @staticmethod
+    def round_sigma(sigma):
+        return torch.as_tensor(sigma)
+
+    def _split_frames(self, img_lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if img_lr.ndim != 4:
+            raise ValueError(
+                f"Expected img_lr with shape (B, C, H, W), got {tuple(img_lr.shape)}"
+            )
+        if img_lr.shape[1] != self.img_in_channels:
+            raise ValueError(
+                f"Expected {self.img_in_channels} temporal input channels, "
+                f"got {img_lr.shape[1]}"
+            )
+        b, _, h, w = img_lr.shape
+        frames = img_lr.reshape(b, self.num_frames, self.frame_channels, h, w)
+        dynamic = frames[:, :, : self.dynamic_channels]
+        invariants = frames[:, :, self.dynamic_channels : self.frame_channels]
+        return dynamic, invariants
+
+    def _coarse_features(self, dynamic: torch.Tensor) -> torch.Tensor:
+        b, t, c, h, w = dynamic.shape
+        x = dynamic.reshape(b * t, c, h, w)
+        features = self.input_stem(x)
+        if self.attention_stride > 1:
+            features = torch.nn.functional.avg_pool2d(
+                features,
+                kernel_size=self.attention_stride,
+                stride=self.attention_stride,
+                ceil_mode=False,
+            )
+        _, e, hc, wc = features.shape
+        return features.reshape(b, t, e, hc, wc)
+
+    def compute_attention(
+        self,
+        img_lr: torch.Tensor,
+        return_weights: bool = True,
+    ):
+        """Compute full-resolution attended dynamic context.
+
+        Returns ``(context, weights)`` when ``return_weights`` is true.  The
+        weight tensor has shape ``(B, heads, Hc, Wc, source_frame, win_y, win_x)``.
+        """
+        dynamic, _ = self._split_frames(img_lr)
+        b, _, _, h, w = dynamic.shape
+        features = self._coarse_features(dynamic)
+        _, _, _, hc, wc = features.shape
+        n_locations = hc * wc
+        n_sources = len(self.source_indices)
+        window_area = self.window_size * self.window_size
+
+        center_features = features[:, self.center_index]
+        source_features = features[:, self.source_indices]
+
+        query = self.query_proj(center_features)
+        query = query.reshape(b, self.num_heads, self.head_dim, n_locations)
+
+        source_flat = source_features.reshape(
+            b * n_sources, self.embed_channels, hc, wc
+        )
+        keys = self.key_proj(source_flat)
+        values = self.value_proj(source_flat)
+
+        keys = torch.nn.functional.unfold(
+            keys,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        values = torch.nn.functional.unfold(
+            values,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        keys = keys.reshape(
+            b,
+            n_sources,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+        values = values.reshape(
+            b,
+            n_sources,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+
+        scale = self.head_dim ** -0.5
+        scores = (query[:, None, :, :, None, :] * keys).sum(dim=3) * scale
+        scores = scores.permute(0, 2, 4, 1, 3).reshape(
+            b, self.num_heads, n_locations, n_sources * window_area
+        )
+        weights_flat = torch.softmax(scores, dim=-1)
+        weights = weights_flat.reshape(
+            b, self.num_heads, n_locations, n_sources, window_area
+        ).permute(0, 1, 3, 4, 2)
+
+        context = (weights[:, :, :, None] * values.permute(0, 2, 1, 3, 4, 5)).sum(
+            dim=(2, 4)
+        )
+        context = context.reshape(b, self.embed_channels, hc, wc)
+        context = self.context_proj(context)
+        if (hc, wc) != (h, w):
+            context = torch.nn.functional.interpolate(
+                context,
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if not return_weights:
+            return context
+
+        weights_out = weights_flat.reshape(
+            b,
+            self.num_heads,
+            hc,
+            wc,
+            n_sources,
+            self.window_size,
+            self.window_size,
+        )
+        return context, weights_out
+
+    def mix_conditioning(self, img_lr: torch.Tensor) -> torch.Tensor:
+        dynamic, invariants = self._split_frames(img_lr)
+        center_dynamic = dynamic[:, self.center_index]
+        attended_context = self.compute_attention(img_lr, return_weights=False)
+
+        parts = [center_dynamic, attended_context]
+        if self.invariant_channels:
+            parts.append(invariants[:, self.center_index])
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        img_lr: torch.Tensor,
+        force_fp32: bool = False,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        mixed_img_lr = self.mix_conditioning(img_lr)
+        return self.model(
+            x=x,
+            img_lr=mixed_img_lr,
+            force_fp32=force_fp32,
+            **model_kwargs,
+        )
+
+
+class FeatureTemporalAttentionRegression(Module):
+    """Regression UNet with feature-level temporal cross-attention.
+
+    Temporal dynamic inputs are encoded with a shared per-frame stem. The center
+    frame then attends separately to past and future feature maps, keeping the
+    aligned latent products distinct for the downstream UNet.
+    """
+
+    _overridable_args = {
+        "use_apex_gn",
+        "checkpoint_level",
+        "profile_mode",
+        "amp_mode",
+        "embedding_type",
+    }
+
+    def __init__(
+        self,
+        img_resolution: Union[int, Tuple[int, int], List[int]],
+        img_in_channels: int,
+        img_out_channels: int,
+        use_fp16: bool = False,
+        N_grid_channels: int = 4,
+        num_frames: int = 3,
+        center_index: int = 1,
+        dynamic_channels: int = 8,
+        invariant_channels: int = 1,
+        embed_channels: int = 32,
+        num_heads: int = 4,
+        attention_stride: int = 4,
+        window_radius: int = 2,
+        output_mode: Literal[
+            "center_aligned_latents_elevation"
+        ] = "center_aligned_latents_elevation",
+        model_type: Literal[
+            "SongUNetPosEmbd", "SongUNetPosLtEmbd", "SongUNet", "DhariwalUNet"
+        ] = "SongUNetPosEmbd",
+        **model_kwargs: Any,
+    ):
+        super().__init__(meta=ModelMetaData(name="FeatureTemporalAttentionRegression"))
+
+        if output_mode != "center_aligned_latents_elevation":
+            raise ValueError(
+                "FeatureTemporalAttentionRegression only supports "
+                "output_mode='center_aligned_latents_elevation'"
+            )
+        if num_frames != 3:
+            raise ValueError(
+                "FeatureTemporalAttentionRegression currently expects exactly "
+                "3 frames: past, center, future."
+            )
+        if center_index != 1:
+            raise ValueError(
+                "FeatureTemporalAttentionRegression currently expects "
+                "center_index=1 for [past, center, future] inputs."
+            )
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if invariant_channels < 0:
+            raise ValueError("invariant_channels must be non-negative")
+        if embed_channels <= 0:
+            raise ValueError("embed_channels must be positive")
+        if num_heads <= 0 or embed_channels % num_heads != 0:
+            raise ValueError("embed_channels must be divisible by num_heads")
+        if attention_stride <= 0:
+            raise ValueError("attention_stride must be positive")
+        if window_radius < 0:
+            raise ValueError("window_radius must be non-negative")
+
+        frame_channels = dynamic_channels + invariant_channels
+        expected_channels = num_frames * frame_channels
+        if img_in_channels != expected_channels:
+            raise ValueError(
+                "FeatureTemporalAttentionRegression expected "
+                f"{expected_channels} input channels "
+                f"({num_frames} frames x {frame_channels} channels), "
+                f"got {img_in_channels}."
+            )
+
+        self.img_resolution = img_resolution
+        self.img_in_channels = img_in_channels
+        self.img_out_channels = img_out_channels
+        self.N_grid_channels = N_grid_channels
+        self.num_frames = num_frames
+        self.center_index = center_index
+        self.dynamic_channels = dynamic_channels
+        self.invariant_channels = invariant_channels
+        self.frame_channels = frame_channels
+        self.embed_channels = embed_channels
+        self.num_heads = num_heads
+        self.head_dim = embed_channels // num_heads
+        self.attention_stride = attention_stride
+        self.window_radius = window_radius
+        self.window_size = 2 * window_radius + 1
+        self.source_indices = [0, 2]
+        self.source_names = ["past", "future"]
+        self.mixed_img_in_channels = embed_channels * 3 + invariant_channels
+        self._use_fp16 = use_fp16
+
+        self.input_stem = torch.nn.Sequential(
+            torch.nn.Conv2d(dynamic_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+        )
+        self.temporal_embeddings = torch.nn.Parameter(
+            torch.zeros(num_frames, embed_channels)
+        )
+        torch.nn.init.normal_(self.temporal_embeddings, mean=0.0, std=0.02)
+        self.query_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.key_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.value_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.context_proj = torch.nn.Sequential(
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1),
+        )
+
+        model_class = getattr(network_module, "UNet")
+        self.model = model_class(
+            img_resolution=img_resolution,
+            img_in_channels=self.mixed_img_in_channels + N_grid_channels,
+            img_out_channels=img_out_channels,
+            use_fp16=use_fp16,
+            model_type=model_type,
+            **model_kwargs,
+        )
+
+        if use_fp16:
+            self.to(torch.float16)
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        self._use_fp16 = bool(value)
+        self.model.use_fp16 = bool(value)
+
+    @staticmethod
+    def round_sigma(sigma):
+        return torch.as_tensor(sigma)
+
+    def _split_frames(self, img_lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if img_lr.ndim != 4:
+            raise ValueError(
+                f"Expected img_lr with shape (B, C, H, W), got {tuple(img_lr.shape)}"
+            )
+        if img_lr.shape[1] != self.img_in_channels:
+            raise ValueError(
+                f"Expected {self.img_in_channels} temporal input channels, "
+                f"got {img_lr.shape[1]}"
+            )
+        b, _, h, w = img_lr.shape
+        frames = img_lr.reshape(b, self.num_frames, self.frame_channels, h, w)
+        dynamic = frames[:, :, : self.dynamic_channels]
+        invariants = frames[:, :, self.dynamic_channels : self.frame_channels]
+        return dynamic, invariants
+
+    def _encode_features(
+        self, dynamic: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        b, t, c, h, w = dynamic.shape
+        x = dynamic.reshape(b * t, c, h, w)
+        full_features = self.input_stem(x).reshape(
+            b, t, self.embed_channels, h, w
+        )
+        embedded = full_features + self.temporal_embeddings[
+            None, :, :, None, None
+        ].to(dtype=full_features.dtype, device=full_features.device)
+        if self.attention_stride > 1:
+            coarse_features = torch.nn.functional.avg_pool2d(
+                embedded.reshape(b * t, self.embed_channels, h, w),
+                kernel_size=self.attention_stride,
+                stride=self.attention_stride,
+                ceil_mode=False,
+            )
+            _, _, hc, wc = coarse_features.shape
+            coarse_features = coarse_features.reshape(
+                b, t, self.embed_channels, hc, wc
+            )
+        else:
+            coarse_features = embedded
+        return full_features, coarse_features
+
+    def _attend_to_source(
+        self,
+        query: torch.Tensor,
+        source_features: torch.Tensor,
+        output_size: Tuple[int, int],
+        return_weights: bool,
+    ):
+        b, _, hc, wc = source_features.shape
+        n_locations = hc * wc
+        window_area = self.window_size * self.window_size
+
+        keys = self.key_proj(source_features)
+        values = self.value_proj(source_features)
+        keys = torch.nn.functional.unfold(
+            keys,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        values = torch.nn.functional.unfold(
+            values,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        keys = keys.reshape(
+            b,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+        values = values.reshape(
+            b,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+
+        scale = self.head_dim ** -0.5
+        scores = (query[:, :, :, None, :] * keys).sum(dim=2) * scale
+        scores = scores.permute(0, 1, 3, 2)
+        weights_flat = torch.softmax(scores, dim=-1)
+        weights = weights_flat.permute(0, 1, 3, 2)
+
+        context = (weights[:, :, None] * values).sum(dim=3)
+        context = context.reshape(b, self.embed_channels, hc, wc)
+        context = self.context_proj(context)
+        if (hc, wc) != output_size:
+            context = torch.nn.functional.interpolate(
+                context,
+                size=output_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if not return_weights:
+            return context
+
+        weights_out = weights_flat.reshape(
+            b,
+            self.num_heads,
+            hc,
+            wc,
+            self.window_size,
+            self.window_size,
+        )
+        return context, weights_out
+
+    def _compute_attention_from_features(
+        self,
+        coarse_features: torch.Tensor,
+        output_size: Tuple[int, int],
+        return_weights: bool = True,
+    ):
+        b, _, _, hc, wc = coarse_features.shape
+        n_locations = hc * wc
+
+        center_features = coarse_features[:, self.center_index]
+        query = self.query_proj(center_features)
+        query = query.reshape(b, self.num_heads, self.head_dim, n_locations)
+
+        contexts = {}
+        weights_by_source = {}
+        for source_name, source_idx in zip(self.source_names, self.source_indices):
+            if return_weights:
+                context, weights = self._attend_to_source(
+                    query,
+                    coarse_features[:, source_idx],
+                    output_size=output_size,
+                    return_weights=True,
+                )
+                weights_by_source[source_name] = weights
+            else:
+                context = self._attend_to_source(
+                    query,
+                    coarse_features[:, source_idx],
+                    output_size=output_size,
+                    return_weights=False,
+                )
+            contexts[source_name] = context
+
+        if not return_weights:
+            return contexts
+        return contexts, weights_by_source
+
+    def compute_attention(
+        self,
+        img_lr: torch.Tensor,
+        return_weights: bool = True,
+    ):
+        """Compute separate full-resolution aligned past/future latent contexts."""
+        dynamic, _ = self._split_frames(img_lr)
+        _, coarse_features = self._encode_features(dynamic)
+        return self._compute_attention_from_features(
+            coarse_features,
+            output_size=dynamic.shape[-2:],
+            return_weights=return_weights,
+        )
+
+    def mix_conditioning(self, img_lr: torch.Tensor) -> torch.Tensor:
+        dynamic, invariants = self._split_frames(img_lr)
+        full_features, coarse_features = self._encode_features(dynamic)
+        center_features = full_features[:, self.center_index]
+        aligned = self._compute_attention_from_features(
+            coarse_features,
+            output_size=dynamic.shape[-2:],
+            return_weights=False,
+        )
+
+        parts = [center_features, aligned["past"], aligned["future"]]
+        if self.invariant_channels:
+            parts.append(invariants[:, self.center_index])
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        img_lr: torch.Tensor,
+        force_fp32: bool = False,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        mixed_img_lr = self.mix_conditioning(img_lr)
+        return self.model(
+            x=x,
+            img_lr=mixed_img_lr,
+            force_fp32=force_fp32,
+            **model_kwargs,
+        )
+
+
+class _PyramidTemporalAttentionLevel(torch.nn.Module):
+    """One coarse local temporal attention level used by the pyramid wrapper."""
+
+    def __init__(
+        self,
+        dynamic_channels: int,
+        embed_channels: int,
+        num_heads: int,
+        attention_stride: int,
+        window_radius: int,
+        num_frames: int,
+        use_temporal_embeddings: bool = False,
+    ):
+        super().__init__()
+        if embed_channels <= 0:
+            raise ValueError("embed_channels must be positive")
+        if num_heads <= 0 or embed_channels % num_heads != 0:
+            raise ValueError("embed_channels must be divisible by num_heads")
+        if attention_stride <= 0:
+            raise ValueError("attention_stride must be positive")
+        if window_radius < 0:
+            raise ValueError("window_radius must be non-negative")
+
+        self.dynamic_channels = dynamic_channels
+        self.embed_channels = embed_channels
+        self.num_heads = num_heads
+        self.head_dim = embed_channels // num_heads
+        self.attention_stride = attention_stride
+        self.window_radius = window_radius
+        self.window_size = 2 * window_radius + 1
+        self.num_frames = num_frames
+        self.use_temporal_embeddings = use_temporal_embeddings
+
+        self.input_stem = torch.nn.Sequential(
+            torch.nn.Conv2d(dynamic_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+        )
+        if use_temporal_embeddings:
+            self.temporal_embeddings = torch.nn.Parameter(
+                torch.zeros(num_frames, embed_channels)
+            )
+            torch.nn.init.normal_(self.temporal_embeddings, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("temporal_embeddings", None)
+        self.query_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.key_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.value_proj = torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=1)
+        self.context_proj = torch.nn.Sequential(
+            torch.nn.Conv2d(embed_channels, embed_channels, kernel_size=3, padding=1),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(embed_channels, dynamic_channels, kernel_size=1),
+        )
+
+    def _coarse_features(self, dynamic: torch.Tensor) -> torch.Tensor:
+        b, t, c, h, w = dynamic.shape
+        x = dynamic.reshape(b * t, c, h, w)
+        features = self.input_stem(x)
+        if self.attention_stride > 1:
+            features = torch.nn.functional.avg_pool2d(
+                features,
+                kernel_size=self.attention_stride,
+                stride=self.attention_stride,
+                ceil_mode=False,
+            )
+        _, e, hc, wc = features.shape
+        return features.reshape(b, t, e, hc, wc)
+
+    def forward(
+        self,
+        dynamic: torch.Tensor,
+        center_index: int,
+        source_indices: List[int],
+        return_weights: bool = True,
+    ):
+        b, _, _, h, w = dynamic.shape
+        features = self._coarse_features(dynamic)
+        if self.temporal_embeddings is not None:
+            features = features + self.temporal_embeddings[None, :, :, None, None].to(
+                dtype=features.dtype,
+                device=features.device,
+            )
+        _, _, _, hc, wc = features.shape
+        n_locations = hc * wc
+        n_sources = len(source_indices)
+        window_area = self.window_size * self.window_size
+
+        center_features = features[:, center_index]
+        source_features = features[:, source_indices]
+
+        query = self.query_proj(center_features)
+        query = query.reshape(b, self.num_heads, self.head_dim, n_locations)
+
+        source_flat = source_features.reshape(
+            b * n_sources, self.embed_channels, hc, wc
+        )
+        keys = self.key_proj(source_flat)
+        values = self.value_proj(source_flat)
+
+        keys = torch.nn.functional.unfold(
+            keys,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        values = torch.nn.functional.unfold(
+            values,
+            kernel_size=self.window_size,
+            padding=self.window_radius,
+        )
+        keys = keys.reshape(
+            b,
+            n_sources,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+        values = values.reshape(
+            b,
+            n_sources,
+            self.num_heads,
+            self.head_dim,
+            window_area,
+            n_locations,
+        )
+
+        scale = self.head_dim ** -0.5
+        scores = (query[:, None, :, :, None, :] * keys).sum(dim=3) * scale
+        scores = scores.permute(0, 2, 4, 1, 3).reshape(
+            b, self.num_heads, n_locations, n_sources * window_area
+        )
+        weights_flat = torch.softmax(scores, dim=-1)
+        weights = weights_flat.reshape(
+            b, self.num_heads, n_locations, n_sources, window_area
+        ).permute(0, 1, 3, 4, 2)
+
+        context = (weights[:, :, :, None] * values.permute(0, 2, 1, 3, 4, 5)).sum(
+            dim=(2, 4)
+        )
+        context = context.reshape(b, self.embed_channels, hc, wc)
+        context = self.context_proj(context)
+        if (hc, wc) != (h, w):
+            context = torch.nn.functional.interpolate(
+                context,
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        if not return_weights:
+            return context
+
+        weights_out = weights_flat.reshape(
+            b,
+            self.num_heads,
+            hc,
+            wc,
+            n_sources,
+            self.window_size,
+            self.window_size,
+        )
+        return context, weights_out
+
+
+class PyramidLocalTemporalAttentionRegression(Module):
+    """Regression UNet with multi-scale local temporal attention context."""
+
+    _overridable_args = {
+        "use_apex_gn",
+        "checkpoint_level",
+        "profile_mode",
+        "amp_mode",
+        "embedding_type",
+    }
+
+    def __init__(
+        self,
+        img_resolution: Union[int, Tuple[int, int], List[int]],
+        img_in_channels: int,
+        img_out_channels: int,
+        use_fp16: bool = False,
+        N_grid_channels: int = 4,
+        num_frames: int = 3,
+        center_index: int = 1,
+        dynamic_channels: int = 8,
+        invariant_channels: int = 1,
+        levels: Union[List[Dict[str, Any]], Tuple[Dict[str, Any], ...], None] = None,
+        fusion_channels: int = 32,
+        use_temporal_embeddings: bool = False,
+        output_mode: Literal[
+            "center_pyramid_elevation"
+        ] = "center_pyramid_elevation",
+        model_type: Literal[
+            "SongUNetPosEmbd", "SongUNetPosLtEmbd", "SongUNet", "DhariwalUNet"
+        ] = "SongUNetPosEmbd",
+        **model_kwargs: Any,
+    ):
+        super().__init__(
+            meta=ModelMetaData(name="PyramidLocalTemporalAttentionRegression")
+        )
+
+        if output_mode != "center_pyramid_elevation":
+            raise ValueError(
+                "PyramidLocalTemporalAttentionRegression only supports "
+                "output_mode='center_pyramid_elevation'"
+            )
+        if num_frames < 2:
+            raise ValueError("num_frames must be at least 2")
+        if not 0 <= center_index < num_frames:
+            raise ValueError(
+                f"center_index must be in [0, {num_frames}), got {center_index}"
+            )
+        if dynamic_channels <= 0:
+            raise ValueError("dynamic_channels must be positive")
+        if invariant_channels < 0:
+            raise ValueError("invariant_channels must be non-negative")
+        if fusion_channels <= 0:
+            raise ValueError("fusion_channels must be positive")
+
+        frame_channels = dynamic_channels + invariant_channels
+        expected_channels = num_frames * frame_channels
+        if img_in_channels != expected_channels:
+            raise ValueError(
+                "PyramidLocalTemporalAttentionRegression expected "
+                f"{expected_channels} input channels "
+                f"({num_frames} frames x {frame_channels} channels), "
+                f"got {img_in_channels}."
+            )
+
+        if levels is None:
+            levels = [
+                {
+                    "name": "local",
+                    "attention_stride": 4,
+                    "window_radius": 2,
+                    "embed_channels": 16,
+                    "num_heads": 2,
+                },
+                {
+                    "name": "mesoscale",
+                    "attention_stride": 8,
+                    "window_radius": 4,
+                    "embed_channels": 32,
+                    "num_heads": 4,
+                },
+                {
+                    "name": "broad",
+                    "attention_stride": 16,
+                    "window_radius": 4,
+                    "embed_channels": 32,
+                    "num_heads": 4,
+                },
+            ]
+        if not levels:
+            raise ValueError("levels must contain at least one attention level")
+
+        self.img_resolution = img_resolution
+        self.img_in_channels = img_in_channels
+        self.img_out_channels = img_out_channels
+        self.N_grid_channels = N_grid_channels
+        self.num_frames = num_frames
+        self.center_index = center_index
+        self.dynamic_channels = dynamic_channels
+        self.invariant_channels = invariant_channels
+        self.frame_channels = frame_channels
+        self.fusion_channels = fusion_channels
+        self.use_temporal_embeddings = use_temporal_embeddings
+        self.source_indices = [
+            frame_idx for frame_idx in range(num_frames) if frame_idx != center_index
+        ]
+        self.mixed_img_in_channels = dynamic_channels * 2 + invariant_channels
+        self._use_fp16 = use_fp16
+
+        self.level_names = []
+        self.attention_levels = torch.nn.ModuleList()
+        seen_names = set()
+        for level_idx, level_cfg in enumerate(levels):
+            level_cfg = dict(level_cfg)
+            name = str(level_cfg.pop("name", f"level_{level_idx}"))
+            if name in seen_names:
+                raise ValueError(f"Duplicate temporal attention level name: {name}")
+            seen_names.add(name)
+            allowed_keys = {
+                "embed_channels",
+                "num_heads",
+                "attention_stride",
+                "window_radius",
+                "use_temporal_embeddings",
+            }
+            unknown_keys = sorted(set(level_cfg) - allowed_keys)
+            if unknown_keys:
+                raise ValueError(
+                    f"Unknown temporal attention level keys for {name}: {unknown_keys}"
+                )
+            self.level_names.append(name)
+            self.attention_levels.append(
+                _PyramidTemporalAttentionLevel(
+                    dynamic_channels=dynamic_channels,
+                    embed_channels=int(level_cfg.get("embed_channels", 32)),
+                    num_heads=int(level_cfg.get("num_heads", 4)),
+                    attention_stride=int(level_cfg.get("attention_stride", 4)),
+                    window_radius=int(level_cfg.get("window_radius", 2)),
+                    num_frames=num_frames,
+                    use_temporal_embeddings=bool(
+                        level_cfg.get(
+                            "use_temporal_embeddings",
+                            use_temporal_embeddings,
+                        )
+                    ),
+                )
+            )
+
+        self.context_fusion = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                dynamic_channels * len(self.attention_levels),
+                fusion_channels,
+                kernel_size=3,
+                padding=1,
+            ),
+            torch.nn.SiLU(),
+            torch.nn.Conv2d(fusion_channels, dynamic_channels, kernel_size=1),
+        )
+
+        model_class = getattr(network_module, "UNet")
+        self.model = model_class(
+            img_resolution=img_resolution,
+            img_in_channels=self.mixed_img_in_channels + N_grid_channels,
+            img_out_channels=img_out_channels,
+            use_fp16=use_fp16,
+            model_type=model_type,
+            **model_kwargs,
+        )
+
+        if use_fp16:
+            self.to(torch.float16)
+
+    @property
+    def use_fp16(self) -> bool:
+        return self._use_fp16
+
+    @use_fp16.setter
+    def use_fp16(self, value: bool):
+        self._use_fp16 = bool(value)
+        self.model.use_fp16 = bool(value)
+
+    @staticmethod
+    def round_sigma(sigma):
+        return torch.as_tensor(sigma)
+
+    def _split_frames(self, img_lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if img_lr.ndim != 4:
+            raise ValueError(
+                f"Expected img_lr with shape (B, C, H, W), got {tuple(img_lr.shape)}"
+            )
+        if img_lr.shape[1] != self.img_in_channels:
+            raise ValueError(
+                f"Expected {self.img_in_channels} temporal input channels, "
+                f"got {img_lr.shape[1]}"
+            )
+        b, _, h, w = img_lr.shape
+        frames = img_lr.reshape(b, self.num_frames, self.frame_channels, h, w)
+        dynamic = frames[:, :, : self.dynamic_channels]
+        invariants = frames[:, :, self.dynamic_channels : self.frame_channels]
+        return dynamic, invariants
+
+    def compute_attention(
+        self,
+        img_lr: torch.Tensor,
+        return_weights: bool = True,
+    ):
+        dynamic, _ = self._split_frames(img_lr)
+        contexts = []
+        weights_by_level = {}
+
+        for name, level in zip(self.level_names, self.attention_levels):
+            if return_weights:
+                context, weights = level(
+                    dynamic,
+                    center_index=self.center_index,
+                    source_indices=self.source_indices,
+                    return_weights=True,
+                )
+                weights_by_level[name] = weights
+            else:
+                context = level(
+                    dynamic,
+                    center_index=self.center_index,
+                    source_indices=self.source_indices,
+                    return_weights=False,
+                )
+            contexts.append(context)
+
+        fused_context = self.context_fusion(torch.cat(contexts, dim=1))
+        if not return_weights:
+            return fused_context
+        return fused_context, weights_by_level
+
+    def mix_conditioning(self, img_lr: torch.Tensor) -> torch.Tensor:
+        dynamic, invariants = self._split_frames(img_lr)
+        center_dynamic = dynamic[:, self.center_index]
+        attended_context = self.compute_attention(img_lr, return_weights=False)
+
+        parts = [center_dynamic, attended_context]
+        if self.invariant_channels:
+            parts.append(invariants[:, self.center_index])
+        return torch.cat(parts, dim=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        img_lr: torch.Tensor,
+        force_fp32: bool = False,
+        **model_kwargs,
+    ) -> torch.Tensor:
+        mixed_img_lr = self.mix_conditioning(img_lr)
+        return self.model(
+            x=x,
+            img_lr=mixed_img_lr,
+            force_fp32=force_fp32,
+            **model_kwargs,
+        )
 
 
 @dataclass

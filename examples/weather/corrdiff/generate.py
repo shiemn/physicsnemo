@@ -97,6 +97,7 @@ from helpers.generate_helpers import (
     save_images,
     setup_patching,
 )
+from helpers.dropout_residual import dropout_residual_step
 from helpers.metrics import MetricsAccumulator
 
 
@@ -194,6 +195,13 @@ def main(cfg: DictConfig) -> None:
     net_reg, net_res = maybe_compile_models(cfg, net_reg, net_res)
 
     # ----------------------------------------------------------- sampler
+    residual_model_type = cfg.generation.get("residual_model_type", "diffusion")
+    use_dropout_residual = residual_model_type in {"dropout_crps", "dropout_residual"}
+    if use_dropout_residual and cfg.generation.inference_mode != "all":
+        raise ValueError("dropout residual inference requires generation.inference_mode=all")
+    if use_dropout_residual and cfg.generation.get("hp_eval", False):
+        raise ValueError("generation.hp_eval is only supported for diffusion residual models")
+
     sampler_fn = build_sampler_fn(
         cfg.sampler, patching, net_guide=net_guide, guidance_scale=guidance_scale
     )
@@ -294,19 +302,29 @@ def main(cfg: DictConfig) -> None:
                     if (cfg.generation.hr_mean_conditioning and net_reg)
                     else None
                 )
-                image_res = diffusion_step(
-                    net=net_res,
-                    sampler_fn=fn,
-                    img_shape=img_shape,
-                    img_out_channels=img_out_channels,
-                    rank_batches=[torch.tensor(seed_batch)],
-                    img_lr=img_lr.expand(bs, -1, -1, -1).to(memory_format=torch.channels_last),
-                    rank=0,
-                    device=device,
-                    mean_hr=mean_hr,
-                    lead_time_label=lead_time_label,
-                    **diffusion_step_kwargs,
-                )
+                if use_dropout_residual:
+                    image_res = dropout_residual_step(
+                        net=net_res,
+                        img_lr=img_lr,
+                        latents_shape=(bs, img_out_channels, img_shape[0], img_shape[1]),
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        seed=int(seed_batch[0]) if len(seed_batch) else None,
+                    )
+                else:
+                    image_res = diffusion_step(
+                        net=net_res,
+                        sampler_fn=fn,
+                        img_shape=img_shape,
+                        img_out_channels=img_out_channels,
+                        rank_batches=[torch.tensor(seed_batch)],
+                        img_lr=img_lr.expand(bs, -1, -1, -1).to(memory_format=torch.channels_last),
+                        rank=0,
+                        device=device,
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        **diffusion_step_kwargs,
+                    )
             if cfg.generation.inference_mode == "regression":
                 batch_out = image_reg
             elif cfg.generation.inference_mode == "diffusion":
@@ -598,20 +616,31 @@ def main(cfg: DictConfig) -> None:
                         )
                 if net_res:
                     mean_hr = image_reg[0:1] if (cfg.generation.hr_mean_conditioning and net_reg) else None
-                    with nvtx.annotate("diffusion_model", color="purple"):
-                        image_res = diffusion_step(
-                            net=net_res,
-                            sampler_fn=sampler_fn,
-                            img_shape=img_shape,
-                            img_out_channels=img_out_channels,
-                            rank_batches=rank_batches,
-                            img_lr=img_lr.expand(seed_batch_size, -1, -1, -1).to(memory_format=torch.channels_last),
-                            rank=dist.rank,
-                            device=device,
-                            mean_hr=mean_hr,
-                            lead_time_label=lead_time_label,
-                            **diffusion_step_kwargs,
-                        )
+                    with nvtx.annotate("residual_model", color="purple"):
+                        if use_dropout_residual:
+                            local_ensemble_size = sum(map(len, rank_batches))
+                            image_res = dropout_residual_step(
+                                net=net_res,
+                                img_lr=img_lr,
+                                latents_shape=(local_ensemble_size, img_out_channels, img_shape[0], img_shape[1]),
+                                mean_hr=mean_hr,
+                                lead_time_label=lead_time_label,
+                                seed=int(rank_batches[0][0]) if rank_batches and len(rank_batches[0]) else None,
+                            )
+                        else:
+                            image_res = diffusion_step(
+                                net=net_res,
+                                sampler_fn=sampler_fn,
+                                img_shape=img_shape,
+                                img_out_channels=img_out_channels,
+                                rank_batches=rank_batches,
+                                img_lr=img_lr.expand(seed_batch_size, -1, -1, -1).to(memory_format=torch.channels_last),
+                                rank=dist.rank,
+                                device=device,
+                                mean_hr=mean_hr,
+                                lead_time_label=lead_time_label,
+                                **diffusion_step_kwargs,
+                            )
                 if cfg.generation.inference_mode == "regression":
                     out = image_reg
                 elif cfg.generation.inference_mode == "diffusion":

@@ -8,6 +8,23 @@ wandb/
 outputs/
 *.xlsx
 *.csv
+docs/
+*.aux
+~$*
+
+# Generated documentation artifacts
+dataset_overview*
+norway_dataset_overview*
+europe_temporal_table_slide.png
+taiwan_temporal_table_slide.png
+taiwan_temporal_results.tex
+docs/figures/*.png
+docs/figures/*.pdf
+docs/results_deck/*.potx
+docs/results_deck/*.pptx
+docs/results_deck/paper_eval_selected/
+docs/temporal_context_review.pptx
+
 
 # HP Search generated outputs
 hp_search/visualizations/
@@ -34,6 +51,9 @@ multi_checkpoint_tools/
 .claude/
 .codex/
 .opencode/
+node_modules/
+AGENTS.md
+CLAUDE.md
 
 
 # MacOs specific

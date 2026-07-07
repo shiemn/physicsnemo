@@ -49,6 +49,7 @@ Usage:
 import json
 import os
 import sys
+import inspect
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -80,6 +81,7 @@ from helpers.generate_helpers import (
     save_images,
     setup_patching,
 )
+from helpers.dropout_residual import dropout_residual_step
 from helpers.metrics import MetricsAccumulator
 from helpers.plots import (
     HistogramAccumulator,
@@ -123,11 +125,41 @@ def _infer_channel_type(channel_name: str) -> str:
         "temperature",
     }:
         return "temperature"
-    if "wind" in normalized:
+    if normalized in {"u10", "v10"} or "wind" in normalized:
         return "wind"
     if any(token in normalized for token in ["precip", "rain", "tp", "rr"]):
         return "precip"
     return "generic"
+
+
+def _is_nonnegative_channel(channel_name: str) -> bool:
+    """Return True for physical channels that should not go below zero."""
+    channel_type = _infer_channel_type(channel_name)
+    return channel_type in {"precip", "reflectivity"}
+
+
+def _nonnegative_channel_indices(channel_names: list[str]) -> list[int]:
+    return [
+        idx for idx, channel_name in enumerate(channel_names)
+        if _is_nonnegative_channel(channel_name)
+    ]
+
+
+def _clamp_nonnegative_channels(
+    tensor: torch.Tensor, channel_indices: list[int]
+) -> torch.Tensor:
+    """Clamp only explicitly nonnegative channels, preserving signed variables."""
+    if not channel_indices:
+        return tensor
+    if tensor.ndim == 4:
+        tensor[:, channel_indices] = tensor[:, channel_indices].clamp(min=0.0)
+        return tensor
+    if tensor.ndim == 3:
+        tensor[channel_indices] = tensor[channel_indices].clamp(min=0.0)
+        return tensor
+    raise ValueError(
+        f"Expected tensor with shape (N,C,H,W) or (C,H,W), got {tuple(tensor.shape)}"
+    )
 
 
 def _infer_channel_unit(channel_type: str) -> str | None:
@@ -305,9 +337,15 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
     lat_np = data["lat"]
     lon_np = data["lon"]
     img_shape = (data["truth"].shape[2], data["truth"].shape[3])
+    nonnegative_channels = _nonnegative_channel_indices(channel_names)
 
     logger.info(f"  Loaded {n_times} timesteps, {n_ens} ensemble members, "
                 f"{len(channel_names)} channels, shape {img_shape}")
+    if nonnegative_channels:
+        logger.info(
+            "  Clamping nonnegative channels only: "
+            + ", ".join(channel_names[i] for i in nonnegative_channels)
+        )
 
     if n_times == 0:
         logger.warning(
@@ -389,6 +427,8 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
     for t in range(n_times):
         pred_t = torch.from_numpy(data["prediction"][:, t])  # (N_ens, C, H, W)
         tar_t = torch.from_numpy(data["truth"][t])          # (C, H, W)
+        pred_t = _clamp_nonnegative_channels(pred_t, nonnegative_channels)
+        tar_t = _clamp_nonnegative_channels(tar_t, nonnegative_channels)
 
         for g in _groups.values():
             ch = g["channels"]
@@ -487,6 +527,7 @@ def _run_single_timestep(
     net_reg,
     net_res,
     sampler_fn,
+    use_dropout_residual: bool,
     img_shape: tuple[int, int],
     img_out_channels: int,
     device,
@@ -534,28 +575,43 @@ def _run_single_timestep(
     reg_mean_np = dataset.denormalize_output(reg_mean.cpu().numpy())[0]  # (C, H, W)
     target_np = dataset.denormalize_output(image_tar.cpu().numpy())[0]   # (C, H, W)
 
-    if net_res is not None and sampler_fn is not None:
+    if net_res is not None and (use_dropout_residual or sampler_fn is not None):
         mean_hr = reg_mean if hr_mean_conditioning else None
         all_residuals = []
         for seed_batch in seed_batches:
             batch_size = len(seed_batch)
             rank_batches = [torch.tensor(seed_batch)]
             with torch.no_grad():
-                res = diffusion_step(
-                    net=net_res,
-                    sampler_fn=sampler_fn,
-                    img_shape=img_shape,
-                    img_out_channels=img_out_channels,
-                    rank_batches=rank_batches,
-                    img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
-                        memory_format=torch.channels_last
-                    ),
-                    rank=0,
-                    device=device,
-                    mean_hr=mean_hr,
-                    lead_time_label=lead_time_label,
-                    **diffusion_kwargs,
-                )
+                if use_dropout_residual:
+                    res = dropout_residual_step(
+                        net=net_res,
+                        img_lr=image_lr,
+                        latents_shape=(
+                            batch_size,
+                            img_out_channels,
+                            img_shape[0],
+                            img_shape[1],
+                        ),
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        seed=int(seed_batch[0]) if len(seed_batch) else None,
+                    )
+                else:
+                    res = diffusion_step(
+                        net=net_res,
+                        sampler_fn=sampler_fn,
+                        img_shape=img_shape,
+                        img_out_channels=img_out_channels,
+                        rank_batches=rank_batches,
+                        img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
+                            memory_format=torch.channels_last
+                        ),
+                        rank=0,
+                        device=device,
+                        mean_hr=mean_hr,
+                        lead_time_label=lead_time_label,
+                        **diffusion_kwargs,
+                    )
             all_residuals.append(res)
         diffusion_residuals = torch.cat(all_residuals, dim=0)  # (N_ens, C, H, W)
         ens_pred = reg_mean + diffusion_residuals               # (N_ens, C, H, W)
@@ -656,6 +712,10 @@ def main(cfg: DictConfig) -> None:
     else:
         logger0.info(f"  Metric channels:{metric_channels if metric_channels is not None else 'all'}")
     logger0.info(f"  GPUs:           {dist.world_size}")
+    residual_model_type = cfg.generation.get("residual_model_type", "diffusion")
+    use_dropout_residual = residual_model_type in {"dropout_crps", "dropout_residual"}
+    if use_dropout_residual and inference_mode != "all":
+        raise ValueError("dropout residual evaluation requires generation.inference_mode=all")
 
     # ------------------------------------------------------------------
     # W&B initialisation (rank 0 only)
@@ -712,6 +772,12 @@ def main(cfg: DictConfig) -> None:
     output_channels = list(dataset.output_channels())
     img_out_channels = len(output_channels)
     channel_names = [_format_channel_label(channel) for channel in output_channels]
+    nonnegative_channels = _nonnegative_channel_indices(channel_names)
+    if nonnegative_channels:
+        logger0.info(
+            "  Clamping nonnegative channels only: "
+            + ", ".join(channel_names[i] for i in nonnegative_channels)
+        )
 
     # Auto-expand per_channel_metrics into one group per output channel
     if per_channel_metrics and metric_groups_cfg is None:
@@ -782,7 +848,17 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # Sampler function (diffusion only)
     # ------------------------------------------------------------------
-    sampler_fn = build_sampler_fn(cfg.sampler, patching, net_guide=net_guide, guidance_scale=guidance_scale, guidance_schedule_alpha=guidance_schedule_alpha) if net_res else None
+    sampler_fn = (
+        None
+        if use_dropout_residual or net_res is None
+        else build_sampler_fn(
+            cfg.sampler,
+            patching,
+            net_guide=net_guide,
+            guidance_scale=guidance_scale,
+            guidance_schedule_alpha=guidance_schedule_alpha,
+        )
+    )
 
     # ------------------------------------------------------------------
     # Seed batches for ensemble generation
@@ -860,6 +936,11 @@ def main(cfg: DictConfig) -> None:
         val = cfg.generation.get(cfg_key, None)
         if val is not None:
             diffusion_kwargs[kwarg_key] = val
+    diffusion_step_params = inspect.signature(diffusion_step).parameters
+    if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in diffusion_step_params.values()):
+        diffusion_kwargs = {
+            key: val for key, val in diffusion_kwargs.items() if key in diffusion_step_params
+        }
 
     # ------------------------------------------------------------------
     # Main evaluation loop
@@ -927,8 +1008,10 @@ def main(cfg: DictConfig) -> None:
         # Denormalize regression prediction and target
         reg_pred_np = dataset.denormalize_output(reg_mean.cpu().numpy())          # (1, C, H, W)
         tar_np = dataset.denormalize_output(image_tar.cpu().numpy())              # (1, C, H, W)
-        reg_pred_t = torch.from_numpy(reg_pred_np).to(device).clamp(min=0.0)       # (1, C, H, W)
-        tar_t = torch.from_numpy(tar_np).to(device).clamp(min=0.0)               # (1, C, H, W)
+        reg_pred_t = torch.from_numpy(reg_pred_np).to(device)                     # (1, C, H, W)
+        tar_t = torch.from_numpy(tar_np).to(device)                               # (1, C, H, W)
+        reg_pred_t = _clamp_nonnegative_channels(reg_pred_t, nonnegative_channels)
+        tar_t = _clamp_nonnegative_channels(tar_t, nonnegative_channels)
 
         # Regression metrics: update each group's accumulator with its channel subset
         if log_regression:
@@ -955,21 +1038,36 @@ def main(cfg: DictConfig) -> None:
                 batch_size = len(seed_batch)
                 rank_batches = [torch.tensor(seed_batch)]
                 with torch.no_grad():
-                    res = diffusion_step(
-                        net=net_res,
-                        sampler_fn=sampler_fn,
-                        img_shape=img_shape,
-                        img_out_channels=img_out_channels,
-                        rank_batches=rank_batches,
-                        img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
-                            memory_format=torch.channels_last
-                        ),
-                        rank=0,
-                        device=device,
-                        mean_hr=mean_hr,
-                        lead_time_label=lead_time_label,
-                        **diffusion_kwargs,
-                    )
+                    if use_dropout_residual:
+                        res = dropout_residual_step(
+                            net=net_res,
+                            img_lr=image_lr,
+                            latents_shape=(
+                                batch_size,
+                                img_out_channels,
+                                img_shape[0],
+                                img_shape[1],
+                            ),
+                            mean_hr=mean_hr,
+                            lead_time_label=lead_time_label,
+                            seed=int(seed_batch[0]) if len(seed_batch) else None,
+                        )
+                    else:
+                        res = diffusion_step(
+                            net=net_res,
+                            sampler_fn=sampler_fn,
+                            img_shape=img_shape,
+                            img_out_channels=img_out_channels,
+                            rank_batches=rank_batches,
+                            img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
+                                memory_format=torch.channels_last
+                            ),
+                            rank=0,
+                            device=device,
+                            mean_hr=mean_hr,
+                            lead_time_label=lead_time_label,
+                            **diffusion_kwargs,
+                        )
                 all_residuals.append(res)
 
             # Full ensemble: regression mean + diffusion residuals
@@ -977,7 +1075,8 @@ def main(cfg: DictConfig) -> None:
             ens_pred = reg_mean + diffusion_residuals                # (N_ens, C, H, W)
 
             ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())
-            ens_pred_t = torch.from_numpy(ens_pred_np).to(device).clamp(min=0.0)  # (N_ens, C, H, W)
+            ens_pred_t = torch.from_numpy(ens_pred_np).to(device)      # (N_ens, C, H, W)
+            ens_pred_t = _clamp_nonnegative_channels(ens_pred_t, nonnegative_channels)
 
             for g in _groups.values():
                 if g["diff_acc"] is None:
@@ -1168,6 +1267,7 @@ def main(cfg: DictConfig) -> None:
                     net_reg=net_reg,
                     net_res=net_res,
                     sampler_fn=sampler_fn,
+                    use_dropout_residual=use_dropout_residual,
                     img_shape=img_shape,
                     img_out_channels=img_out_channels,
                     device=device,

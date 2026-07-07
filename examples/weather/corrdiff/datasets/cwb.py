@@ -53,6 +53,55 @@ def get_target_normalizations_v2(group):
     return center, scale
 
 
+def get_target_normalizations_europa(group):
+    """Europa-tuned target normalization with linear rescaling only."""
+    variable = group["cwb_variable"][:]
+    center = np.array(group["cwb_center"][:], dtype=np.float32)
+    scale = np.array(group["cwb_scale"][:], dtype=np.float32)
+
+    center = np.where(variable == "eastward_wind_10m", 0.0, center)
+    center = np.where(variable == "northward_wind_10m", 0.0, center)
+    center = np.where(variable == "precipitation_amount_1hr", 0.0, center)
+
+    scale = np.where(variable == "precipitation_amount_1hr", 5.0, scale)
+    return center.astype(np.float32), scale.astype(np.float32)
+
+
+def get_target_normalizations_v3_europa(group):
+    """Europa target normalization with log1p precipitation stabilization."""
+    variable = group["cwb_variable"][:]
+    center = np.array(group["cwb_center"][:], dtype=np.float32)
+    scale = np.array(group["cwb_scale"][:], dtype=np.float32)
+
+    center = np.where(variable == "eastward_wind_10m", 0.0, center)
+    center = np.where(variable == "northward_wind_10m", 0.0, center)
+    center = np.where(variable == "precipitation_amount_1hr", 0.0, center)
+
+    scale = np.where(variable == "precipitation_amount_1hr", 1.0, scale)
+
+    n_channels = len(variable)
+    fwd = [None] * n_channels
+    inv = [None] * n_channels
+    precip_idx = np.where(variable == "precipitation_amount_1hr")[0]
+    if len(precip_idx) != 1:
+        raise ValueError(
+            "normalization=v3_europa requires exactly one "
+            "precipitation_amount_1hr output channel"
+        )
+    fwd[int(precip_idx[0])] = np.log1p
+    inv[int(precip_idx[0])] = np.expm1
+
+    return center.astype(np.float32), scale.astype(np.float32), fwd, inv
+
+
+def _resolve_target_normalization(result, n_channels):
+    """Return center, scale, fwd transforms, and inverse transforms."""
+    if len(result) == 2:
+        center, scale = result
+        return center, scale, [None] * n_channels, [None] * n_channels
+    return result
+
+
 class _ZarrDataset(DownscalingDataset):
     """A Dataset for loading paired training data from a Zarr-file
 
@@ -153,6 +202,28 @@ class _ZarrDataset(DownscalingDataset):
             stds = stds[channels]
         return (means, stds)
 
+    def _resolved_target_norm(self, channels=None):
+        center, scale, fwd, inv = _resolve_target_normalization(
+            self.get_target_normalization(self.group),
+            n_channels=int(self.group["cwb_variable"].shape[0]),
+        )
+        if channels is not None:
+            center = np.asarray(center)[channels]
+            scale = np.asarray(scale)[channels]
+            fwd = [fwd[c] for c in channels]
+            inv = [inv[c] for c in channels]
+        return center, scale, fwd, inv
+
+    @staticmethod
+    def _apply_per_channel(x, fns):
+        if all(fn is None for fn in fns):
+            return x
+        out = np.asarray(x).copy()
+        for channel, fn in enumerate(fns):
+            if fn is not None:
+                out[:, channel] = fn(out[:, channel])
+        return out
+
     def normalize_input(self, x, channels=None):
         """Convert input from physical units to normalized data."""
         norm = self._select_norm_channels(
@@ -169,19 +240,18 @@ class _ZarrDataset(DownscalingDataset):
 
     def normalize_output(self, x, channels=None):
         """Convert output from physical units to normalized data."""
-        norm = self.get_target_normalization(self.group)
-        norm = self._select_norm_channels(*norm, channels)
-        return normalize(x, *norm)
+        center, scale, fwd, _ = self._resolved_target_norm(channels)
+        return normalize(self._apply_per_channel(x, fwd), center, scale)
 
     def denormalize_output(self, x, channels=None):
         """Convert output from normalized data to physical units."""
-        norm = self.get_target_normalization(self.group)
-        norm = self._select_norm_channels(*norm, channels)
-        return denormalize(x, *norm)
+        center, scale, _, inv = self._resolved_target_norm(channels)
+        return self._apply_per_channel(denormalize(x, center, scale), inv)
 
     def info(self):
+        center, scale, _, _ = self._resolved_target_norm()
         return {
-            "target_normalization": self.get_target_normalization(self.group),
+            "target_normalization": (center, scale),
             "input_normalization": (
                 self.group["era5_center"][:],
                 self.group["era5_scale"][:],
@@ -517,17 +587,34 @@ class ZarrDataset(DownscalingDataset):
         return x
 
 
-def get_zarr_dataset(*, data_path, normalization="v1", all_times=False, **kwargs):
+def get_zarr_dataset(
+    *, data_path, normalization="v1", all_times=False, include_times=None, **kwargs
+):
     """Get a Zarr dataset for training or evaluation."""
     data_path = to_absolute_path(data_path)
     get_target_normalization = {
         "v1": get_target_normalizations_v1,
         "v2": get_target_normalizations_v2,
+        "europa": get_target_normalizations_europa,
+        "v3_europa": get_target_normalizations_v3_europa,
     }[normalization]
     logger.info(f"Normalization: {normalization}")
     zdataset = _ZarrDataset(
         data_path, get_target_normalization=get_target_normalization
     )
+    if include_times is not None:
+        include_set = set(include_times)
+
+        def _in_set(t):
+            iso = (
+                f"{t.year:04d}-{t.month:02d}-{t.day:02d}T"
+                f"{t.hour:02d}:{t.minute:02d}:{t.second:02d}"
+            )
+            return iso in include_set
+
+        zdataset = FilterTime(zdataset, _in_set)
+        all_times = True
+        logger.info("include_times: filtered to %d timestamps", len(zdataset))
     return ZarrDataset(
         dataset=zdataset, normalization=normalization, all_times=all_times, **kwargs
     )
