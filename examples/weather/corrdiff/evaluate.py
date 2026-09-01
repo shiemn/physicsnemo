@@ -82,6 +82,7 @@ from helpers.generate_helpers import (
     setup_patching,
 )
 from helpers.dropout_residual import dropout_residual_step
+from helpers.climate_signal import ClimateAccumulator, timestamp_seeds
 from helpers.metrics import MetricsAccumulator
 from helpers.plots import (
     HistogramAccumulator,
@@ -646,6 +647,28 @@ def main(cfg: DictConfig) -> None:
         )
     num_ensembles = cfg.generation.num_ensembles
     seed_batch_size = cfg.generation.seed_batch_size
+    climate_cfg_raw = cfg.eval.get("climate", None)
+    climate_cfg = (
+        OmegaConf.to_container(climate_cfg_raw, resolve=True)
+        if climate_cfg_raw is not None
+        else {}
+    )
+    climate_enabled = bool(climate_cfg.get("enabled", False))
+    climate_only = bool(cfg.eval.get("climate_only", False))
+    if climate_only and not climate_enabled:
+        raise ValueError("eval.climate_only=true requires eval.climate.enabled=true")
+    if climate_only:
+        if dist.world_size != 1:
+            raise ValueError("Climate-only aggregation requires exactly one GPU/process")
+        if inference_mode != "all" or num_ensembles != 1:
+            raise ValueError(
+                "Climate-only evaluation requires generation.inference_mode=all "
+                "and generation.num_ensembles=1"
+            )
+        if cfg.generation.get("seed_mode", "fixed") != "timestamp":
+            raise ValueError(
+                "Climate-only evaluation requires generation.seed_mode=timestamp"
+            )
     precip_threshold = cfg.eval.get("precip_threshold", 1.0)
     output_json = cfg.eval.get("output_json", "eval_results.json")
     twcrps_thresholds = list(cfg.eval.get("twcrps_thresholds", [5.0, 10.0]))
@@ -653,6 +676,14 @@ def main(cfg: DictConfig) -> None:
     plot_events = list(cfg.eval.get("plot_events", None) or [])
     rapsd_dx_km = float(cfg.eval.get("rapsd_dx_km", 2.0))
     predictions_file_cfg = cfg.eval.get("predictions_file", None)
+    stream_predictions = bool(cfg.eval.get("stream_predictions", False))
+    save_prediction_inputs = bool(cfg.eval.get("save_inputs", True))
+    prediction_sync_interval = int(cfg.eval.get("prediction_sync_interval", 32))
+    if prediction_sync_interval < 1:
+        raise ValueError("eval.prediction_sync_interval must be at least 1")
+    save_prediction_channels_cfg = cfg.eval.get("save_prediction_channels", None)
+    if save_prediction_channels_cfg is not None:
+        save_prediction_channels_cfg = list(save_prediction_channels_cfg)
     # metric_groups: optional dict of {group_name: {channels, precip_threshold,
     #   twcrps_thresholds, skip_conditional_metrics, skip_spread_skill, hrre_threshold}}
     # If null, falls back to legacy single-accumulator behaviour using metric_channels.
@@ -681,6 +712,8 @@ def main(cfg: DictConfig) -> None:
         predictions_file = f"eval_{_stem}.nc"
     else:
         predictions_file = predictions_file_cfg  # explicit path or None
+    if climate_only and predictions_file is not None:
+        raise ValueError("Climate-only evaluation requires eval.predictions_file=null")
 
     # ------------------------------------------------------------------
     # Offline mode: load predictions from existing NetCDF file
@@ -704,6 +737,9 @@ def main(cfg: DictConfig) -> None:
     logger0.info(f"  Run tag:        {run_tag}")
     logger0.info(f"  Inference mode: {inference_mode}")
     logger0.info(f"  Ensembles:      {num_ensembles}")
+    logger0.info(f"  Climate only:   {climate_only}")
+    logger0.info(f"  Stream output:  {stream_predictions}")
+    logger0.info(f"  Save inputs:    {save_prediction_inputs}")
     logger0.info(f"  Threshold:      {precip_threshold} mm")
     logger0.info(f"  twCRPS at:      {twcrps_thresholds} mm")
     logger0.info(f"  Plot events:    top-{n_plot_events} (+ {len(plot_events)} explicit)")
@@ -720,7 +756,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # W&B initialisation (rank 0 only)
     # ------------------------------------------------------------------
-    if dist.rank == 0:
+    if dist.rank == 0 and not climate_only:
         guidance_scale = float(cfg.generation.get("guidance_scale", 0.0))
         guidance_schedule_alpha = float(cfg.generation.get("guidance_schedule_alpha", 0.0))
         wandb_name = f"eval-{run_tag}-g{guidance_scale}" if guidance_scale != 0.0 else f"eval-{run_tag}"
@@ -767,11 +803,52 @@ def main(cfg: DictConfig) -> None:
     # Rebuild times as cftime objects (needed by NetCDFWriter.write_time)
     all_dataset_times = dataset.time()
     times = [all_dataset_times[i] for i in sampler] if sampler else all_dataset_times
+    excluded_month_days = {
+        str(value)
+        for value in climate_cfg.get("excluded_month_days", [])
+    }
+    if climate_enabled and excluded_month_days:
+        kept = [
+            (dataset_idx, timestamp)
+            for dataset_idx, timestamp in zip(sampler, times)
+            if f"{int(timestamp.month):02d}-{int(timestamp.day):02d}"
+            not in excluded_month_days
+        ]
+        sampler = [item[0] for item in kept]
+        times = [item[1] for item in kept]
+        total_times = len(sampler)
+        logger0.info(
+            "  Excluded month-days: " + ", ".join(sorted(excluded_month_days))
+        )
 
     img_shape = dataset.image_shape()
     output_channels = list(dataset.output_channels())
     img_out_channels = len(output_channels)
     channel_names = [_format_channel_label(channel) for channel in output_channels]
+    if save_prediction_channels_cfg is None:
+        saved_output_channel_indices = list(range(img_out_channels))
+    else:
+        if len(set(save_prediction_channels_cfg)) != len(save_prediction_channels_cfg):
+            raise ValueError("eval.save_prediction_channels must not contain duplicates")
+        unknown_saved_channels = [
+            name for name in save_prediction_channels_cfg if name not in channel_names
+        ]
+        if unknown_saved_channels:
+            raise ValueError(
+                "Unknown eval.save_prediction_channels value(s): "
+                + ", ".join(unknown_saved_channels)
+                + f". Available channels: {', '.join(channel_names)}"
+            )
+        saved_output_channel_indices = [
+            channel_names.index(name) for name in save_prediction_channels_cfg
+        ]
+    saved_output_channels = [
+        output_channels[channel_idx] for channel_idx in saved_output_channel_indices
+    ]
+    logger0.info(
+        "  Saved channels:  "
+        + ", ".join(channel_names[i] for i in saved_output_channel_indices)
+    )
     nonnegative_channels = _nonnegative_channel_indices(channel_names)
     if nonnegative_channels:
         logger0.info(
@@ -794,6 +871,41 @@ def main(cfg: DictConfig) -> None:
     except AttributeError:
         lat_np = None
         lon_np = None
+
+    climate_accumulator = None
+    climate_channel_idx = None
+    climate_output_path = None
+    if climate_enabled:
+        climate_channel = str(climate_cfg.get("channel", "precipitation"))
+        normalized_climate_channel = _normalize_channel_name(climate_channel)
+        matching_channels = [
+            idx
+            for idx, name in enumerate(channel_names)
+            if _normalize_channel_name(name) == normalized_climate_channel
+        ]
+        if len(matching_channels) != 1:
+            raise ValueError(
+                f"Climate channel {climate_channel!r} did not uniquely match "
+                f"output channels {channel_names}"
+            )
+        climate_channel_idx = matching_channels[0]
+        climate_output_cfg = climate_cfg.get("output_file")
+        if not climate_output_cfg:
+            raise ValueError("eval.climate.output_file must be set")
+        climate_output_path = to_absolute_path(str(climate_output_cfg))
+        climate_accumulator = ClimateAccumulator(
+            shape=img_shape,
+            wet_day_threshold_mm=float(
+                climate_cfg.get("wet_day_threshold_mm", 1.0)
+            ),
+            expected_hours=climate_cfg.get(
+                "expected_hours", [0, 3, 6, 9, 12, 15, 18, 21]
+            ),
+        )
+        logger0.info(
+            f"  Climate output: {climate_output_path} "
+            f"(channel={channel_names[climate_channel_idx]})"
+        )
 
     logger0.info(f"  Eval timesteps: {total_times} (matched {total_times}/{len(times)})")
 
@@ -866,6 +978,10 @@ def main(cfg: DictConfig) -> None:
     seeds = list(np.arange(num_ensembles))
     num_seed_batches = (len(seeds) - 1) // seed_batch_size + 1
     seed_batches = np.array_split(seeds, num_seed_batches)
+    seed_mode = str(cfg.generation.get("seed_mode", "fixed"))
+    seed_base = int(cfg.generation.get("seed_base", 0))
+    if seed_mode not in {"fixed", "timestamp"}:
+        raise ValueError("generation.seed_mode must be 'fixed' or 'timestamp'")
 
     # ------------------------------------------------------------------
     # Metric accumulators (one per inference mode × metric group)
@@ -919,9 +1035,43 @@ def main(cfg: DictConfig) -> None:
     # Event candidates for auto-selection of plot timesteps: (time_idx, max_precip, dataset_idx)
     local_event_candidates: list[tuple[int, float, int]] = []
 
-    # Buffer for NetCDF save (normalized tensors, CPU)
-    local_save_data: list[dict] = [] if predictions_file else []
     save_predictions = predictions_file is not None
+    if stream_predictions and save_predictions and dist.world_size != 1:
+        raise ValueError(
+            "eval.stream_predictions currently requires a single process/GPU. "
+            "Submit one GPU or disable streaming."
+        )
+
+    # The legacy output path buffers tensors and writes after evaluation. Annual
+    # time series use streaming to avoid retaining many GiB of predictions and
+    # upsampled temporal inputs in host memory.
+    local_save_data: list[dict] = []
+    streaming_nc_file = None
+    streaming_nc_writer = None
+    streaming_tmp_path = None
+    streaming_final_path = None
+    if save_predictions and stream_predictions:
+        streaming_final_path = to_absolute_path(predictions_file)
+        streaming_tmp_path = streaming_final_path + ".tmp"
+        os.makedirs(os.path.dirname(streaming_final_path) or ".", exist_ok=True)
+        if os.path.exists(streaming_tmp_path):
+            raise FileExistsError(
+                f"Incomplete streaming output already exists: {streaming_tmp_path}. "
+                "Inspect or move it before retrying so diagnostic data is not overwritten."
+            )
+        logger0.info(f"Streaming predictions to: {streaming_tmp_path}")
+        streaming_nc_file = nc.Dataset(streaming_tmp_path, "w")
+        streaming_nc_file.cfg = str(cfg)
+        streaming_nc_file.setncattr("save_inputs", int(save_prediction_inputs))
+        streaming_nc_file.setncattr("streaming_output", 1)
+        streaming_nc_writer = NetCDFWriter(
+            streaming_nc_file,
+            lat=np.array(dataset.latitude()),
+            lon=np.array(dataset.longitude()),
+            input_channels=(dataset.input_channels() if save_prediction_inputs else []),
+            output_channels=saved_output_channels,
+            has_lead_time=cfg.generation.get("has_lead_time", False),
+        )
 
     # ------------------------------------------------------------------
     # Distribution kwargs for diffusion_step
@@ -1013,28 +1163,39 @@ def main(cfg: DictConfig) -> None:
         reg_pred_t = _clamp_nonnegative_channels(reg_pred_t, nonnegative_channels)
         tar_t = _clamp_nonnegative_channels(tar_t, nonnegative_channels)
 
-        # Regression metrics: update each group's accumulator with its channel subset
-        if log_regression:
-            for g in _groups.values():
-                ch = g["channels"]
-                r = reg_pred_t[:, ch] if ch is not None else reg_pred_t
-                t = tar_t[:, ch] if ch is not None else tar_t
-                g["reg_acc"].update(r, t)
-        # Diagnostic plots use the selected diagnostic group's channel subset.
-        reg_pred_m = reg_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else reg_pred_t
-        tar_m = tar_t[:, diagnostic_channels] if diagnostic_channels is not None else tar_t
-        hist_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
-        rapsd_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
+        if not climate_only:
+            # Regression metrics: update each group's accumulator with its channel subset
+            if log_regression:
+                for g in _groups.values():
+                    ch = g["channels"]
+                    r = reg_pred_t[:, ch] if ch is not None else reg_pred_t
+                    t = tar_t[:, ch] if ch is not None else tar_t
+                    g["reg_acc"].update(r, t)
+            # Diagnostic plots use the selected diagnostic group's channel subset.
+            reg_pred_m = reg_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else reg_pred_t
+            tar_m = tar_t[:, diagnostic_channels] if diagnostic_channels is not None else tar_t
+            hist_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
+            rapsd_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
 
-        # Track as event candidate for auto-selection of plot timesteps
-        local_event_candidates.append((time_idx, float(tar_t.max()), dataset_idx))
+            # Track as event candidate for auto-selection of plot timesteps
+            local_event_candidates.append((time_idx, float(tar_t.max()), dataset_idx))
 
         # -- Diffusion forward pass (when mode == "all") --
         _any_diff_acc = any(g["diff_acc"] is not None for g in _groups.values())
-        if net_res is not None and _any_diff_acc:
+        if net_res is not None and (_any_diff_acc or climate_enabled):
             mean_hr = reg_mean if cfg.generation.hr_mean_conditioning else None
             all_residuals = []
-            for seed_batch in seed_batches:
+            timestep_seed_batches = seed_batches
+            if seed_mode == "timestamp":
+                timestep_seeds = timestamp_seeds(
+                    times[time_idx],
+                    n_members=num_ensembles,
+                    base_seed=seed_base,
+                )
+                timestep_seed_batches = np.array_split(
+                    timestep_seeds, num_seed_batches
+                )
+            for seed_batch in timestep_seed_batches:
                 batch_size = len(seed_batch)
                 rank_batches = [torch.tensor(seed_batch)]
                 with torch.no_grad():
@@ -1078,31 +1239,95 @@ def main(cfg: DictConfig) -> None:
             ens_pred_t = torch.from_numpy(ens_pred_np).to(device)      # (N_ens, C, H, W)
             ens_pred_t = _clamp_nonnegative_channels(ens_pred_t, nonnegative_channels)
 
-            for g in _groups.values():
-                if g["diff_acc"] is None:
-                    continue
-                ch = g["channels"]
-                e = ens_pred_t[:, ch] if ch is not None else ens_pred_t
-                t = tar_t[:, ch] if ch is not None else tar_t
-                g["diff_acc"].update(e, t)
-            ens_pred_m = ens_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else ens_pred_t
-            hist_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
-            rapsd_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
+            if climate_enabled:
+                climate_accumulator.update(
+                    times[time_idx],
+                    ens_pred_t[0, climate_channel_idx].detach().cpu().numpy(),
+                    tar_t[0, climate_channel_idx].detach().cpu().numpy(),
+                )
 
-        # Buffer normalized predictions for NetCDF save
+            if not climate_only:
+                for g in _groups.values():
+                    if g["diff_acc"] is None:
+                        continue
+                    ch = g["channels"]
+                    e = ens_pred_t[:, ch] if ch is not None else ens_pred_t
+                    t = tar_t[:, ch] if ch is not None else tar_t
+                    g["diff_acc"].update(e, t)
+                ens_pred_m = ens_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else ens_pred_t
+                hist_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
+                rapsd_acc_diff.update(ens_pred_m, tar_m.squeeze(0))
+
+        # Save or buffer normalized predictions for NetCDF output.
         if save_predictions:
             # Use the diffusion ensemble if available, otherwise regression only
             if net_res is not None and _any_diff_acc:
                 image_out = ens_pred.cpu()  # (N_ens, C, H, W), normalized
             else:
                 image_out = reg_mean.cpu()  # (1, C, H, W), normalized
-            local_save_data.append({
-                "time_idx": time_idx,
-                "dataset_idx": dataset_idx,
-                "image_out": image_out,
-                "image_tar": image_tar.cpu(),  # (1, C, H, W), normalized
-                "image_lr": image_lr.cpu(),    # (1, C_lr, H, W), normalized
-            })
+            if stream_predictions:
+                save_images(
+                    writer=streaming_nc_writer,
+                    dataset=dataset,
+                    times=list(times),
+                    image_out=image_out,
+                    image_tar=image_tar.cpu(),
+                    image_lr=image_lr.cpu() if save_prediction_inputs else None,
+                    time_index=time_idx,
+                    t_index=time_idx,
+                    has_lead_time=cfg.generation.get("has_lead_time", False),
+                    save_inputs=save_prediction_inputs,
+                    output_channel_indices=saved_output_channel_indices,
+                )
+                if (time_idx + 1) % prediction_sync_interval == 0:
+                    streaming_nc_file.sync()
+            else:
+                local_save_data.append({
+                    "time_idx": time_idx,
+                    "dataset_idx": dataset_idx,
+                    "image_out": image_out,
+                    "image_tar": image_tar.cpu(),  # (1, C, H, W), normalized
+                    "image_lr": (
+                        image_lr.cpu() if save_prediction_inputs else None
+                    ),
+                })
+
+    if save_predictions and stream_predictions:
+        streaming_nc_file.setncattr("completed_timesteps", total_times)
+        streaming_nc_file.close()
+        os.rename(streaming_tmp_path, streaming_final_path)
+        logger0.info(f"Saved {total_times} streamed timesteps to {streaming_final_path}")
+
+    if climate_only:
+        written_path = climate_accumulator.write_netcdf(
+            climate_output_path,
+            latitude=lat_np,
+            longitude=lon_np,
+            metadata={
+                "run_tag": str(run_tag),
+                "model_regression_checkpoint": str(
+                    cfg.generation.io.reg_ckpt_filename
+                ),
+                "model_diffusion_checkpoint": str(
+                    cfg.generation.io.res_ckpt_filename
+                ),
+                "seed_mode": seed_mode,
+                "seed_base": seed_base,
+                "num_ensembles": int(num_ensembles),
+                "requested_first_time": str(times[0]),
+                "requested_last_time": str(times[-1]),
+                "dataset_years": list(cfg.dataset.years),
+                "excluded_month_days": sorted(excluded_month_days),
+                "temporal_offsets_hours": list(
+                    cfg.dataset.get("temporal_inputs", {}).get("offset_hours", [0])
+                ),
+            },
+        )
+        logger0.info(
+            f"Climate-only evaluation complete: {climate_accumulator.completed_timesteps} "
+            f"timesteps written to {written_path}"
+        )
+        return
 
     # ------------------------------------------------------------------
     # Distributed reduce (all_reduce so every rank has global totals)
@@ -1130,7 +1355,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # Save predictions to NetCDF (rank 0 gathers from all ranks and writes)
     # ------------------------------------------------------------------
-    if save_predictions:
+    if save_predictions and not stream_predictions:
         if dist.world_size > 1:
             all_save_data_nested = [None] * dist.world_size
             torch.distributed.all_gather_object(all_save_data_nested, local_save_data)
@@ -1151,8 +1376,8 @@ def main(cfg: DictConfig) -> None:
                 nc_file,
                 lat=np.array(dataset.latitude()),
                 lon=np.array(dataset.longitude()),
-                input_channels=dataset.input_channels(),
-                output_channels=dataset.output_channels(),
+                input_channels=(dataset.input_channels() if save_prediction_inputs else []),
+                output_channels=saved_output_channels,
                 has_lead_time=cfg.generation.get("has_lead_time", False),
             )
             for write_idx, d in enumerate(all_save_data):
@@ -1166,6 +1391,8 @@ def main(cfg: DictConfig) -> None:
                     time_index=write_idx,
                     t_index=d["time_idx"],
                     has_lead_time=cfg.generation.get("has_lead_time", False),
+                    save_inputs=save_prediction_inputs,
+                    output_channel_indices=saved_output_channel_indices,
                 )
             nc_file.close()
             os.rename(tmp_path, abs_pred_path)

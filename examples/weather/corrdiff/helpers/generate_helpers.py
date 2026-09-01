@@ -243,13 +243,32 @@ def save_images(
     t_index,
     has_lead_time,
     predicted_uncertainty=None,
+    save_inputs=True,
+    output_channel_indices=None,
 ):
     """Save inference results to NetCDF via a NetCDFWriter."""
-    image_lr2 = dataset.denormalize_input(image_lr[0].unsqueeze(0).cpu().numpy())
+    image_lr2 = None
+    if save_inputs:
+        if image_lr is None:
+            raise ValueError("image_lr is required when save_inputs=True")
+        image_lr2 = dataset.denormalize_input(image_lr[0].unsqueeze(0).cpu().numpy())
     image_tar2 = dataset.denormalize_output(image_tar[0].unsqueeze(0).cpu().numpy())
 
     if image_tar2.ndim != 4:
         raise ValueError("image_tar2 must be 4-dimensional")
+
+    output_channel_info = dataset.output_channels()
+    if output_channel_indices is None:
+        output_channel_indices = list(range(len(output_channel_info)))
+    else:
+        output_channel_indices = list(output_channel_indices)
+    if len(set(output_channel_indices)) != len(output_channel_indices):
+        raise ValueError("output_channel_indices must not contain duplicates")
+    if any(
+        channel_idx < 0 or channel_idx >= len(output_channel_info)
+        for channel_idx in output_channel_indices
+    ):
+        raise ValueError("output_channel_indices contains an out-of-range channel")
 
     for idx in range(image_out.shape[0]):
         image_out2 = image_out[idx].unsqueeze(0)
@@ -259,8 +278,8 @@ def save_images(
 
         time = times[t_index]
         writer.write_time(time_index, time)
-        for channel_idx in range(image_out2.shape[1]):
-            info = dataset.output_channels()[channel_idx]
+        for channel_idx in output_channel_indices:
+            info = output_channel_info[channel_idx]
             channel_name = info.name + info.level
             truth = image_tar2[0, channel_idx]
 
@@ -276,10 +295,11 @@ def save_images(
                     channel_name, time_index, predicted_uncertainty[channel_idx]
                 )
 
-        input_channel_info = dataset.input_channels()
-        for channel_idx in range(len(input_channel_info)):
-            info = input_channel_info[channel_idx]
-            channel_name = info.name + info.level
-            writer.write_input(channel_name, time_index, image_lr2[0, channel_idx])
-            if channel_idx == image_lr2.shape[1] - 1:
-                break
+        if save_inputs:
+            input_channel_info = dataset.input_channels()
+            for channel_idx in range(len(input_channel_info)):
+                info = input_channel_info[channel_idx]
+                channel_name = info.name + info.level
+                writer.write_input(channel_name, time_index, image_lr2[0, channel_idx])
+                if channel_idx == image_lr2.shape[1] - 1:
+                    break
