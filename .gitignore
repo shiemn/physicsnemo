@@ -165,6 +165,7 @@ nsight-systems*
 build/
 mlruns/
 checkpoints/
+.DS_Store
 
 # Hydra
 outputs/

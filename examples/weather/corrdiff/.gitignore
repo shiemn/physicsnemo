@@ -5,6 +5,7 @@ __pycache__/
 #Outputs
 tensorboard/
 wandb/
+output/
 outputs/
 *.xlsx
 *.csv
@@ -39,8 +40,13 @@ jobs/archive/
 *.db
 
 # Notebooks outputs
-notebooks/
+notebooks/*
+!notebooks/build_temporal_error_workbench.py
+!notebooks/build_temporal_process_analysis.py
 planning/
+
+# Local scratch and imported worktrees
+tmp/
 
 # Multi-checkpoint tools (user-specific checkpoint lists)
 multi_checkpoint_tools/
