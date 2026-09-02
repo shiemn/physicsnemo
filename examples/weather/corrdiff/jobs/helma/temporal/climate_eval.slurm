@@ -38,7 +38,7 @@ echo "Config: ${CONFIG}"
 echo "Run tag: ${RUN_TAG}"
 echo "Output: ${OUTPUT_DIR}/climate_chunk.nc"
 
-MASTER_PORT=$((29500 + SLURM_JOB_ID % 10000))
+MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 srun apptainer run --nv \
     --bind ${HNVME}:/data/ \
     --bind ${HNVME}/checkpoints/corrdiff:/checkpoints/ \

@@ -14,6 +14,8 @@
 #   europa    extract wuerzburg450_corrdiff_v2.zarr.zip to /scratch and override dataset.data_path
 # Override GPU count: sbatch --gres=gpu:h100:1 train.slurm <config>
 
+set -eo pipefail
+
 export http_proxy=http://proxy:80
 export https_proxy=http://proxy:80
 
@@ -32,7 +34,11 @@ USER_OVERRIDES=("$@")
 
 HNVME=/hnvme/workspace/b214cb11-helma-ecodata/downscaling
 NGPUS=$(nvidia-smi -L | wc -l)
+# Use the same job-based port as the other launchers to reduce node-local collisions.
+MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 HYDRA_OVERRIDES=()
+
+echo "MASTER_PORT: ${MASTER_PORT}"
 
 if [ "$DATA_MODE" = "--direct" ]; then
     echo "Data mode: direct (binding hnvme)"
@@ -66,5 +72,5 @@ srun --ntasks=1 apptainer run --nv \
     --bind ${HNVME}/checkpoints/corrdiff:/checkpoints/ \
     --bind ${HNVME}/outputs/corrdiff:/outputs/ \
     ${HNVME}/apptainer/corrdiff_ngc.sif \
-    torchrun --nproc_per_node=$NGPUS \
+    torchrun --nproc_per_node=$NGPUS --master_port=${MASTER_PORT} \
         $HOME/bjerknes/corrdiff/train.py --config-name $CONFIG "${HYDRA_OVERRIDES[@]}" "${USER_OVERRIDES[@]}"

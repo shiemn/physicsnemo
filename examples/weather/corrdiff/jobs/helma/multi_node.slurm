@@ -29,7 +29,8 @@ export APPTAINERENV_OMP_NUM_THREADS=16
 
 # Multi-node setup
 export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
-export MASTER_PORT=29500
+# Use the same job-based port as the other launchers to reduce node-local collisions.
+export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 export APPTAINERENV_MASTER_PORT=${MASTER_PORT}
 
 echo "MASTER_ADDR: ${MASTER_ADDR}"
