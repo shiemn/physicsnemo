@@ -1,0 +1,21 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/europa/temporal_comparison/base
+  - _self_
+
+run_tag: cross_crps_europa_common12h_sym3h_500k
+
+dataset:
+  temporal_inputs:
+    offsets: [-3, 0, 3]
+    boundary: drop
+    strict_time_step_hours: 1
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/temporal_regression/europa_channel_stack_3h/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/temporal_diffusion/europa_channel_stack_3h/checkpoints_diffusion/EDMPrecondSuperResolution.0.500096.mdlus

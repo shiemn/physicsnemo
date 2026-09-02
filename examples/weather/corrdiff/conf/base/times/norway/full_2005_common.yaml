@@ -1,0 +1,7 @@
+# @package generation
+# Complete 3-hourly 2005 analysis period with enough edge padding for all
+# current Norway temporal contexts, including past 12 h and symmetric +/-24 h.
+times_range:
+  - 2005-01-02T00:00:00
+  - 2005-12-30T21:00:00
+  - 3

@@ -1,0 +1,15 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/taiwan/timeseries_2021_base
+  - _self_
+
+run_tag: timeseries_taiwan_2021_common_baseline
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/taiwan_regression/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/taiwan_diffusion_cond/checkpoints_diffusion/EDMPrecondSuperResolution.0.12000000.mdlus

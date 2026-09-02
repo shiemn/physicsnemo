@@ -1,0 +1,19 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/norway/climate_signal_base
+  - _self_
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-3, 0]
+    boundary: drop
+    strict_time_step_hours: 3
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/temporal_regression/norway_past3h/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/tr_diff_temporal_past3h/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000000.mdlus

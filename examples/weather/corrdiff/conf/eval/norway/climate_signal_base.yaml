@@ -1,0 +1,74 @@
+# @package _global_
+# Single-member diffusion inference with streaming annual climate statistics.
+
+hydra:
+  job:
+    chdir: false
+    name: evaluate
+  run:
+    dir: ./outputs/${hydra:job.name}
+
+defaults:
+  - /dataset: custom
+  - /generation: non_patched
+  - _self_
+
+run_tag: ???
+
+wandb:
+  mode: disabled
+  project: CorrDiff-Climate-Signal
+  entity: shiemn
+  results_dir: ./wandb
+
+eval:
+  climate_only: true
+  predictions_file: null
+  log_regression: false
+  n_plot_events: 0
+  climate:
+    enabled: true
+    output_file: /outputs/climate_signal/${run_tag}/climate_chunk.nc
+    channel: precipitation
+    wet_day_threshold_mm: 1.0
+    expected_hours: [0, 3, 6, 9, 12, 15, 18, 21]
+    # HCLIM lacks 21 UTC on 31 December. Excluding both boundary dates gives
+    # identical complete-day support for all four temporal-context variants.
+    excluded_month_days: [01-01, 12-31]
+
+dataset:
+  type: norway
+  data_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  stats_path: /data/Norway/HCLIM3/preprocessed_large/NorCP_AROME_EC-EARTH
+  invariant_variables_path: /data/Norway/HCLIM3/
+  output_variables: [precipitation]
+  input_variables: [hus500, hus850, ua500, ua850, va500, va850, ta500, ta850]
+  invariant_variables: [elevation]
+  bounds: large
+  years: ???
+
+sampler:
+  type: stochastic
+  num_steps: 18
+  S_churn: 40
+  S_min: 0
+  S_max: .inf
+
+generation:
+  times_range: ???
+  inference_mode: all
+  num_ensembles: 1
+  seed_batch_size: 1
+  seed_mode: timestamp
+  seed_base: 0
+  hr_mean_conditioning: true
+  perf:
+    use_fp16: true
+    use_torch_compile: true
+  io:
+    reg_ckpt_filename: ???
+    res_ckpt_filename: ???
+    output_filename: /dev/null
+    guide_ckpt_filename: null
+  guidance_scale: 0.0
+  guidance_schedule_alpha: 0.0

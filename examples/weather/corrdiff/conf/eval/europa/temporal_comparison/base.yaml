@@ -1,0 +1,67 @@
+# @package _global_
+# Controlled 10-member Europe temporal-context comparison on a common axis.
+
+hydra:
+  job:
+    chdir: false
+    name: evaluate_europa_temporal_comparison
+  run:
+    dir: ./outputs/${hydra:job.name}
+
+defaults:
+  - /dataset: europa
+  - /generation: non_patched
+  - /times: europa/random512_common12h
+  - _self_
+
+run_tag: ???
+
+wandb:
+  mode: online
+  project: evaluation
+  entity: shiemn
+  results_dir: ./wandb
+
+eval:
+  output_json: eval_results.json
+  n_plot_events: 0
+  plot_events: null
+  plot_channels: [0, 1, 2, 3]
+  rapsd_dx_km: 3.0
+  predictions_file: auto
+  diagnostic_channel: precipitation_amount_1hr
+  spread_skill_bin_mode: quantile
+  per_channel_metrics: true
+  skip_conditional_metrics: true
+  twcrps_thresholds: []
+  log_regression: false
+
+dataset:
+  train: false
+  all_times: true
+
+sampler:
+  type: stochastic
+  num_steps: 18
+  S_churn: 0
+  S_min: 0
+  S_max: .inf
+
+generation:
+  inference_mode: all
+  num_ensembles: 10
+  seed_batch_size: 10
+  hr_mean_conditioning: true
+  distribution: normal
+  P_mean: 0.7499199835165111
+  P_std: 0.8440688577987278
+  perf:
+    use_fp16: true
+    use_torch_compile: true
+  io:
+    reg_ckpt_filename: ???
+    res_ckpt_filename: ???
+    output_filename: /dev/null
+    guide_ckpt_filename: null
+  guidance_scale: 0.0
+  guidance_schedule_alpha: 0.0

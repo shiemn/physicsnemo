@@ -1,0 +1,22 @@
+# Future-climate comparison of four temporal-context models whose regression and
+# diffusion components were each trained for 2M samples.
+
+compare:
+  output_dir: /outputs/paper_eval/model_comparison/future_conf_s43_diffusion_ladder
+  models:
+    - id: t0_diffusion
+      label: t0
+      color: "#6f6f6f"
+      result_dir: /outputs/paper_eval/future_conf_s43_t0_diffusion_epoch_balanced_paper
+    - id: past3h_diffusion
+      label: past3h
+      color: "#d55e00"
+      result_dir: /outputs/paper_eval/future_conf_s43_past3h_diffusion_epoch_balanced_paper
+    - id: sym3h_diffusion
+      label: sym3h
+      color: "#2a9d55"
+      result_dir: /outputs/paper_eval/future_conf_s43_sym3h_diffusion_epoch_balanced_paper
+    - id: past12h_diffusion
+      label: past12h
+      color: "#2878b5"
+      result_dir: /outputs/paper_eval/future_conf_s43_past12h_diffusion_epoch_balanced_paper

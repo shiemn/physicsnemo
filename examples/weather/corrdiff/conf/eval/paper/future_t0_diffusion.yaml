@@ -1,0 +1,19 @@
+# @package _global_
+# Offline paper-protocol analysis of five existing no-temporal prediction pools.
+# The regression and diffusion models were each trained for 2M samples.
+
+defaults:
+  - /eval/paper/base
+  - _self_
+
+run_tag: future_conf_s43_t0_diffusion_epoch_balanced_paper
+
+eval:
+  figure_title_context: Scandinavia future-confidence t0 diffusion
+  inputs:
+    - {epoch: current, label: current_2005, path: /outputs/eval/future_conf_s43_t0_diffusion_current_2005/predictions.nc}
+    - {epoch: mid, label: mid_start_2041_2042, path: /outputs/eval/future_conf_s43_t0_diffusion_mid_start_2041_2042/predictions.nc}
+    - {epoch: mid, label: mid_end_2059_2060, path: /outputs/eval/future_conf_s43_t0_diffusion_mid_end_2059_2060/predictions.nc}
+    - {epoch: end, label: end_start_2081_2082, path: /outputs/eval/future_conf_s43_t0_diffusion_end_start_2081_2082/predictions.nc}
+    - {epoch: end, label: end_end_2099_2100, path: /outputs/eval/future_conf_s43_t0_diffusion_end_end_2099_2100/predictions.nc}
+  target_set: conf/paper_targets/epoch_balanced_12.yaml

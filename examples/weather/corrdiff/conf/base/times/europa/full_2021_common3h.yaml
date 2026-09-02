@@ -1,0 +1,7 @@
+# @package generation
+# Complete held-out 2021 hourly period with edge padding removed so every
+# center is valid for symmetric +/-3 h context.
+times_range:
+  - 2021-01-01T03:00:00
+  - 2021-12-31T20:00:00
+  - 1

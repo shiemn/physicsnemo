@@ -523,7 +523,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", action="append", type=parse_model, required=True)
     parser.add_argument("--storm", action="append", choices=tuple(STORM_WINDOWS), default=[])
     parser.add_argument(
-        "--track-file", type=Path, default=Path("jma_best_track_2021_selected.txt")
+        "--track-file",
+        type=Path,
+        default=Path(__file__).with_name("data")
+        / "jma_best_track_2021_selected.txt",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/taiwan_typhoon_analysis"))
     parser.add_argument("--extract-output", type=Path)

@@ -1,0 +1,15 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/europa/temporal_comparison/base
+  - _self_
+
+run_tag: cross_crps_europa_common12h_baseline_500k
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/europa_regression_standard/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/europa_diffusion_standard/checkpoints_diffusion/EDMPrecondSuperResolution.0.500096.mdlus

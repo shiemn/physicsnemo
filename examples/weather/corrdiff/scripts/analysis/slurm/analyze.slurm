@@ -1,9 +1,9 @@
 #!/bin/bash -l
 #SBATCH -J Analysis
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --partition=cpu
 #SBATCH --cpus-per-task=48
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --output=output/analysis-%j.out
 #SBATCH --mail-type=FAILED,TIME_LIMIT,END
 #SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
@@ -14,6 +14,8 @@ usage() {
     echo "Usage:" >&2
     echo "  sbatch scripts/analysis/slurm/analyze.slurm annual <europa|taiwan>" >&2
     echo "  sbatch scripts/analysis/slurm/analyze.slurm europa-extremes" >&2
+    echo "  sbatch scripts/analysis/slurm/analyze.slurm climate-model <key> <label> <tag-prefix>" >&2
+    echo "  sbatch scripts/analysis/slurm/analyze.slurm climate-compare" >&2
     exit 2
 }
 
@@ -74,6 +76,27 @@ case "$ANALYSIS" in
             --model "Symmetric 1h=$EVAL_ROOT/timeseries_europa_2021_common_sym1h/predictions.nc"
             --model "Symmetric 3h=$EVAL_ROOT/timeseries_europa_2021_common_sym3h/predictions.nc"
         )
+        ;;
+    climate-model)
+        MODEL_KEY=${1:-}
+        MODEL_LABEL=${2:-}
+        TAG_PREFIX=${3:-}
+        [ -n "$MODEL_KEY" ] && [ -n "$MODEL_LABEL" ] && [ -n "$TAG_PREFIX" ] || usage
+        shift 3
+        [ "$#" -eq 0 ] || usage
+
+        SCRIPT="$CORRDIFF_DIR/scripts/analysis/climate_signal_ladder.py"
+        ARGS=(
+            model
+            --model-key "$MODEL_KEY"
+            --model-label "$MODEL_LABEL"
+            --tag-prefix "$TAG_PREFIX"
+        )
+        ;;
+    climate-compare)
+        [ "$#" -eq 0 ] || usage
+        SCRIPT="$CORRDIFF_DIR/scripts/analysis/climate_signal_ladder.py"
+        ARGS=(compare-ladder)
         ;;
     *)
         usage

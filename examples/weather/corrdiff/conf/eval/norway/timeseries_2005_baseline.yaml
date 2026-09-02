@@ -1,0 +1,16 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/norway/timeseries_2005_base
+  - _self_
+
+run_tag: timeseries_2005_common_baseline
+
+generation:
+  io:
+    # Exact checkpoint pair behind the documented no-temporal baseline row.
+    reg_ckpt_filename: /checkpoints/hp_reg_grid/reg_07_flexi_p125/checkpoints_regression/UNet.0.1700096.mdlus
+    res_ckpt_filename: /checkpoints/hp_diff_search/trial_7/checkpoints_diffusion/EDMPrecondSuperResolution.0.1000064.mdlus

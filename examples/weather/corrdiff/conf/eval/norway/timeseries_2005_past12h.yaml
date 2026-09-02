@@ -1,0 +1,21 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/norway/timeseries_2005_base
+  - _self_
+
+run_tag: timeseries_2005_common_past12h
+
+dataset:
+  temporal_inputs:
+    offset_hours: [-12, -6, -3, 0]
+    boundary: drop
+    strict_time_step_hours: 3
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/temporal_regression/norway_past12h/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/tr_diff_temporal_past12h/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000000.mdlus

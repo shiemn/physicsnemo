@@ -1,0 +1,69 @@
+# @package _global_
+# Compact streaming Taiwan diffusion time series on the common held-out 2021 axis.
+
+hydra:
+  job:
+    chdir: false
+    name: evaluate_taiwan_timeseries_2021
+  run:
+    dir: ./outputs/${hydra:job.name}
+
+defaults:
+  - /dataset: cwb
+  - /generation: non_patched
+  - /times: taiwan/full_2021_common3h
+  - _self_
+
+run_tag: ???
+
+wandb:
+  mode: online
+  project: evaluation
+  entity: shiemn
+  results_dir: ./wandb
+
+eval:
+  output_json: eval_results.json
+  n_plot_events: 0
+  plot_events: null
+  plot_channels: null
+  rapsd_dx_km: 3.0
+  predictions_file: auto
+  diagnostic_channel: maximum_radar_reflectivity
+  spread_skill_bin_mode: quantile
+  per_channel_metrics: true
+  skip_conditional_metrics: true
+  twcrps_thresholds: []
+  log_regression: false
+  stream_predictions: true
+  save_inputs: false
+  save_prediction_channels: [maximum_radar_reflectivity]
+  prediction_sync_interval: 32
+
+dataset:
+  data_path: /data/CorrDiff/cwa_dataset.zarr.zip
+  train: false
+  all_times: true
+
+sampler:
+  type: stochastic
+  num_steps: 18
+  S_churn: 0
+  S_min: 0
+  S_max: .inf
+
+generation:
+  inference_mode: all
+  num_ensembles: 2
+  seed_batch_size: 2
+  hr_mean_conditioning: true
+  perf:
+    use_fp16: true
+    use_torch_compile: true
+  io:
+    reg_ckpt_filename: ???
+    res_ckpt_filename: ???
+    output_filename: /dev/null
+    guide_ckpt_filename: null
+  guidance_scale: 0.0
+  guidance_schedule_alpha: 0.0

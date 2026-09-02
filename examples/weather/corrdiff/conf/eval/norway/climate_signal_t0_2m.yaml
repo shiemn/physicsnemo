@@ -1,0 +1,15 @@
+# @package _global_
+# Matched no-temporal climate-signal run: final 2M regression + 2M diffusion.
+
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/norway/climate_signal_base
+  - _self_
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/temporal_regression/norway_t0/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/tr_diff_t0_ladder/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000000.mdlus

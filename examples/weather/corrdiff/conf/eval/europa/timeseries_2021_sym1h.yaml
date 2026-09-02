@@ -1,0 +1,23 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /eval/europa/timeseries_2021_base
+  - _self_
+
+run_tag: timeseries_europa_2021_common_sym1h
+
+dataset:
+  temporal_inputs:
+    offsets: [-1, 0, 1]
+    boundary: drop
+    strict_time_step_hours: 1
+
+generation:
+  io:
+    reg_ckpt_filename: /checkpoints/temporal_regression/europa_channel_stack_1h/checkpoints_regression/UNet.0.2000128.mdlus
+    # The 1M checkpoint is the validated finite checkpoint; the unstable 2M
+    # checkpoint produced NaN diffusion outputs.
+    res_ckpt_filename: /checkpoints/temporal_diffusion/europa_channel_stack_1h/checkpoints_diffusion/EDMPrecondSuperResolution.0.1000064.mdlus

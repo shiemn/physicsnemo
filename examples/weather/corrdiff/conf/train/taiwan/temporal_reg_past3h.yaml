@@ -1,0 +1,52 @@
+# @package _global_
+# Normal-size Taiwan regression with past-only 3-hour context.
+
+hydra:
+  job:
+    chdir: false
+    name: tr_reg_temporal_taiwan_past3h
+  run:
+    dir: ./output/${hydra:job.name}
+  searchpath:
+    - pkg://conf/base
+
+defaults:
+  - /dataset: cwb
+  - /model: regression
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+
+dataset:
+  data_path: /data/cwa_dataset/cwa_dataset.zarr
+  temporal_inputs:
+    offsets: [-3, 0]
+    boundary: drop
+    strict_time_step_hours: 1
+
+training:
+  hp:
+    training_duration: 2000000
+    lr_rampup: 10000
+    total_batch_size: 256
+    batch_size_per_gpu: 4
+    lr: 2.0e-4
+  io:
+    checkpoint_dir: /checkpoints/taiwan_regression_past3h
+    print_progress_freq: 1000
+    save_checkpoint_freq: 100000
+    save_n_recent_checkpoints: -1
+    validation_freq: 5000
+    validation_steps: 10
+
+wandb:
+  mode: online
+  results_dir: ./wandb
+  watch_model: false
+  group: taiwan_temporal_context_ladder
+  tags:
+    - taiwan
+    - regression
+    - temporal_context:past_3h
+    - temporal_mixer:channel_stack
+    - offsets:-3,0
