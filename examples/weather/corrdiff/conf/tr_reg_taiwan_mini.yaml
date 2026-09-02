@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/taiwan/ and conf/train/europa/regression_mini.yaml.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Regression training for Taiwan (CWA/CWB) dataset — mini model size, no temporal conditioning.
 
 hydra:

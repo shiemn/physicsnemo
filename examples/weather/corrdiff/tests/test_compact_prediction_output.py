@@ -1,13 +1,9 @@
 from datetime import datetime
 from types import SimpleNamespace
-from pathlib import Path
-import sys
 
 import netCDF4 as nc
 import numpy as np
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from helpers.generate_helpers import save_images
 from physicsnemo.utils.corrdiff.utils import NetCDFWriter

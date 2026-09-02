@@ -1,12 +1,8 @@
 from datetime import datetime, timedelta
-from pathlib import Path
-import sys
 
 import netCDF4 as nc
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from helpers.climate_signal import ClimateAccumulator, timestamp_seeds
 

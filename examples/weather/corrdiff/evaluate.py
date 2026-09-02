@@ -68,21 +68,24 @@ from omegaconf import DictConfig, OmegaConf
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.launch.logging.wandb import initialize_wandb
-from physicsnemo.utils.corrdiff import get_time_from_range, regression_step, diffusion_step
+from physicsnemo.utils.corrdiff import regression_step, diffusion_step
 from physicsnemo.utils.corrdiff.utils import NetCDFWriter
 
 from datasets.dataset import register_dataset
 from helpers.generate_helpers import (
     build_sampler_fn,
+    generate_ensemble,
     get_dataset_and_sampler,
     load_model,
     load_models,
+    load_timestep_tensors,
     maybe_compile_models,
+    resolve_seed_batches,
+    resolve_times,
     save_images,
     setup_patching,
 )
-from helpers.dropout_residual import dropout_residual_step
-from helpers.climate_signal import ClimateAccumulator, timestamp_seeds
+from helpers.climate_signal import ClimateAccumulator
 from helpers.metrics import MetricsAccumulator
 from helpers.plots import (
     HistogramAccumulator,
@@ -277,6 +280,7 @@ def _load_predictions_netcdf(path: str) -> dict:
             n_ensemble:     int
             truth:          (T, C, H, W) numpy — stacked over channels
             prediction:     (N_ens, T, C, H, W) numpy
+            times:          list of decoded timestamps, or [] if undecodable
     """
     f = nc.Dataset(path, "r")
 
@@ -301,6 +305,24 @@ def _load_predictions_netcdf(path: str) -> dict:
     pred_arrays = [pred_group[ch][:] for ch in channel_names]  # list of (N, T, H, W)
     prediction = np.stack(pred_arrays, axis=2)  # (N, T, C, H, W)
 
+    # Decode timestamps so offline event plots can be labelled with the real
+    # time, exactly as the online path does. Lead-time files store strings;
+    # everything else stores cftime offsets. Labels are cosmetic, so a file
+    # written without usable times degrades to an empty list rather than
+    # failing the whole evaluation.
+    times = []
+    if "time" in f.variables:
+        time_v = f.variables["time"]
+        try:
+            if getattr(time_v, "dtype", None) == str or time_v.dtype.kind in "SU":
+                times = [str(t) for t in time_v[:]]
+            else:
+                times = list(
+                    nc.num2date(time_v[:], time_v.units, calendar=time_v.calendar)
+                )
+        except (AttributeError, ValueError, TypeError):
+            times = []
+
     f.close()
     return {
         "lat": lat,
@@ -310,6 +332,7 @@ def _load_predictions_netcdf(path: str) -> dict:
         "n_ensemble": prediction.shape[0],
         "truth": truth,
         "prediction": prediction,
+        "times": times,
     }
 
 
@@ -398,6 +421,13 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
             bin_mode=spread_skill_bin_mode,
         )
 
+    # Must mirror the online path's fallback (see main()): without this the
+    # offline rerun scores every channel while the first, online run scored
+    # only eval.metric_channels -- same config, different numbers.
+    metric_channels = cfg.eval.get("metric_channels", None)
+    if metric_channels is not None:
+        metric_channels = list(metric_channels)
+
     if metric_groups_cfg:
         _groups = {
             gname: {"channels": gcfg.get("channels"), "acc": _make_file_acc(gcfg)}
@@ -406,7 +436,7 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
     else:
         _groups = {
             None: {
-                "channels": None,
+                "channels": metric_channels,
                 "acc": MetricsAccumulator(
                     precip_threshold=precip_threshold,
                     device=device,
@@ -477,6 +507,10 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
     ))
 
     # Event plots
+    file_times = data.get("times") or []
+    plot_channels_cfg = cfg.eval.get("plot_channels", None)
+    if plot_channels_cfg is not None:
+        plot_channels_cfg = list(plot_channels_cfg)
     explicit_set = set(plot_events)
     sorted_cands = sorted(event_candidates, key=lambda x: -x[1])
     auto_set = {c[0] for c in sorted_cands[:n_plot_events]}
@@ -498,18 +532,26 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
             reg_mean_np = pred_ens_np.mean(axis=0)          # (C, H, W)
             max_precip = float(target_np.max())
 
+            time_label = (
+                str(file_times[time_idx])
+                if time_idx < len(file_times)
+                else str(time_idx)
+            )
             fig = plot_example_event(
                 pred_ens_np=pred_ens_np,
                 target_np=target_np,
                 reg_mean_np=reg_mean_np,
-                time_str=str(time_idx),
+                time_str=time_label,
                 channel_names=channel_names,
                 lat=lat_np,
                 lon=lon_np,
+                plot_channels=plot_channels_cfg,
             )
             wandb.log(
                 {
-                    "event/plot": wandb.Image(fig, caption=f"t{time_idx} max={max_precip:.1f}mm"),
+                    "event/plot": wandb.Image(
+                        fig, caption=f"t{time_idx} {time_label} max={max_precip:.1f}mm"
+                    ),
                     "event/time_idx": time_idx,
                     "event/max_precip_mm": max_precip,
                 },
@@ -535,8 +577,19 @@ def _run_single_timestep(
     hr_mean_conditioning: bool,
     diffusion_kwargs: dict,
     seed_batches,
+    nonnegative_channels: list[int] | None = None,
+    seed_mode: str = "fixed",
+    timestamp=None,
+    num_ensembles: int | None = None,
+    seed_base: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run regression + diffusion inference for a single timestep on one GPU.
+
+    Seeds and non-negative clamping are resolved exactly as in the main
+    evaluation loop, so the ensemble drawn here is the one that was scored.
+    Pass ``seed_mode``/``timestamp``/``num_ensembles``/``seed_base`` and
+    ``nonnegative_channels`` through from the caller; omitting them reproduces
+    the fixed-seed, unclamped behaviour.
 
     Returns:
         reg_mean_np:  (C, H, W) regression prediction in physical units (mm).
@@ -544,25 +597,9 @@ def _run_single_timestep(
                       as reg_mean_np if net_res is None.
         target_np:    (C, H, W) ground truth in physical units (mm).
     """
-    image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
-    if isinstance(image_tar, np.ndarray):
-        image_tar = torch.from_numpy(image_tar)
-    if isinstance(image_lr, np.ndarray):
-        image_lr = torch.from_numpy(image_lr)
-
-    image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
-    image_lr = (
-        image_lr.unsqueeze(0)
-        .to(device=device, dtype=torch.float32)
-        .to(memory_format=torch.channels_last)
+    image_tar, image_lr, lead_time_label = load_timestep_tensors(
+        dataset, dataset_idx, device
     )
-    if lead_time_label:
-        lt = lead_time_label[0]
-        if isinstance(lt, np.ndarray):
-            lt = torch.from_numpy(lt)
-        lead_time_label = lt.unsqueeze(0).to(device).contiguous()
-    else:
-        lead_time_label = None
 
     with torch.no_grad():
         image_reg = regression_step(
@@ -573,50 +610,40 @@ def _run_single_timestep(
         )
     reg_mean = image_reg[0:1]  # (1, C, H, W)
 
-    reg_mean_np = dataset.denormalize_output(reg_mean.cpu().numpy())[0]  # (C, H, W)
-    target_np = dataset.denormalize_output(image_tar.cpu().numpy())[0]   # (C, H, W)
+    def _to_physical(tensor):
+        """Denormalize then clamp, matching the metric path."""
+        array = dataset.denormalize_output(tensor.cpu().numpy())
+        clamped = _clamp_nonnegative_channels(
+            torch.from_numpy(array), nonnegative_channels
+        )
+        return clamped.numpy()
+
+    reg_mean_np = _to_physical(reg_mean)[0]      # (C, H, W)
+    target_np = _to_physical(image_tar)[0]       # (C, H, W)
 
     if net_res is not None and (use_dropout_residual or sampler_fn is not None):
-        mean_hr = reg_mean if hr_mean_conditioning else None
-        all_residuals = []
-        for seed_batch in seed_batches:
-            batch_size = len(seed_batch)
-            rank_batches = [torch.tensor(seed_batch)]
-            with torch.no_grad():
-                if use_dropout_residual:
-                    res = dropout_residual_step(
-                        net=net_res,
-                        img_lr=image_lr,
-                        latents_shape=(
-                            batch_size,
-                            img_out_channels,
-                            img_shape[0],
-                            img_shape[1],
-                        ),
-                        mean_hr=mean_hr,
-                        lead_time_label=lead_time_label,
-                        seed=int(seed_batch[0]) if len(seed_batch) else None,
-                    )
-                else:
-                    res = diffusion_step(
-                        net=net_res,
-                        sampler_fn=sampler_fn,
-                        img_shape=img_shape,
-                        img_out_channels=img_out_channels,
-                        rank_batches=rank_batches,
-                        img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
-                            memory_format=torch.channels_last
-                        ),
-                        rank=0,
-                        device=device,
-                        mean_hr=mean_hr,
-                        lead_time_label=lead_time_label,
-                        **diffusion_kwargs,
-                    )
-            all_residuals.append(res)
-        diffusion_residuals = torch.cat(all_residuals, dim=0)  # (N_ens, C, H, W)
-        ens_pred = reg_mean + diffusion_residuals               # (N_ens, C, H, W)
-        ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())  # (N_ens, C, H, W)
+        timestep_seed_batches = resolve_seed_batches(
+            seed_batches,
+            seed_mode=seed_mode,
+            timestamp=timestamp,
+            num_ensembles=num_ensembles,
+            seed_base=seed_base,
+        )
+        diffusion_residuals = generate_ensemble(
+            net_res=net_res,
+            sampler_fn=sampler_fn,
+            use_dropout_residual=use_dropout_residual,
+            image_lr=image_lr,
+            img_shape=img_shape,
+            img_out_channels=img_out_channels,
+            device=device,
+            mean_hr=reg_mean if hr_mean_conditioning else None,
+            lead_time_label=lead_time_label,
+            seed_batches=timestep_seed_batches,
+            diffusion_kwargs=diffusion_kwargs,
+        )
+        ens_pred = reg_mean + diffusion_residuals            # (N_ens, C, H, W)
+        ens_pred_np = _to_physical(ens_pred)                 # (N_ens, C, H, W)
     else:
         ens_pred_np = reg_mean_np[np.newaxis]  # (1, C, H, W)
 
@@ -775,21 +802,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # Dataset and eval timesteps
     # ------------------------------------------------------------------
-    has_times_range = (
-        hasattr(cfg.generation, "times_range")
-        and cfg.generation.times_range is not None
-    )
-    has_times = (
-        hasattr(cfg.generation, "times") and cfg.generation.times is not None
-    )
-    if has_times_range and has_times:
-        raise ValueError("Provide times_range or times, not both.")
-    elif has_times_range:
-        times = get_time_from_range(cfg.generation.times_range)
-    elif has_times:
-        times = list(cfg.generation.times)
-    else:
-        raise ValueError("Either times_range or times must be set in cfg.generation.")
+    times = resolve_times(cfg.generation)
 
     dataset_cfg = OmegaConf.to_container(cfg.dataset)
     register_dataset(cfg.dataset.type)
@@ -1112,25 +1125,9 @@ def main(cfg: DictConfig) -> None:
         )
 
         # Load data (normalized)
-        image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
-        if isinstance(image_tar, np.ndarray):
-            image_tar = torch.from_numpy(image_tar)
-        if isinstance(image_lr, np.ndarray):
-            image_lr = torch.from_numpy(image_lr)
-
-        image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
-        image_lr = (
-            image_lr.unsqueeze(0)
-            .to(device=device, dtype=torch.float32)
-            .to(memory_format=torch.channels_last)
+        image_tar, image_lr, lead_time_label = load_timestep_tensors(
+            dataset, dataset_idx, device
         )
-        if lead_time_label:
-            lt = lead_time_label[0]
-            if isinstance(lt, np.ndarray):
-                lt = torch.from_numpy(lt)
-            lead_time_label = lt.unsqueeze(0).to(device).contiguous()
-        else:
-            lead_time_label = None
 
         # -- Regression forward pass --
         with torch.no_grad():
@@ -1184,55 +1181,28 @@ def main(cfg: DictConfig) -> None:
         _any_diff_acc = any(g["diff_acc"] is not None for g in _groups.values())
         if net_res is not None and (_any_diff_acc or climate_enabled):
             mean_hr = reg_mean if cfg.generation.hr_mean_conditioning else None
-            all_residuals = []
-            timestep_seed_batches = seed_batches
-            if seed_mode == "timestamp":
-                timestep_seeds = timestamp_seeds(
-                    times[time_idx],
-                    n_members=num_ensembles,
-                    base_seed=seed_base,
-                )
-                timestep_seed_batches = np.array_split(
-                    timestep_seeds, num_seed_batches
-                )
-            for seed_batch in timestep_seed_batches:
-                batch_size = len(seed_batch)
-                rank_batches = [torch.tensor(seed_batch)]
-                with torch.no_grad():
-                    if use_dropout_residual:
-                        res = dropout_residual_step(
-                            net=net_res,
-                            img_lr=image_lr,
-                            latents_shape=(
-                                batch_size,
-                                img_out_channels,
-                                img_shape[0],
-                                img_shape[1],
-                            ),
-                            mean_hr=mean_hr,
-                            lead_time_label=lead_time_label,
-                            seed=int(seed_batch[0]) if len(seed_batch) else None,
-                        )
-                    else:
-                        res = diffusion_step(
-                            net=net_res,
-                            sampler_fn=sampler_fn,
-                            img_shape=img_shape,
-                            img_out_channels=img_out_channels,
-                            rank_batches=rank_batches,
-                            img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
-                                memory_format=torch.channels_last
-                            ),
-                            rank=0,
-                            device=device,
-                            mean_hr=mean_hr,
-                            lead_time_label=lead_time_label,
-                            **diffusion_kwargs,
-                        )
-                all_residuals.append(res)
+            timestep_seed_batches = resolve_seed_batches(
+                seed_batches,
+                seed_mode=seed_mode,
+                timestamp=times[time_idx],
+                num_ensembles=num_ensembles,
+                seed_base=seed_base,
+            )
+            diffusion_residuals = generate_ensemble(
+                net_res=net_res,
+                sampler_fn=sampler_fn,
+                use_dropout_residual=use_dropout_residual,
+                image_lr=image_lr,
+                img_shape=img_shape,
+                img_out_channels=img_out_channels,
+                device=device,
+                mean_hr=mean_hr,
+                lead_time_label=lead_time_label,
+                seed_batches=timestep_seed_batches,
+                diffusion_kwargs=diffusion_kwargs,
+            )
 
             # Full ensemble: regression mean + diffusion residuals
-            diffusion_residuals = torch.cat(all_residuals, dim=0)   # (N_ens, C, H, W)
             ens_pred = reg_mean + diffusion_residuals                # (N_ens, C, H, W)
 
             ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())
@@ -1501,6 +1471,13 @@ def main(cfg: DictConfig) -> None:
                     hr_mean_conditioning=cfg.generation.hr_mean_conditioning,
                     diffusion_kwargs=diffusion_kwargs,
                     seed_batches=seed_batches,
+                    # Match the metric path exactly: same seeds, same clamping,
+                    # so the plotted event is the ensemble that was scored.
+                    nonnegative_channels=nonnegative_channels,
+                    seed_mode=seed_mode,
+                    timestamp=times[time_idx] if time_idx < len(times) else None,
+                    num_ensembles=num_ensembles,
+                    seed_base=seed_base,
                 )
 
                 time_label = str(times[time_idx]) if time_idx < len(times) else str(time_idx)

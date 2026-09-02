@@ -8,7 +8,9 @@ wandb/
 output/
 outputs/
 *.xlsx
-*.csv
+# Root-level only: scripts dump CSVs here. Deliberately NOT recursive, so
+# fixtures and reference data (e.g. scripts/analysis/data/) stay trackable.
+/*.csv
 docs/
 *.aux
 ~$*
@@ -27,10 +29,8 @@ docs/results_deck/paper_eval_selected/
 docs/temporal_context_review.pptx
 
 
-# HP Search generated outputs
-hp_search/visualizations/
-hp_search/slurm/logs/
-hp_search/archive/
+# HP search infra (removed from git in this branch; files remain on disk)
+hp_search/
 
 # Archived/obsolete scripts
 jobs/archive/
@@ -40,9 +40,7 @@ jobs/archive/
 *.db
 
 # Notebooks outputs
-notebooks/*
-!notebooks/build_temporal_error_workbench.py
-!notebooks/build_temporal_process_analysis.py
+notebooks/
 planning/
 
 # Local scratch and imported worktrees

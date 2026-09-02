@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/eval/taiwan/.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Regression-only evaluation for Taiwan (CWB) dataset — no temporal conditioning.
 # Shared by any non-temporal CWB regression model; pass checkpoint as CLI override.
 #

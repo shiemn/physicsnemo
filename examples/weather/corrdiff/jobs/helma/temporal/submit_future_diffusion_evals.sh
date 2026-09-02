@@ -68,7 +68,7 @@ for model in "${MODELS[@]}"; do
       jobs/helma/eval.slurm
       "${MODEL_CONFIG[$model]}"
       "${tag}"
-      "times=${PERIOD_TIMES[$period]}"
+      "times=future_confidence/${PERIOD_TIMES[$period]}"
       "dataset.years=[${PERIOD_YEARS[$period]}]"
       "generation.io.reg_ckpt_filename=${MODEL_REG[$model]}"
       "generation.io.res_ckpt_filename=${MODEL_DIFF[$model]}"

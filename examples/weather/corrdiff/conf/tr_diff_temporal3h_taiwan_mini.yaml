@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/taiwan/temporal_diff_3h.yaml.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Diffusion training for Taiwan (CWB) — conditioned on mini temporal 3h regression.
 # Same as tr_diff_temporal_taiwan_mini but with 3-hour context offsets.
 

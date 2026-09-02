@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by the *_smoke.yaml configs in conf/train/norway_temporal/.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Norway symmetric 3-hour temporal regression smoke test.
 # Uses one local batch of 4 samples per optimizer step for a short direct run.
 

@@ -1,10 +1,6 @@
 import datetime
-import sys
-from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datasets.base import ChannelMetadata, DownscalingDataset
 from datasets.dataset import TemporalInputDataset, maybe_wrap_temporal_inputs

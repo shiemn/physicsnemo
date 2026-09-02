@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/norway_temporal/sym6h_only.yaml.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Norway symmetric 6-hour temporal regression.
 
 defaults:

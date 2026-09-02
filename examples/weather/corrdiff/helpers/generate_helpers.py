@@ -17,16 +17,23 @@
 import datetime
 from functools import partial
 
+import numpy as np
 import torch
 import torch._dynamo
 from hydra.utils import to_absolute_path
 
 from physicsnemo import Module
+from physicsnemo.utils.corrdiff import (
+    diffusion_step,
+    get_time_from_range,
+)
 from physicsnemo.utils.diffusion import convert_datetime_to_cftime, deterministic_sampler
 from physicsnemo.utils.patching import GridPatching2D
 
 from datasets.dataset import init_dataset_from_config
 from datasets.base import DownscalingDataset
+from helpers.climate_signal import timestamp_seeds
+from helpers.dropout_residual import dropout_residual_step
 
 
 # ---------------------------------------------------------------------------
@@ -303,3 +310,225 @@ def save_images(
                 writer.write_input(channel_name, time_index, image_lr2[0, channel_idx])
                 if channel_idx == image_lr2.shape[1] - 1:
                     break
+
+
+# ---------------------------------------------------------------------------
+# Evaluation timestamp resolution
+# ---------------------------------------------------------------------------
+
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+
+
+def resolve_times(generation_cfg):
+    """Resolve the evaluation timestamps from a ``generation`` config node.
+
+    Accepts one of two mutually exclusive sources:
+
+    ``times``
+        An explicit list of ``%Y-%m-%dT%H:%M:%S`` timestamps.
+    ``times_range``
+        ``[start, end, step_hours]``, expanded by ``get_time_from_range``.
+
+    Either may be narrowed by an optional ``times_exclude``: a list of
+    ``[start, end]`` windows, both endpoints inclusive, dropped after
+    expansion. This lets a mostly-contiguous evaluation period be expressed as
+    a range plus its data gaps instead of thousands of literal timestamps, and
+    keeps the *reason* for each gap documentable next to it.
+
+    Args:
+        generation_cfg: the ``cfg.generation`` node.
+
+    Returns:
+        list[str]: timestamps in ``TIME_FORMAT``, ascending.
+    """
+    has_times_range = (
+        hasattr(generation_cfg, "times_range")
+        and generation_cfg.times_range is not None
+    )
+    has_times = hasattr(generation_cfg, "times") and generation_cfg.times is not None
+
+    if has_times_range and has_times:
+        raise ValueError(
+            "Specify either generation.times_range or generation.times, not both."
+        )
+    if has_times_range:
+        times = list(get_time_from_range(generation_cfg.times_range))
+    elif has_times:
+        times = [str(t) for t in generation_cfg.times]
+    else:
+        raise ValueError(
+            "Either generation.times_range or generation.times must be set."
+        )
+
+    excluded = getattr(generation_cfg, "times_exclude", None)
+    if not excluded:
+        return times
+
+    windows = []
+    for i, window in enumerate(excluded):
+        window = list(window)
+        if len(window) != 2:
+            raise ValueError(
+                f"generation.times_exclude[{i}] must be [start, end], got {window!r}"
+            )
+        start, end = (
+            datetime.datetime.strptime(str(bound), TIME_FORMAT) for bound in window
+        )
+        if start > end:
+            raise ValueError(
+                f"generation.times_exclude[{i}] has start after end: {window!r}"
+            )
+        windows.append((start, end))
+
+    kept = []
+    for stamp in times:
+        moment = datetime.datetime.strptime(stamp, TIME_FORMAT)
+        if not any(start <= moment <= end for start, end in windows):
+            kept.append(stamp)
+    if not kept:
+        raise ValueError("generation.times_exclude removed every evaluation timestep.")
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Per-timestep inference
+# ---------------------------------------------------------------------------
+
+
+def load_timestep_tensors(dataset, dataset_idx: int, device):
+    """Fetch one dataset item and move it onto ``device`` as batched tensors.
+
+    Args:
+        dataset: the downscaling dataset.
+        dataset_idx: index into ``dataset``.
+        device: target torch device.
+
+    Returns:
+        tuple: ``(image_tar, image_lr, lead_time_label)`` where the first two are
+        ``(1, C, H, W)`` float32 tensors (``image_lr`` in channels-last) and
+        ``lead_time_label`` is a batched tensor or ``None``.
+    """
+    image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
+    if isinstance(image_tar, np.ndarray):
+        image_tar = torch.from_numpy(image_tar)
+    if isinstance(image_lr, np.ndarray):
+        image_lr = torch.from_numpy(image_lr)
+
+    image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
+    image_lr = (
+        image_lr.unsqueeze(0)
+        .to(device=device, dtype=torch.float32)
+        .to(memory_format=torch.channels_last)
+    )
+    if lead_time_label:
+        label = lead_time_label[0]
+        if isinstance(label, np.ndarray):
+            label = torch.from_numpy(label)
+        lead_time_label = label.unsqueeze(0).to(device).contiguous()
+    else:
+        lead_time_label = None
+
+    return image_tar, image_lr, lead_time_label
+
+
+def resolve_seed_batches(
+    seed_batches,
+    *,
+    seed_mode: str = "fixed",
+    timestamp=None,
+    num_ensembles: int | None = None,
+    seed_base: int = 0,
+):
+    """Return the seed batches to use for one timestep.
+
+    With ``seed_mode="fixed"`` the caller's batches are reused for every
+    timestep. With ``"timestamp"`` the seeds are derived from ``timestamp``, so
+    each timestep draws a different ensemble.
+
+    Every consumer of a timestep -- metrics, climate accumulation, saved
+    predictions, and the example-event figures -- must resolve seeds through
+    this function, or the plotted ensemble will not be the scored one.
+
+    Args:
+        seed_batches: the fixed batches, as produced by ``np.array_split``.
+        seed_mode: ``"fixed"`` or ``"timestamp"``.
+        timestamp: the timestep's time, required for ``"timestamp"``.
+        num_ensembles: ensemble size, required for ``"timestamp"``.
+        seed_base: offset applied to timestamp-derived seeds.
+
+    Returns:
+        list: seed batches for this timestep.
+    """
+    if seed_mode not in {"fixed", "timestamp"}:
+        raise ValueError("seed_mode must be 'fixed' or 'timestamp'")
+    if seed_mode == "fixed":
+        return seed_batches
+    if timestamp is None or num_ensembles is None:
+        raise ValueError(
+            "seed_mode='timestamp' requires both timestamp and num_ensembles"
+        )
+    seeds = timestamp_seeds(
+        timestamp, n_members=num_ensembles, base_seed=seed_base
+    )
+    return np.array_split(seeds, len(seed_batches))
+
+
+def generate_ensemble(
+    *,
+    net_res,
+    sampler_fn,
+    use_dropout_residual: bool,
+    image_lr,
+    img_shape,
+    img_out_channels: int,
+    device,
+    mean_hr,
+    lead_time_label,
+    seed_batches,
+    diffusion_kwargs: dict,
+):
+    """Sample residual ensemble members for one timestep.
+
+    Runs either the dropout-residual or the diffusion sampler once per seed
+    batch and concatenates the members.
+
+    Returns:
+        torch.Tensor: ``(N_ens, C, H, W)`` residuals, still normalized.
+    """
+    all_residuals = []
+    for seed_batch in seed_batches:
+        batch_size = len(seed_batch)
+        with torch.no_grad():
+            if use_dropout_residual:
+                residual = dropout_residual_step(
+                    net=net_res,
+                    img_lr=image_lr,
+                    latents_shape=(
+                        batch_size,
+                        img_out_channels,
+                        img_shape[0],
+                        img_shape[1],
+                    ),
+                    mean_hr=mean_hr,
+                    lead_time_label=lead_time_label,
+                    seed=int(seed_batch[0]) if len(seed_batch) else None,
+                )
+            else:
+                residual = diffusion_step(
+                    net=net_res,
+                    sampler_fn=sampler_fn,
+                    img_shape=img_shape,
+                    img_out_channels=img_out_channels,
+                    rank_batches=[torch.tensor(seed_batch)],
+                    img_lr=image_lr.expand(batch_size, -1, -1, -1).to(
+                        memory_format=torch.channels_last
+                    ),
+                    rank=0,
+                    device=device,
+                    mean_hr=mean_hr,
+                    lead_time_label=lead_time_label,
+                    **diffusion_kwargs,
+                )
+        all_residuals.append(residual)
+
+    return torch.cat(all_residuals, dim=0)

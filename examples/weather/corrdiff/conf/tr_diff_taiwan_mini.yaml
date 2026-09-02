@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/europa/diffusion_mini.yaml.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Diffusion training for Taiwan (CWB) — conditioned on mini non-temporal regression.
 
 hydra:

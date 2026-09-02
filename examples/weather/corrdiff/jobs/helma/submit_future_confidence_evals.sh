@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Submit the extra random-draw future-period regression evals.
 #
-# Assumes docs/generate_future_time_configs.py has been run and synced first.
+# Assumes scripts/generate_future_time_configs.py has been run and synced first.
 # Seed 42 is the already-completed draw; default submits only seeds 43..46.
 
 set -euo pipefail

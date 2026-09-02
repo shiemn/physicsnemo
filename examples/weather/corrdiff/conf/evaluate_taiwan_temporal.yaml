@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/eval/taiwan/temporal_comparison/.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Full diffusion evaluation for Taiwan (CWB) — with temporal conditioning.
 # For models trained with temporal_inputs offsets [-1, 0, 1].
 #

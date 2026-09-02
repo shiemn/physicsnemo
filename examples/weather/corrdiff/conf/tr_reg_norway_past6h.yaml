@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/norway_temporal/.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Norway past-only 6-hour temporal regression.
 
 defaults:

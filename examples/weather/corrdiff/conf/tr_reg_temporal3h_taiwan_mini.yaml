@@ -1,3 +1,5 @@
+# UNREFERENCED: nothing outside this file names it -- superseded by conf/train/taiwan/temporal_reg_3h.yaml.
+# Kept for provenance of past runs; prefer the replacement for new work.
 # Temporal regression training for Taiwan (CWA/CWB) — mini model, 3-hour offsets.
 # Same as tr_reg_temporal_taiwan_mini but with strict_time_step_hours: 3 (context at -3h, 0h, +3h).
 

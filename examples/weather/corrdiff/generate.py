@@ -79,7 +79,6 @@ from physicsnemo.experimental.models.diffusion.preconditioning import tEDMPrecon
 from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.corrdiff import (
     NetCDFWriter,
-    get_time_from_range,
     regression_step,
     diffusion_step,
 )
@@ -93,7 +92,9 @@ from helpers.generate_helpers import (
     get_dataset_and_sampler,
     load_model,
     load_models,
+    load_timestep_tensors,
     maybe_compile_models,
+    resolve_times,
     save_images,
     setup_patching,
 )
@@ -101,6 +102,11 @@ from helpers.dropout_residual import dropout_residual_step
 from helpers.metrics import MetricsAccumulator
 
 
+# NOTE: conf/generate_norwayW.yaml was removed in 526b124 and no generation config
+# remains under conf/, so this default does not resolve and generate.py cannot be
+# launched as-is (jobs/helma/generate.slurm has nothing valid to pass either).
+# Left as-is deliberately; restore a config here if ensemble-parallel generation,
+# autoguidance, or the uncertainty maps are needed again.
 @hydra.main(version_base="1.2", config_path="conf", config_name="generate_norwayW")
 def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------ setup
@@ -116,16 +122,7 @@ def main(cfg: DictConfig) -> None:
         torch.distributed.barrier()
 
     # ------------------------------------------------------------------ times
-    has_times_range = hasattr(cfg.generation, "times_range") and cfg.generation.times_range is not None
-    has_times = hasattr(cfg.generation, "times") and cfg.generation.times is not None
-    if has_times_range and has_times:
-        raise ValueError("Specify either generation.times_range or generation.times, not both.")
-    elif has_times_range:
-        times = get_time_from_range(cfg.generation.times_range)
-    elif has_times:
-        times = cfg.generation.times
-    else:
-        raise ValueError("generation.times_range or generation.times is required.")
+    times = resolve_times(cfg.generation)
 
     # ----------------------------------------------------------------- dataset
     register_dataset(cfg.dataset.type)
@@ -356,22 +353,9 @@ def main(cfg: DictConfig) -> None:
                 if time_idx >= total_times:
                     continue
                 dataset_idx = sampler[time_idx]
-                image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
-                if isinstance(image_tar, np.ndarray):
-                    image_tar = torch.from_numpy(image_tar)
-                if isinstance(image_lr, np.ndarray):
-                    image_lr = torch.from_numpy(image_lr)
-                image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
-                image_lr = image_lr.unsqueeze(0).to(device=device, dtype=torch.float32).to(
-                    memory_format=torch.channels_last
+                image_tar, image_lr, lead_time_label = load_timestep_tensors(
+                    dataset, dataset_idx, device
                 )
-                if lead_time_label:
-                    ltl = lead_time_label[0]
-                    if isinstance(ltl, np.ndarray):
-                        ltl = torch.from_numpy(ltl)
-                    lead_time_label = ltl.unsqueeze(0).to(device).contiguous()
-                else:
-                    lead_time_label = None
 
                 image_out = generate_for_time(image_lr, lead_time_label, config_sampler_fn)
                 pred_t = torch.from_numpy(dataset.denormalize_output(image_out.cpu().numpy())).to(device)
@@ -488,22 +472,9 @@ def main(cfg: DictConfig) -> None:
 
             if has_work:
                 dataset_idx = sampler[time_idx]
-                image_tar, image_lr, *lead_time_label = dataset[dataset_idx]
-                if isinstance(image_tar, np.ndarray):
-                    image_tar = torch.from_numpy(image_tar)
-                if isinstance(image_lr, np.ndarray):
-                    image_lr = torch.from_numpy(image_lr)
-                image_tar = image_tar.unsqueeze(0).to(device=device, dtype=torch.float32)
-                image_lr = image_lr.unsqueeze(0).to(device=device, dtype=torch.float32).to(
-                    memory_format=torch.channels_last
+                image_tar, image_lr, lead_time_label = load_timestep_tensors(
+                    dataset, dataset_idx, device
                 )
-                if lead_time_label:
-                    ltl = lead_time_label[0]
-                    if isinstance(ltl, np.ndarray):
-                        ltl = torch.from_numpy(ltl)
-                    lead_time_label = ltl.unsqueeze(0).to(device).contiguous()
-                else:
-                    lead_time_label = None
 
                 logger.info(f"[GPU {dist.rank}] time_idx={time_idx}, time={times_list[time_idx]}")
                 image_out = generate_for_time(image_lr, lead_time_label)
