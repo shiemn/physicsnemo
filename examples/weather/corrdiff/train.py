@@ -88,6 +88,7 @@ from helpers.train_helpers import (
     is_time_for_periodic_task,
 )
 from helpers.custom_losses import IntensityResidualLoss, CalibratedResidualLoss, CalibratedResidualLossV2
+from helpers.direct_diffusion import DirectEDMLoss
 from helpers.dropout_residual import DropoutResidualCRPSLoss
 from helpers.custom_tweedie_losses import FlexiLoss
 from helpers.preconditioning import (
@@ -701,12 +702,19 @@ def main(cfg: DictConfig) -> None:
             loss_init_kwargs["sigma_data"] = sigma_data
         
         loss_function = cfg.model.get("hp", {}).get("loss_function", None)
-        if loss_function == None:
+        if regression_net is None:
+            if cfg.model.hr_mean_conditioning:
+                raise ValueError("Direct diffusion requires model.hr_mean_conditioning=false")
+            if residual_loss is not ResidualLoss or loss_function is not None or patching is not None:
+                raise ValueError("Direct diffusion supports the standard full-domain Gaussian EDM loss only")
+            logger0.info("Training direct diffusion on normalized targets (no regression)")
+            loss_fn = DirectEDMLoss(**loss_init_kwargs)
+        elif loss_function == None:
             loss_fn = residual_loss(
-            regression_net=regression_net,
-            hr_mean_conditioning=cfg.model.hr_mean_conditioning,
-            **loss_init_kwargs,
-        )
+                regression_net=regression_net,
+                hr_mean_conditioning=cfg.model.hr_mean_conditioning,
+                **loss_init_kwargs,
+            )
         elif loss_function == "IntensityResidualLoss":
             logger0.info("Using custom IntensityResidualLoss")
             loss_fn = IntensityResidualLoss(

@@ -1,0 +1,18 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+defaults:
+  - base
+  - _self_
+target: radar
+stage: direct
+dataset:
+  out_channels: [0]
+generation:
+  inference_mode: diffusion
+  hr_mean_conditioning: false
+  io:
+    reg_ckpt_filename: null
+eval:
+  log_regression: false

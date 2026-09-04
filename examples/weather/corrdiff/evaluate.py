@@ -379,8 +379,8 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
         )
         return
 
-    # Determine if regression-only (1 member) or ensemble
-    is_regression = n_ens == 1
+    # A one-member diffusion sample is still a diffusion prediction.
+    is_regression = cfg.generation.inference_mode == "regression"
 
     # W&B init
     initialize_wandb(
@@ -529,7 +529,7 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
                 continue
             pred_ens_np = data["prediction"][:, time_idx]  # (N_ens, C, H, W)
             target_np = data["truth"][time_idx]             # (C, H, W)
-            reg_mean_np = pred_ens_np.mean(axis=0)          # (C, H, W)
+            reg_mean_np = pred_ens_np[0] if is_regression else None
             max_precip = float(target_np.max())
 
             time_label = (
@@ -582,7 +582,7 @@ def _run_single_timestep(
     timestamp=None,
     num_ensembles: int | None = None,
     seed_base: int = 0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
     """Run regression + diffusion inference for a single timestep on one GPU.
 
     Seeds and non-negative clamping are resolved exactly as in the main
@@ -592,7 +592,7 @@ def _run_single_timestep(
     the fixed-seed, unclamped behaviour.
 
     Returns:
-        reg_mean_np:  (C, H, W) regression prediction in physical units (mm).
+        reg_mean_np:  (C, H, W) regression prediction, or None for direct diffusion.
         ens_pred_np:  (N_ens, C, H, W) full ensemble in physical units, or same
                       as reg_mean_np if net_res is None.
         target_np:    (C, H, W) ground truth in physical units (mm).
@@ -601,14 +601,17 @@ def _run_single_timestep(
         dataset, dataset_idx, device
     )
 
-    with torch.no_grad():
-        image_reg = regression_step(
-            net=net_reg,
-            img_lr=image_lr,
-            latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
-            lead_time_label=lead_time_label,
-        )
-    reg_mean = image_reg[0:1]  # (1, C, H, W)
+    reg_mean = None
+    if net_reg is not None:
+        with torch.no_grad():
+            reg_mean = regression_step(
+                net=net_reg,
+                img_lr=image_lr,
+                latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+                lead_time_label=lead_time_label,
+            )[0:1]
+    elif hr_mean_conditioning:
+        raise ValueError("Direct diffusion requires hr_mean_conditioning=false")
 
     def _to_physical(tensor):
         """Denormalize then clamp, matching the metric path."""
@@ -618,7 +621,7 @@ def _run_single_timestep(
         )
         return clamped.numpy()
 
-    reg_mean_np = _to_physical(reg_mean)[0]      # (C, H, W)
+    reg_mean_np = _to_physical(reg_mean)[0] if reg_mean is not None else None      # (C, H, W)
     target_np = _to_physical(image_tar)[0]       # (C, H, W)
 
     if net_res is not None and (use_dropout_residual or sampler_fn is not None):
@@ -642,7 +645,9 @@ def _run_single_timestep(
             seed_batches=timestep_seed_batches,
             diffusion_kwargs=diffusion_kwargs,
         )
-        ens_pred = reg_mean + diffusion_residuals            # (N_ens, C, H, W)
+        ens_pred = (
+            diffusion_residuals if reg_mean is None else reg_mean + diffusion_residuals
+        )
         ens_pred_np = _to_physical(ens_pred)                 # (N_ens, C, H, W)
     else:
         ens_pred_np = reg_mean_np[np.newaxis]  # (1, C, H, W)
@@ -667,11 +672,15 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     run_tag = cfg.get("run_tag", "eval")
     inference_mode = cfg.generation.inference_mode
-    if inference_mode not in ("regression", "all"):
+    if inference_mode not in ("regression", "diffusion", "all"):
         raise ValueError(
             f'Unsupported inference_mode={inference_mode!r}. '
-            f'Must be "regression" or "all" (regression + diffusion).'
+            f'Must be "regression", "diffusion", or "all" (regression + diffusion).'
         )
+    has_regression = inference_mode in ("regression", "all")
+    has_diffusion = inference_mode in ("diffusion", "all")
+    if not has_regression and cfg.generation.hr_mean_conditioning:
+        raise ValueError("Direct diffusion requires generation.hr_mean_conditioning=false")
     num_ensembles = cfg.generation.num_ensembles
     seed_batch_size = cfg.generation.seed_batch_size
     climate_cfg_raw = cfg.eval.get("climate", None)
@@ -721,7 +730,7 @@ def main(cfg: DictConfig) -> None:
         else None
     )
     per_channel_metrics = cfg.eval.get("per_channel_metrics", False)
-    log_regression = cfg.eval.get("log_regression", True)
+    log_regression = has_regression and cfg.eval.get("log_regression", True)
     plot_channels_cfg = cfg.eval.get("plot_channels", None)
     if plot_channels_cfg is not None:
         plot_channels_cfg = list(plot_channels_cfg)
@@ -731,7 +740,7 @@ def main(cfg: DictConfig) -> None:
     # path from the config (not the loaded model).
     if predictions_file_cfg == "auto":
         # Use diffusion checkpoint if available, otherwise regression
-        if inference_mode == "all":
+        if has_diffusion:
             _ckpt = cfg.generation.io.res_ckpt_filename
         else:
             _ckpt = cfg.generation.io.reg_ckpt_filename
@@ -958,8 +967,8 @@ def main(cfg: DictConfig) -> None:
     logger0.info("Loading models...")
     net_reg, net_res = load_models(
         cfg, device,
-        load_net_reg=True,
-        load_net_res=(inference_mode == "all"),
+        load_net_reg=has_regression,
+        load_net_res=has_diffusion,
         edm2_kwargs=edm2_kwargs,
     )
     net_guide = None
@@ -1018,7 +1027,7 @@ def main(cfg: DictConfig) -> None:
             gname: {
                 "channels": gcfg.get("channels"),  # list[int] or None = all
                 "reg_acc": _make_acc(gcfg, skip_ss=True),
-                "diff_acc": _make_acc(gcfg, skip_ss=False) if inference_mode == "all" else None,
+                "diff_acc": _make_acc(gcfg, skip_ss=False) if has_diffusion else None,
             }
             for gname, gcfg in metric_groups_cfg.items()
         }
@@ -1027,7 +1036,7 @@ def main(cfg: DictConfig) -> None:
             None: {  # None key → legacy prefix structure (no group sub-key)
                 "channels": metric_channels,
                 "reg_acc": _make_acc({}, skip_ss=True),
-                "diff_acc": _make_acc({}, skip_ss=False) if inference_mode == "all" else None,
+                "diff_acc": _make_acc({}, skip_ss=False) if has_diffusion else None,
             }
         }
 
@@ -1038,10 +1047,10 @@ def main(cfg: DictConfig) -> None:
     # Histogram and RAPSD accumulators
     hist_acc_reg = HistogramAccumulator(device=device)
     rapsd_acc_reg = RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
-    hist_acc_diff = HistogramAccumulator(device=device) if inference_mode == "all" else None
+    hist_acc_diff = HistogramAccumulator(device=device) if has_diffusion else None
     rapsd_acc_diff = (
         RAPSDAccumulator(img_shape=img_shape, dx_km=rapsd_dx_km, device=device)
-        if inference_mode == "all"
+        if has_diffusion
         else None
     )
 
@@ -1129,36 +1138,36 @@ def main(cfg: DictConfig) -> None:
             dataset, dataset_idx, device
         )
 
-        # -- Regression forward pass --
-        with torch.no_grad():
-            try:
-                image_reg = regression_step(
-                    net=net_reg,
-                    img_lr=image_lr,
-                    latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
-                    lead_time_label=lead_time_label,
-                )
-            except (RuntimeError, Exception) as _e:
-                _msg = str(_e)
-                if "channels" in _msg and image_lr is not None:
-                    n_got = image_lr.shape[1]
-                    raise RuntimeError(
-                        f"Regression model received {n_got} input channels but "
-                        f"expected a different number. If the model was trained with "
-                        f"temporal inputs, add 'dataset.temporal_inputs' to your eval "
-                        f"config (e.g. use --config-name=evaluate_temporal_reg). "
-                        f"Original error: {_e}"
-                    ) from _e
-                raise
-        reg_mean = image_reg[0:1]  # (1, C, H, W)
-
-        # Denormalize regression prediction and target
-        reg_pred_np = dataset.denormalize_output(reg_mean.cpu().numpy())          # (1, C, H, W)
-        tar_np = dataset.denormalize_output(image_tar.cpu().numpy())              # (1, C, H, W)
-        reg_pred_t = torch.from_numpy(reg_pred_np).to(device)                     # (1, C, H, W)
-        tar_t = torch.from_numpy(tar_np).to(device)                               # (1, C, H, W)
-        reg_pred_t = _clamp_nonnegative_channels(reg_pred_t, nonnegative_channels)
-        tar_t = _clamp_nonnegative_channels(tar_t, nonnegative_channels)
+        reg_mean = None
+        if has_regression:
+            # -- Regression forward pass --
+            with torch.no_grad():
+                try:
+                    image_reg = regression_step(
+                        net=net_reg,
+                        img_lr=image_lr,
+                        latents_shape=(1, img_out_channels, img_shape[0], img_shape[1]),
+                        lead_time_label=lead_time_label,
+                    )
+                except (RuntimeError, Exception) as _e:
+                    _msg = str(_e)
+                    if "channels" in _msg and image_lr is not None:
+                        n_got = image_lr.shape[1]
+                        raise RuntimeError(
+                            f"Regression model received {n_got} input channels but "
+                            f"expected a different number. If the model was trained with "
+                            f"temporal inputs, add 'dataset.temporal_inputs' to your eval "
+                            f"config (e.g. use --config-name=evaluate_temporal_reg). "
+                            f"Original error: {_e}"
+                        ) from _e
+                    raise
+            reg_mean = image_reg[0:1]  # (1, C, H, W)
+        tar_np = dataset.denormalize_output(image_tar.cpu().numpy())
+        tar_t = _clamp_nonnegative_channels(torch.from_numpy(tar_np).to(device), nonnegative_channels)
+        reg_pred_t = None
+        if reg_mean is not None:
+            reg_pred_np = dataset.denormalize_output(reg_mean.cpu().numpy())
+            reg_pred_t = _clamp_nonnegative_channels(torch.from_numpy(reg_pred_np).to(device), nonnegative_channels)
 
         if not climate_only:
             # Regression metrics: update each group's accumulator with its channel subset
@@ -1168,16 +1177,17 @@ def main(cfg: DictConfig) -> None:
                     r = reg_pred_t[:, ch] if ch is not None else reg_pred_t
                     t = tar_t[:, ch] if ch is not None else tar_t
                     g["reg_acc"].update(r, t)
-            # Diagnostic plots use the selected diagnostic group's channel subset.
-            reg_pred_m = reg_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else reg_pred_t
+            # Diffusion diagnostics also use this target subset.
             tar_m = tar_t[:, diagnostic_channels] if diagnostic_channels is not None else tar_t
-            hist_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
-            rapsd_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
+            if has_regression:
+                reg_pred_m = reg_pred_t[:, diagnostic_channels] if diagnostic_channels is not None else reg_pred_t
+                hist_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
+                rapsd_acc_reg.update(reg_pred_m, tar_m.squeeze(0))
 
             # Track as event candidate for auto-selection of plot timesteps
             local_event_candidates.append((time_idx, float(tar_t.max()), dataset_idx))
 
-        # -- Diffusion forward pass (when mode == "all") --
+        # -- Direct or residual diffusion forward pass --
         _any_diff_acc = any(g["diff_acc"] is not None for g in _groups.values())
         if net_res is not None and (_any_diff_acc or climate_enabled):
             mean_hr = reg_mean if cfg.generation.hr_mean_conditioning else None
@@ -1202,8 +1212,10 @@ def main(cfg: DictConfig) -> None:
                 diffusion_kwargs=diffusion_kwargs,
             )
 
-            # Full ensemble: regression mean + diffusion residuals
-            ens_pred = reg_mean + diffusion_residuals                # (N_ens, C, H, W)
+            # Direct samples are already full targets; only residuals need a mean.
+            ens_pred = (
+                diffusion_residuals if reg_mean is None else reg_mean + diffusion_residuals
+            )
 
             ens_pred_np = dataset.denormalize_output(ens_pred.cpu().numpy())
             ens_pred_t = torch.from_numpy(ens_pred_np).to(device)      # (N_ens, C, H, W)
@@ -1307,8 +1319,9 @@ def main(cfg: DictConfig) -> None:
             g["reg_acc"].reduce()
         if g["diff_acc"] is not None:
             g["diff_acc"].reduce()
-    hist_acc_reg.reduce()
-    rapsd_acc_reg.reduce()
+    if has_regression:
+        hist_acc_reg.reduce()
+        rapsd_acc_reg.reduce()
     if hist_acc_diff is not None:
         hist_acc_diff.reduce()
     if rapsd_acc_diff is not None:

@@ -1,0 +1,47 @@
+# @package _global_
+# Taiwan radar: regression, normal size, no temporal context, seed 0.
+hydra:
+  job:
+    chdir: false
+    name: taiwan_ablation_${target}_${stage}
+  searchpath:
+    - pkg://conf/base
+  run:
+    dir: ./output/${hydra:job.name}
+
+defaults:
+  - /dataset: cwb
+  - /model: regression
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+
+target: radar
+stage: regression
+dataset:
+  out_channels: [0]
+  data_path: /data/cwa_dataset/cwa_dataset.zarr
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 256
+    batch_size_per_gpu: 4
+    lr: 2.0e-4
+    lr_rampup: 10000
+  io:
+    checkpoint_dir: /checkpoints/taiwan_ablation/${target}/${stage}
+    regression_checkpoint_path: null
+    print_progress_freq: 1024
+    save_checkpoint_freq: 100096
+    save_n_recent_checkpoints: -1
+    validation_freq: 100096
+    validation_steps: 10
+validation:
+  train: false
+  all_times: false
+wandb:
+  mode: online
+  results_dir: ./wandb
+  watch_model: false
+  group: taiwan_regression_ablation
+  tags: [taiwan, '${target}', '${stage}', t0, seed0, exposure2M]

@@ -572,6 +572,8 @@ class ZarrDataset(DownscalingDataset):
         x = cv2.resize(
             x, (shape[0], shape[1]), interpolation=cv2.INTER_CUBIC
         )  # 32x32x3
+        if x.ndim == 2:  # OpenCV squeezes a singleton channel.
+            x = x[..., None]
         x = x.transpose(2, 0, 1)  # 3x32x32
         return x
 
@@ -583,6 +585,8 @@ class ZarrDataset(DownscalingDataset):
         x = cv2.resize(
             x, (x.shape[1] * factor, x.shape[0] * factor), interpolation=cv2.INTER_CUBIC
         )  # 32x32x3
+        if x.ndim == 2:  # OpenCV squeezes a singleton channel.
+            x = x[..., None]
         x = x.transpose(2, 0, 1)  # 3x32x32
         return x
 

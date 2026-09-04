@@ -1,0 +1,18 @@
+# @package _global_
+hydra:
+  searchpath:
+    - pkg://conf/base
+defaults:
+  - base
+  - _self_
+target: radar
+stage: regression
+dataset:
+  out_channels: [0]
+generation:
+  inference_mode: regression
+  hr_mean_conditioning: false
+  num_ensembles: 1
+  seed_batch_size: 1
+  io:
+    res_ckpt_filename: null

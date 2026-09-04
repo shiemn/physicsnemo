@@ -427,7 +427,7 @@ class RAPSDAccumulator:
 def plot_example_event(
     pred_ens_np: np.ndarray,
     target_np: np.ndarray,
-    reg_mean_np: np.ndarray,
+    reg_mean_np: np.ndarray | None,
     time_str: str,
     channel_names: list[str],
     lat: np.ndarray | None = None,
@@ -447,7 +447,7 @@ def plot_example_event(
     Args:
         pred_ens_np: (N_ens, C, H, W) ensemble predictions in physical units.
         target_np:   (C, H, W) ground truth in physical units.
-        reg_mean_np: (C, H, W) regression-only prediction in physical units.
+        reg_mean_np: (C, H, W) regression prediction, or None when unavailable.
         time_str:    ISO-8601 timestamp string used as the figure title.
         channel_names: List of channel name strings (length == C).
         lat: (H, W) latitude array.  If None, row/col indices are used.
@@ -511,7 +511,7 @@ def plot_example_event(
         # Auto-detect colorscale: use symmetric diverging cmap for signed variables
         all_data = np.concatenate([
             target_np[c].flatten(),
-            reg_mean_np[c].flatten(),
+            *([reg_mean_np[c].flatten()] if reg_mean_np is not None else []),
             ens_mean_np[c].flatten(),
         ])
         data_min = float(np.nanpercentile(all_data, 1))
@@ -552,11 +552,11 @@ def plot_example_event(
             plt.colorbar(pcm, ax=ax, fraction=0.046, pad=0.04, shrink=0.8, label=unit)
             ax.set_title(title, fontsize=10)
 
-        # Summary row 0: Target | Regression mean
+        # Summary row 0: Target | Regression mean (omitted when unavailable)
         # Summary row 1: Ensemble mean | Ensemble spread
         summary = [
             (gs[ro + 0, 0:3], target_np[c],    cmap_intensity, vmin_intensity, vmax_intensity, "Target",          cbar_label),
-            (gs[ro + 0, 3:6], reg_mean_np[c],   cmap_intensity, vmin_intensity, vmax_intensity, "Regression mean", cbar_label),
+            *([(gs[ro + 0, 3:6], reg_mean_np[c], cmap_intensity, vmin_intensity, vmax_intensity, "Regression mean", cbar_label)] if reg_mean_np is not None else []),
             (gs[ro + 1, 0:3], ens_mean_np[c],   cmap_intensity, vmin_intensity, vmax_intensity, "Ensemble mean",   cbar_label),
             (gs[ro + 1, 3:6], ens_spread_np[c], cmap_spread,    0.0,            vmax_spread,    "Ensemble spread", cbar_label),
         ]
