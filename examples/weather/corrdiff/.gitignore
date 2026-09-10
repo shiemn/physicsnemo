@@ -58,6 +58,7 @@ multi_checkpoint_tools/
 node_modules/
 AGENTS.md
 CLAUDE.md
+AGENTS-Simon.md.txt
 
 
 # MacOs specific
