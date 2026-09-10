@@ -174,11 +174,13 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize loggers
     if dist.rank == 0:
-        writer = SummaryWriter(log_dir="tensorboard")
+        writer = SummaryWriter(
+            log_dir=f"/outputs/tensorboard/{HydraConfig.get().job.name}"
+        )
 
         initialize_wandb(
-            project="CorrDiff",
-            entity="shiemn",
+            project=cfg.wandb.get("project", "CorrDiff"),
+            entity=cfg.wandb.get("entity", "shiemn"),
             name=f"CorrDiff-Training-{HydraConfig.get().job.name}",
             group=cfg.wandb.get("group", "CorrDiff-DDP-Group"),
             mode=cfg.wandb.mode,
