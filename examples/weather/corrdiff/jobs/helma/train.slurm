@@ -37,6 +37,14 @@ CORRDIFF_DIR="${HOME}/corrdiffProjektSimon/code/examples/weather/corrdiff"
 RUN_ROOT="${HNVME}/daniel"
 CHECKPOINT_ROOT="${RUN_ROOT}/checkpoints/ablation_1_and_2_models"
 OUTPUT_ROOT="${RUN_ROOT}/outputs/ablation_1_and_2_models"
+echo "Git branch: $(git -C "$CORRDIFF_DIR" branch --show-current)"
+echo "Git commit: $(git -C "$CORRDIFF_DIR" rev-parse HEAD)"
+if [ -z "$(git -C "$CORRDIFF_DIR" status --porcelain)" ]; then
+    echo "Git worktree: clean"
+else
+    echo "Git worktree: dirty"
+    git -C "$CORRDIFF_DIR" status --short
+fi
 NGPUS=$(nvidia-smi -L | wc -l)
 # Use the same job-based port as the other launchers to reduce node-local collisions.
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
