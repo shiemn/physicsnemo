@@ -189,7 +189,7 @@ def main(cfg: DictConfig) -> None:
         )
         wandb_tags = cfg.wandb.get("tags", None)
         if wandb_tags:
-            wandb.run.tags = tuple(OmegaConf.to_container(wandb_tags))
+            wandb.run.tags = tuple(OmegaConf.to_container(wandb_tags, resolve=True))
 
     logger = PythonLogger("main")  # General python logger
     logger0 = RankZeroLoggingWrapper(logger, dist)  # Rank 0 logger
