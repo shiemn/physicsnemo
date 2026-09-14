@@ -27,7 +27,7 @@ eval:
   predictions_file: /outputs/eval/${run_tag}/predictions.nc
   stream_predictions: true
   save_inputs: false
-  n_plot_events: 0
+  n_plot_events: 10
   per_channel_metrics: true
   skip_conditional_metrics: true
   twcrps_thresholds: []
