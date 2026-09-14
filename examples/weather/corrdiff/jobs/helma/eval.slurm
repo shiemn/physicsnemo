@@ -3,9 +3,9 @@
 #SBATCH --time=12:00:00
 #SBATCH --gres=gpu:h100:1
 #SBATCH --partition=h100
-#SBATCH --output=output/eval-%j.out
+#SBATCH --output=/hnvme/workspace/b214cb11-helma-ecodata/downscaling/daniel/outputs/ablation_1_and_2_models/slurm/eval-%j.out
 #SBATCH --mail-type=FAILED,TIME_LIMIT,END
-#SBATCH --mail-user "simon.hentschel@uni-wuerzburg.de"
+#SBATCH --mail-user=daniel.weggenmann@uni-wuerzburg.de
 
 # =============================================================================
 # Evaluate a CorrDiff model
@@ -22,7 +22,7 @@
 # The config is expected to have all checkpoint paths set (no ??? fields).
 # =============================================================================
 
-set -e
+set -eo pipefail
 
 CONFIG=${1:?"Usage: sbatch eval.slurm <config_name> [run_tag] [overrides...]"}
 RUN_TAG=${2:-${CONFIG}_${SLURM_JOB_ID}}
@@ -48,9 +48,21 @@ export APPTAINERENV_WANDB__SERVICE_WAIT=300
 export APPTAINERENV_CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}
 export APPTAINERENV_OMP_NUM_THREADS=16
 
-CONTAINER="/hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/corrdiff_ngc.sif"
-CORRDIFF_DIR="$HOME/bjerknes/corrdiff"
 HNVME="/hnvme/workspace/b214cb11-helma-ecodata/downscaling"
+CONTAINER="${HNVME}/apptainer/corrdiff_ngc.sif"
+CORRDIFF_DIR="${HOME}/corrdiffProjektSimon/code/examples/weather/corrdiff"
+RUN_ROOT="${HNVME}/daniel"
+CHECKPOINT_ROOT="${RUN_ROOT}/checkpoints/ablation_1_and_2_models"
+OUTPUT_ROOT="${RUN_ROOT}/outputs/ablation_1_and_2_models"
+
+echo "Git branch: $(git -C "$CORRDIFF_DIR" branch --show-current)"
+echo "Git commit: $(git -C "$CORRDIFF_DIR" rev-parse HEAD)"
+if [ -z "$(git -C "$CORRDIFF_DIR" status --porcelain)" ]; then
+    echo "Git worktree: clean"
+else
+    echo "Git worktree: dirty"
+    git -C "$CORRDIFF_DIR" status --short
+fi
 
 HYDRA_OVERRIDES=()
 if [ "$DATA_MODE" = "taiwan" ]; then
@@ -89,17 +101,17 @@ echo "=================================================="
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 
 srun apptainer run --nv \
-    --bind ${DATA_BIND}:/data/ \
-    --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/checkpoints/corrdiff:/checkpoints/ \
-    --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/outputs/corrdiff:/outputs/ \
-    ${CONTAINER} \
+    --bind "${DATA_BIND}:/data/" \
+    --bind "${CHECKPOINT_ROOT}:/checkpoints/" \
+    --bind "${OUTPUT_ROOT}:/outputs/" \
+    "${CONTAINER}" \
     torchrun --nproc_per_node=$NGPUS --master_port=$MASTER_PORT \
-        ${CORRDIFF_DIR}/evaluate.py \
-        --config-name ${CONFIG} \
-        run_tag=${RUN_TAG} \
-        hydra.run.dir=${OUTPUT_DIR} \
-        wandb.results_dir=${OUTPUT_DIR}/wandb \
-        eval.output_json=${OUTPUT_DIR}/eval_results.json \
-        eval.predictions_file=${OUTPUT_DIR}/predictions.nc \
+        "${CORRDIFF_DIR}/evaluate.py" \
+        --config-name "${CONFIG}" \
+        run_tag="${RUN_TAG}" \
+        hydra.run.dir="${OUTPUT_DIR}" \
+        wandb.results_dir="${OUTPUT_DIR}/wandb" \
+        eval.output_json="${OUTPUT_DIR}/eval_results.json" \
+        eval.predictions_file="${OUTPUT_DIR}/predictions.nc" \
         "${HYDRA_OVERRIDES[@]}" \
         "${USER_OVERRIDES[@]}"

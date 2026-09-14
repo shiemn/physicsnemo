@@ -62,6 +62,7 @@ import netCDF4 as nc
 import numpy as np
 import torch
 import wandb
+from hydra.core.hydra_config import HydraConfig
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
@@ -665,7 +666,9 @@ def main(cfg: DictConfig) -> None:
 
     logger = PythonLogger("evaluate")
     logger0 = RankZeroLoggingWrapper(logger, dist)
-    logger.file_logging("evaluate.log")
+    logger.file_logging(
+        os.path.join(HydraConfig.get().runtime.output_dir, "evaluate.log")
+    )
 
     # ------------------------------------------------------------------
     # Config extraction
