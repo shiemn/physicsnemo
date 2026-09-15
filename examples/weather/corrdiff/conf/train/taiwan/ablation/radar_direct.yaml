@@ -7,7 +7,7 @@ hydra:
   searchpath:
     - pkg://conf/base
   run:
-    dir: ./output/${hydra:job.name}
+    dir: /outputs/hydra/${hydra:job.name}
 
 defaults:
   - /dataset: cwb
@@ -43,7 +43,9 @@ validation:
   all_times: false
 wandb:
   mode: online
-  results_dir: ./wandb
+  entity: dagewe_team1
+  project: CorrDiff
+  results_dir: /outputs/wandb/${hydra:job.name}
   watch_model: false
   group: taiwan_regression_ablation
   tags: [taiwan, '${target}', '${stage}', t0, seed0, exposure2M]
