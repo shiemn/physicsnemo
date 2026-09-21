@@ -25,7 +25,7 @@ model:
   hr_mean_conditioning: false
 training:
   hp:
-    training_duration: 2000000
+    training_duration: 4000000
     total_batch_size: 256
     batch_size_per_gpu: 4
     lr: 2.0e-4
@@ -48,4 +48,4 @@ wandb:
   results_dir: /outputs/wandb/${hydra:job.name}
   watch_model: false
   group: taiwan_regression_ablation
-  tags: [taiwan, '${target}', '${stage}', t0, seed0, exposure2M]
+  tags: [taiwan, '${target}', '${stage}', t0, seed0, exposure4M, continued_from_2M]
