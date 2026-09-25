@@ -1,0 +1,34 @@
+# @package _global_
+hydra:
+  job:
+    name: taiwan_si_temperature_2m_eval
+  searchpath:
+    - pkg://conf/base
+defaults:
+  - ablation/base
+  - /model: stochastic_interpolant
+  - _self_
+run_tag: taiwan_si_temperature_2m
+target: temperature
+stage: stochastic_interpolant
+dataset:
+  out_channels: [1]
+  ds_factor: 4
+model:
+  si:
+    output_channel_names: [temperature_2m]
+    base_input_channel_names: [temperature_2m]
+generation:
+  inference_mode: stochastic_interpolant
+  hr_mean_conditioning: false
+  num_ensembles: 10
+  seed_batch_size: 2
+  io:
+    reg_ckpt_filename: null
+    res_ckpt_filename: null
+    si_ckpt_filename: /checkpoints/stochastic_interpolant/temperature_2m/checkpoints_stochastic_interpolant/StochasticInterpolant.0.2000128.mdlus
+sampler:
+  type: euler_maruyama
+  num_steps: 40
+eval:
+  log_regression: false

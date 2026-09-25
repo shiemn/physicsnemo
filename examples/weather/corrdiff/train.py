@@ -89,6 +89,11 @@ from helpers.train_helpers import (
 )
 from helpers.custom_losses import IntensityResidualLoss, CalibratedResidualLoss, CalibratedResidualLossV2
 from helpers.direct_diffusion import DirectEDMLoss
+from helpers.stochastic_interpolant import (
+    StochasticInterpolant,
+    StochasticInterpolantLoss,
+    build_channel_spec,
+)
 from helpers.dropout_residual import DropoutResidualCRPSLoss
 from helpers.custom_tweedie_losses import FlexiLoss
 from helpers.preconditioning import (
@@ -337,6 +342,8 @@ def main(cfg: DictConfig) -> None:
         )
     patch_shape = (patch_shape_y, patch_shape_x)
     use_patching, img_shape, patch_shape = set_patch_shape(img_shape, patch_shape)
+    if cfg.model.name == "stochastic_interpolant" and use_patching:
+        raise ValueError("First SI implementation supports full-domain training only")
     if use_patching:
         # Utility to perform patches extraction and batching
         patching = RandomPatching2D(
@@ -379,7 +386,30 @@ def main(cfg: DictConfig) -> None:
     if enable_amp:
         model_args["amp_mode"] = enable_amp
 
-    if cfg.model.name == "regression":
+    if cfg.model.name == "stochastic_interpolant":
+        if cfg.dataset.type != "cwb" or cfg.dataset.get("normalization", "v1") not in ("v1", "v2"):
+            raise ValueError("First SI implementation supports affine-normalized CWB data only")
+        if cfg.model.hr_mean_conditioning:
+            raise ValueError("SI directly models full targets; hr_mean_conditioning must be false")
+        spec = build_channel_spec(
+            dataset,
+            cfg.model.si.output_channel_names,
+            cfg.model.si.base_input_channel_names,
+        )
+        si_kwargs = model_args.copy()
+        for key in ("img_resolution", "img_out_channels", "use_fp16"):
+            si_kwargs.pop(key, None)
+        model = StochasticInterpolant(
+            img_resolution=list(img_shape),
+            use_fp16=fp16,
+            base_type=cfg.model.si.base_type,
+            alpha_schedule=OmegaConf.to_container(cfg.model.si.alpha_schedule, resolve=True),
+            beta_schedule=OmegaConf.to_container(cfg.model.si.beta_schedule, resolve=True),
+            sigma_schedule=OmegaConf.to_container(cfg.model.si.sigma_schedule, resolve=True),
+            **spec,
+            **si_kwargs,
+        )
+    elif cfg.model.name == "regression":
         model = UNet(
             img_in_channels=img_in_channels + model_args["N_grid_channels"],
             **model_args,
@@ -682,7 +712,11 @@ def main(cfg: DictConfig) -> None:
         use_patch_grad_acc = None
 
     # Instantiate the loss function
-    if cfg.model.name in (
+    if cfg.model.name == "stochastic_interpolant":
+        if regression_net is not None:
+            raise ValueError("First SI path does not use a regression checkpoint")
+        loss_fn = StochasticInterpolantLoss()
+    elif cfg.model.name in (
         "diffusion",
         "patched_diffusion",
         "lt_aware_patched_diffusion",

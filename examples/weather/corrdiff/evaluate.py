@@ -87,6 +87,11 @@ from helpers.generate_helpers import (
     setup_patching,
 )
 from helpers.climate_signal import ClimateAccumulator
+from helpers.stochastic_interpolant import (
+    StochasticInterpolant,
+    build_channel_spec,
+    sample_ensemble as sample_si_ensemble,
+)
 from helpers.metrics import MetricsAccumulator
 from helpers.plots import (
     HistogramAccumulator,
@@ -474,7 +479,11 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
         rapsd_acc.update(p_hist, tg_hist)
         event_candidates.append((t, float(tar_t.max()), t))
 
-    acc_label = "regression" if is_regression else "diffusion"
+    acc_label = (
+        "regression" if is_regression else
+        "stochastic_interpolant" if cfg.generation.inference_mode == "stochastic_interpolant" else
+        "diffusion"
+    )
     all_metrics = {}
     for gname, g in _groups.items():
         prefix = f"{acc_label}/" if gname is None else f"{acc_label}/{gname}/"
@@ -583,6 +592,7 @@ def _run_single_timestep(
     timestamp=None,
     num_ensembles: int | None = None,
     seed_base: int = 0,
+    si_num_steps: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
     """Run regression + diffusion inference for a single timestep on one GPU.
 
@@ -625,7 +635,7 @@ def _run_single_timestep(
     reg_mean_np = _to_physical(reg_mean)[0] if reg_mean is not None else None      # (C, H, W)
     target_np = _to_physical(image_tar)[0]       # (C, H, W)
 
-    if net_res is not None and (use_dropout_residual or sampler_fn is not None):
+    if net_res is not None and (use_dropout_residual or sampler_fn is not None or si_num_steps is not None):
         timestep_seed_batches = resolve_seed_batches(
             seed_batches,
             seed_mode=seed_mode,
@@ -633,19 +643,24 @@ def _run_single_timestep(
             num_ensembles=num_ensembles,
             seed_base=seed_base,
         )
-        diffusion_residuals = generate_ensemble(
-            net_res=net_res,
-            sampler_fn=sampler_fn,
-            use_dropout_residual=use_dropout_residual,
-            image_lr=image_lr,
-            img_shape=img_shape,
-            img_out_channels=img_out_channels,
-            device=device,
-            mean_hr=reg_mean if hr_mean_conditioning else None,
-            lead_time_label=lead_time_label,
-            seed_batches=timestep_seed_batches,
-            diffusion_kwargs=diffusion_kwargs,
-        )
+        if si_num_steps is not None:
+            diffusion_residuals = sample_si_ensemble(
+                net_res, image_lr, timestep_seed_batches, si_num_steps
+            )
+        else:
+            diffusion_residuals = generate_ensemble(
+                net_res=net_res,
+                sampler_fn=sampler_fn,
+                use_dropout_residual=use_dropout_residual,
+                image_lr=image_lr,
+                img_shape=img_shape,
+                img_out_channels=img_out_channels,
+                device=device,
+                mean_hr=reg_mean if hr_mean_conditioning else None,
+                lead_time_label=lead_time_label,
+                seed_batches=timestep_seed_batches,
+                diffusion_kwargs=diffusion_kwargs,
+            )
         ens_pred = (
             diffusion_residuals if reg_mean is None else reg_mean + diffusion_residuals
         )
@@ -675,15 +690,18 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     run_tag = cfg.get("run_tag", "eval")
     inference_mode = cfg.generation.inference_mode
-    if inference_mode not in ("regression", "diffusion", "all"):
+    if inference_mode not in ("regression", "diffusion", "all", "stochastic_interpolant"):
         raise ValueError(
             f'Unsupported inference_mode={inference_mode!r}. '
-            f'Must be "regression", "diffusion", or "all" (regression + diffusion).'
+            f'Must be "regression", "diffusion", "all", or "stochastic_interpolant".'
         )
+    si_mode = inference_mode == "stochastic_interpolant"
     has_regression = inference_mode in ("regression", "all")
-    has_diffusion = inference_mode in ("diffusion", "all")
+    has_diffusion = inference_mode in ("diffusion", "all", "stochastic_interpolant")
     if not has_regression and cfg.generation.hr_mean_conditioning:
         raise ValueError("Direct diffusion requires generation.hr_mean_conditioning=false")
+    if si_mode and cfg.sampler.type != "euler_maruyama":
+        raise ValueError("First SI implementation requires sampler.type=euler_maruyama")
     num_ensembles = cfg.generation.num_ensembles
     seed_batch_size = cfg.generation.seed_batch_size
     climate_cfg_raw = cfg.eval.get("climate", None)
@@ -743,7 +761,9 @@ def main(cfg: DictConfig) -> None:
     # path from the config (not the loaded model).
     if predictions_file_cfg == "auto":
         # Use diffusion checkpoint if available, otherwise regression
-        if has_diffusion:
+        if si_mode:
+            _ckpt = cfg.generation.io.si_ckpt_filename
+        elif has_diffusion:
             _ckpt = cfg.generation.io.res_ckpt_filename
         else:
             _ckpt = cfg.generation.io.reg_ckpt_filename
@@ -942,6 +962,8 @@ def main(cfg: DictConfig) -> None:
     # Patching
     # ------------------------------------------------------------------
     patching, img_shape = setup_patching(cfg, img_shape)
+    if si_mode and patching is not None:
+        raise ValueError("First SI implementation does not support patching")
 
     # ------------------------------------------------------------------
     # Model loading
@@ -966,14 +988,39 @@ def main(cfg: DictConfig) -> None:
     guidance_scale = float(cfg.generation.get("guidance_scale", 0.0))
     guidance_schedule_alpha = float(cfg.generation.get("guidance_schedule_alpha", 0.0))
     guide_ckpt = cfg.generation.io.get("guide_ckpt_filename", None)
+    if si_mode and (guidance_scale != 0.0 or guide_ckpt):
+        raise ValueError("First SI implementation does not support guidance")
 
     logger0.info("Loading models...")
-    net_reg, net_res = load_models(
-        cfg, device,
-        load_net_reg=has_regression,
-        load_net_res=has_diffusion,
-        edm2_kwargs=edm2_kwargs,
-    )
+    if si_mode:
+        if cfg.dataset.type != "cwb" or cfg.dataset.get("normalization", "v1") not in ("v1", "v2"):
+            raise ValueError("First SI implementation supports affine-normalized CWB data only")
+        spec = build_channel_spec(
+            dataset,
+            cfg.model.si.output_channel_names,
+            cfg.model.si.base_input_channel_names,
+        )
+        si_ckpt = cfg.generation.io.get("si_ckpt_filename")
+        if not si_ckpt:
+            raise ValueError("generation.io.si_ckpt_filename is required for SI evaluation")
+        net_reg = None
+        net_res = load_model(to_absolute_path(si_ckpt), device, cfg.generation.perf)
+        if not isinstance(net_res, StochasticInterpolant):
+            raise TypeError("The SI checkpoint does not contain a StochasticInterpolant model")
+        net_res.validate_dataset(spec)
+        if net_res.base_type != cfg.model.si.base_type:
+            raise ValueError("SI checkpoint and evaluation config use different base_type values")
+        for schedule_name in ("alpha_schedule", "beta_schedule", "sigma_schedule"):
+            configured = OmegaConf.to_container(cfg.model.si[schedule_name], resolve=True)
+            if getattr(net_res, schedule_name) != configured:
+                raise ValueError(f"SI checkpoint and evaluation config differ in {schedule_name}")
+    else:
+        net_reg, net_res = load_models(
+            cfg, device,
+            load_net_reg=has_regression,
+            load_net_res=has_diffusion,
+            edm2_kwargs=edm2_kwargs,
+        )
     net_guide = None
     if guidance_scale != 0.0 and guide_ckpt:
         logger0.info(f"Loading guidance model (scale={guidance_scale}): {guide_ckpt}")
@@ -987,7 +1034,7 @@ def main(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     sampler_fn = (
         None
-        if use_dropout_residual or net_res is None
+        if si_mode or use_dropout_residual or net_res is None
         else build_sampler_fn(
             cfg.sampler,
             patching,
@@ -1201,19 +1248,24 @@ def main(cfg: DictConfig) -> None:
                 num_ensembles=num_ensembles,
                 seed_base=seed_base,
             )
-            diffusion_residuals = generate_ensemble(
-                net_res=net_res,
-                sampler_fn=sampler_fn,
-                use_dropout_residual=use_dropout_residual,
-                image_lr=image_lr,
-                img_shape=img_shape,
-                img_out_channels=img_out_channels,
-                device=device,
-                mean_hr=mean_hr,
-                lead_time_label=lead_time_label,
-                seed_batches=timestep_seed_batches,
-                diffusion_kwargs=diffusion_kwargs,
-            )
+            if si_mode:
+                diffusion_residuals = sample_si_ensemble(
+                    net_res, image_lr, timestep_seed_batches, int(cfg.sampler.num_steps)
+                )
+            else:
+                diffusion_residuals = generate_ensemble(
+                    net_res=net_res,
+                    sampler_fn=sampler_fn,
+                    use_dropout_residual=use_dropout_residual,
+                    image_lr=image_lr,
+                    img_shape=img_shape,
+                    img_out_channels=img_out_channels,
+                    device=device,
+                    mean_hr=mean_hr,
+                    lead_time_label=lead_time_label,
+                    seed_batches=timestep_seed_batches,
+                    diffusion_kwargs=diffusion_kwargs,
+                )
 
             # Direct samples are already full targets; only residuals need a mean.
             ens_pred = (
@@ -1395,10 +1447,10 @@ def main(cfg: DictConfig) -> None:
             # WandB prefix: "regression/" for single group, "regression/{gname}/" for multi
             if gname is None:
                 reg_prefix = "regression/"
-                diff_prefix = "diffusion/"
+                diff_prefix = "stochastic_interpolant/" if si_mode else "diffusion/"
             else:
                 reg_prefix = f"regression/{gname}/"
-                diff_prefix = f"diffusion/{gname}/"
+                diff_prefix = f"stochastic_interpolant/{gname}/" if si_mode else f"diffusion/{gname}/"
 
             if log_regression:
                 reg_dict = g["reg_acc"].to_dict(prefix=reg_prefix)
@@ -1440,9 +1492,10 @@ def main(cfg: DictConfig) -> None:
             ))
 
         if diagnostic_group["diff_acc"] is not None and hist_acc_diff is not None:
-            diagnostic_diff_dict = diagnostic_group["diff_acc"].to_dict(prefix="diffusion/")
+            diagnostic_label = "stochastic_interpolant" if si_mode else "diffusion"
+            diagnostic_diff_dict = diagnostic_group["diff_acc"].to_dict(prefix=f"{diagnostic_label}/")
             wandb_payload.update(_diagnostic_plot_payload(
-                acc_label="diffusion",
+                acc_label=diagnostic_label,
                 metrics_dict=diagnostic_diff_dict,
                 hist_acc=hist_acc_diff,
                 rapsd_acc=rapsd_acc_diff,
@@ -1494,6 +1547,7 @@ def main(cfg: DictConfig) -> None:
                     timestamp=times[time_idx] if time_idx < len(times) else None,
                     num_ensembles=num_ensembles,
                     seed_base=seed_base,
+                    si_num_steps=int(cfg.sampler.num_steps) if si_mode else None,
                 )
 
                 time_label = str(times[time_idx]) if time_idx < len(times) else str(time_idx)

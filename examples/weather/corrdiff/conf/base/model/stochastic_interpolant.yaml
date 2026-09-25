@@ -1,0 +1,21 @@
+name: stochastic_interpolant
+hr_mean_conditioning: false
+model_args:
+  gridtype: sinusoidal
+  N_grid_channels: 4
+  embedding_type: fourier
+si:
+  base_type: matching_input
+  output_channel_names: ???
+  base_input_channel_names: ???
+  alpha_schedule:
+    type: linear
+    start: 1.0
+    end: 0.0
+  beta_schedule:
+    type: polynomial
+    power: 2
+  sigma_schedule:
+    type: linear
+    start: 1.0
+    end: 0.0
