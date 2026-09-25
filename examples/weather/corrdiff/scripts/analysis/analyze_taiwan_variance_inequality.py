@@ -7,12 +7,13 @@ already lives on Helma's HNVME filesystem.  From
 
     sbatch \\
       --job-name=var-radar \\
-      --partition=cpu \\
+      --partition=preempt_cpu \\
+      --nodes=1 \\
+      --ntasks=1 \\
+      --cpus-per-task=5 \\
       --time=00:15:00 \\
-      --cpus-per-task=1 \\
-      --mem=8G \\
       --output=/hnvme/workspace/b214cb11-helma-ecodata/downscaling/daniel/outputs/ablation_1_and_2_models/slurm/variance-radar-%j.out \\
-      --wrap="apptainer exec \\
+      --wrap="srun --ntasks=1 --cpus-per-task=5 apptainer exec \\
         --bind $HOME/corrdiffProjektSimon/code/examples/weather/corrdiff:/workspace/corrdiff \\
         --bind /hnvme/workspace/b214cb11-helma-ecodata/downscaling/daniel/outputs/ablation_1_and_2_models:/outputs \\
         /hnvme/workspace/b214cb11-helma-ecodata/downscaling/apptainer/corrdiff_ngc.sif \\
