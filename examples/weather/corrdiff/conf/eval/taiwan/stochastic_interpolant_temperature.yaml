@@ -1,19 +1,19 @@
 # @package _global_
 hydra:
   job:
-    name: taiwan_si_temperature_2m_eval
+    name: taiwan_si_temperature_2m_ds1_eval
   searchpath:
     - pkg://conf/base
 defaults:
   - ablation/base
   - /model: stochastic_interpolant
   - _self_
-run_tag: taiwan_si_temperature_2m
+run_tag: taiwan_si_temperature_2m_ds1
 target: temperature
 stage: stochastic_interpolant
 dataset:
   out_channels: [1]
-  ds_factor: 4
+  ds_factor: 1
 model:
   si:
     output_channel_names: [temperature_2m]
@@ -26,7 +26,7 @@ generation:
   io:
     reg_ckpt_filename: null
     res_ckpt_filename: null
-    si_ckpt_filename: /checkpoints/stochastic_interpolant/temperature_2m/checkpoints_stochastic_interpolant/StochasticInterpolant.0.2000128.mdlus
+    si_ckpt_filename: /checkpoints/stochastic_interpolant/temperature_2m_ds1/checkpoints_stochastic_interpolant/StochasticInterpolant.0.2000128.mdlus
 sampler:
   type: euler_maruyama
   num_steps: 40
