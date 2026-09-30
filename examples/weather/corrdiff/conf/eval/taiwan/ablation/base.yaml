@@ -2,7 +2,7 @@
 hydra:
   job:
     chdir: false
-    name: taiwan_ablation_${target}_${stage}_eval
+    name: taiwan_ablation_ds1_${target}_${stage}_eval
   run:
     dir: /outputs/eval/${run_tag}
 defaults:
@@ -12,13 +12,14 @@ defaults:
   - _self_
 target: ???
 stage: ???
-run_tag: taiwan_ablation_${target}_${stage}_2m
+run_tag: taiwan_ablation_ds1_${target}_${stage}_2m
 wandb:
   mode: online
   entity: dagewe_team1
   project: CorrDiff
   results_dir: /outputs/eval/${run_tag}/wandb
 dataset:
+  ds_factor: 1
   data_path: /data/cwa_dataset/cwa_dataset.zarr
   train: false
   all_times: true
@@ -50,8 +51,8 @@ generation:
     use_fp16: false
     use_torch_compile: false
   io:
-    reg_ckpt_filename: /checkpoints/taiwan_ablation/${target}/regression/checkpoints_regression/UNet.0.2000128.mdlus
-    res_ckpt_filename: /checkpoints/taiwan_ablation/${target}/${stage}/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000128.mdlus
+    reg_ckpt_filename: /checkpoints/taiwan_ablation_ds1/${target}/regression/checkpoints_regression/UNet.0.2000128.mdlus
+    res_ckpt_filename: /checkpoints/taiwan_ablation_ds1/${target}/${stage}/checkpoints_diffusion/EDMPrecondSuperResolution.0.2000128.mdlus
     output_filename: /dev/null
     guide_ckpt_filename: null
   guidance_scale: 0.0

@@ -3,7 +3,7 @@
 hydra:
   job:
     chdir: false
-    name: taiwan_ablation_${target}_${stage}
+    name: taiwan_ablation_ds1_${target}_${stage}
   searchpath:
     - pkg://conf/base
   run:
@@ -20,18 +20,19 @@ target: radar
 stage: direct
 dataset:
   out_channels: [0]
+  ds_factor: 1
   data_path: /data/cwa_dataset/cwa_dataset.zarr
 model:
   hr_mean_conditioning: false
 training:
   hp:
-    training_duration: 6000000
+    training_duration: 2000000
     total_batch_size: 256
     batch_size_per_gpu: 4
     lr: 2.0e-4
     lr_rampup: 100000
   io:
-    checkpoint_dir: /checkpoints/taiwan_ablation/${target}/${stage}
+    checkpoint_dir: /checkpoints/taiwan_ablation_ds1/${target}/${stage}
     regression_checkpoint_path: null
     print_progress_freq: 1024
     save_checkpoint_freq: 100096
@@ -47,5 +48,5 @@ wandb:
   project: CorrDiff
   results_dir: /outputs/wandb/${hydra:job.name}
   watch_model: false
-  group: taiwan_regression_ablation
-  tags: [taiwan, '${target}', '${stage}', t0, seed0, exposure6M, continued_from_4M]
+  group: taiwan_regression_ablation_ds1
+  tags: [taiwan, radar, direct, t0, seed0, ds1, exposure2M]
