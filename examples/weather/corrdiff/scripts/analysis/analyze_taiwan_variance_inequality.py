@@ -51,6 +51,7 @@ else:
 
 
 DEFAULT_CHANNEL = "maximum_radar_reflectivity"
+DEFAULT_PLOT_TITLE = "Taiwan radar regression: pixelwise variance ratio"
 
 
 def git_commit() -> str | None:
@@ -139,6 +140,117 @@ def variance_maps(
     return target_variance, residual_variance, ratio, valid
 
 
+def _update_welford(
+    mean: np.ndarray, m2: np.ndarray, values: np.ndarray, count: int
+) -> None:
+    """Update per-pixel population-variance accumulators with one field."""
+
+    delta = values - mean
+    mean += delta / count
+    m2 += delta * (values - mean)
+
+
+def streaming_variance_maps(
+    path: Path, channel: str, expected_times: int, min_target_variance: float
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    int,
+    str | None,
+]:
+    """Calculate the same ddof=0 maps while reading one NetCDF time at a time."""
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    with Dataset(path) as source:
+        if "truth" not in source.groups or "prediction" not in source.groups:
+            raise ValueError("predictions file must contain truth and prediction groups")
+        if channel not in source.groups["truth"].variables:
+            raise KeyError(f"{channel!r} is absent from the truth group")
+        if channel not in source.groups["prediction"].variables:
+            raise KeyError(f"{channel!r} is absent from the prediction group")
+        if "lat" not in source.variables or "lon" not in source.variables:
+            raise ValueError("predictions file must contain root lat and lon variables")
+
+        target_variable = source.groups["truth"].variables[channel]
+        prediction_variable = source.groups["prediction"].variables[channel]
+        if target_variable.ndim != 3 or prediction_variable.ndim != 4:
+            raise ValueError(
+                "expected truth(channel)=(time,y,x) and "
+                "prediction(channel)=(ensemble,time,y,x)"
+            )
+        if prediction_variable.shape[0] != 1:
+            raise ValueError(
+                "this control is defined for the one-member regression output; "
+                f"found {prediction_variable.shape[0]} ensemble members"
+            )
+        if target_variable.shape != prediction_variable.shape[1:]:
+            raise ValueError("truth and prediction spatial/time dimensions differ")
+
+        times = read_times(source)
+        n_times = target_variable.shape[0]
+        if len(times) != n_times:
+            raise ValueError("decoded time coordinate disagrees with truth time dimension")
+        if n_times != expected_times:
+            raise ValueError(
+                f"expected {expected_times} evaluation times, found {n_times}"
+            )
+
+        field_shape = target_variable.shape[1:]
+        target_mean = np.zeros(field_shape, dtype=np.float64)
+        target_m2 = np.zeros(field_shape, dtype=np.float64)
+        residual_mean = np.zeros(field_shape, dtype=np.float64)
+        residual_m2 = np.zeros(field_shape, dtype=np.float64)
+        target_finite = np.ones(field_shape, dtype=bool)
+        residual_finite = np.ones(field_shape, dtype=bool)
+
+        for index in range(n_times):
+            target = np.asarray(target_variable[index], dtype=np.float64)
+            regression = np.asarray(prediction_variable[0, index], dtype=np.float64)
+            residual = target - regression
+
+            target_is_finite = np.isfinite(target)
+            residual_is_finite = target_is_finite & np.isfinite(regression)
+            target_finite &= target_is_finite
+            residual_finite &= residual_is_finite
+            _update_welford(
+                target_mean,
+                target_m2,
+                np.where(target_is_finite, target, 0.0),
+                index + 1,
+            )
+            _update_welford(
+                residual_mean,
+                residual_m2,
+                np.where(residual_is_finite, residual, 0.0),
+                index + 1,
+            )
+
+        target_variance = target_m2 / n_times
+        residual_variance = residual_m2 / n_times
+        target_variance[~target_finite] = np.nan
+        residual_variance[~residual_finite] = np.nan
+        lat = np.asarray(source.variables["lat"][:], dtype=np.float64)
+        lon = np.asarray(source.variables["lon"][:], dtype=np.float64)
+        if lat.shape != field_shape or lon.shape != field_shape:
+            raise ValueError("lat/lon shapes do not match the field grid")
+        units = getattr(target_variable, "units", None)
+
+    valid = (
+        np.isfinite(target_variance)
+        & np.isfinite(residual_variance)
+        & (target_variance > min_target_variance)
+    )
+    ratio = np.full(target_variance.shape, np.nan, dtype=np.float64)
+    ratio[valid] = residual_variance[valid] / target_variance[valid]
+    return target_variance, residual_variance, ratio, valid, lat, lon, n_times, units
+
+
 def write_netcdf(
     path: Path,
     lat: np.ndarray,
@@ -151,6 +263,7 @@ def write_netcdf(
     source_path: Path,
     n_times: int,
     min_target_variance: float,
+    accumulation_mode: str,
 ) -> None:
     """Write the numerical map outputs with grid coordinates and provenance."""
 
@@ -188,12 +301,15 @@ def write_netcdf(
         output.n_times = n_times
         output.ddof = 0
         output.min_target_variance = min_target_variance
+        output.accumulation_mode = accumulation_mode
         commit = git_commit()
         if commit:
             output.git_commit = commit
 
 
-def plot_ratio(path: Path, lon: np.ndarray, lat: np.ndarray, ratio: np.ndarray) -> None:
+def plot_ratio(
+    path: Path, lon: np.ndarray, lat: np.ndarray, ratio: np.ndarray, title: str
+) -> None:
     """Plot a geographic ratio map with one as the neutral colour."""
 
     finite = ratio[np.isfinite(ratio)]
@@ -213,7 +329,7 @@ def plot_ratio(path: Path, lon: np.ndarray, lat: np.ndarray, ratio: np.ndarray) 
     )
     colorbar = figure.colorbar(image, ax=axis, extend="max")
     colorbar.set_label(r"$\mathrm{Var}(x - \hat{\mu}(y)) / \mathrm{Var}(x)$")
-    axis.set_title("Taiwan radar regression: pixelwise variance ratio")
+    axis.set_title(title)
     axis.set_xlabel("Longitude")
     axis.set_ylabel("Latitude")
     figure.savefig(path, dpi=180, facecolor="white")
@@ -226,6 +342,7 @@ def summary(
     source_path: Path,
     n_times: int,
     min_target_variance: float,
+    accumulation_mode: str,
 ) -> dict:
     """Return compact, JSON-serialisable diagnostics for the map."""
 
@@ -237,6 +354,7 @@ def summary(
         "n_times": n_times,
         "ddof": 0,
         "min_target_variance": min_target_variance,
+        "accumulation_mode": accumulation_mode,
         "valid_pixels": int(valid.sum()),
         "total_pixels": int(valid.size),
         "fraction_ratio_le_1": float(np.mean(values <= 1.0)),
@@ -255,6 +373,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channel", default=DEFAULT_CHANNEL)
     parser.add_argument("--expected-times", type=int, default=256)
     parser.add_argument("--min-target-variance", type=float, default=0.0)
+    parser.add_argument(
+        "--accumulation-mode",
+        choices=("in-memory", "streaming"),
+        default="in-memory",
+        help="Use streaming for large evaluations; in-memory preserves the old default.",
+    )
+    parser.add_argument("--plot-title", default=DEFAULT_PLOT_TITLE)
     return parser
 
 
@@ -266,12 +391,29 @@ def main() -> None:
         raise ValueError("min-target-variance must be non-negative")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    target, regression, lat, lon, n_times, units = load_regression_fields(
-        args.predictions, args.channel, args.expected_times
-    )
-    target_variance, residual_variance, ratio, valid = variance_maps(
-        target, regression, args.min_target_variance
-    )
+    if args.accumulation_mode == "in-memory":
+        target, regression, lat, lon, n_times, units = load_regression_fields(
+            args.predictions, args.channel, args.expected_times
+        )
+        target_variance, residual_variance, ratio, valid = variance_maps(
+            target, regression, args.min_target_variance
+        )
+    else:
+        (
+            target_variance,
+            residual_variance,
+            ratio,
+            valid,
+            lat,
+            lon,
+            n_times,
+            units,
+        ) = streaming_variance_maps(
+            args.predictions,
+            args.channel,
+            args.expected_times,
+            args.min_target_variance,
+        )
     write_netcdf(
         args.output_dir / "variance_ratio.nc",
         lat,
@@ -284,14 +426,22 @@ def main() -> None:
         args.predictions,
         n_times,
         args.min_target_variance,
+        args.accumulation_mode,
     )
-    plot_ratio(args.output_dir / "variance_ratio.png", lon, lat, ratio)
+    plot_ratio(
+        args.output_dir / "variance_ratio.png",
+        lon,
+        lat,
+        ratio,
+        args.plot_title,
+    )
     result = summary(
         ratio,
         valid,
         args.predictions,
         n_times,
         args.min_target_variance,
+        args.accumulation_mode,
     )
     (args.output_dir / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)
