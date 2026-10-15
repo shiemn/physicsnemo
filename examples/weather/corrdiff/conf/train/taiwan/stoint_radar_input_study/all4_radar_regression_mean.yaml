@@ -1,0 +1,49 @@
+# @package _global_
+hydra:
+  job:
+    chdir: false
+    name: taiwan_si_all4_radar_regression_mean_ds1
+  searchpath: [pkg://conf/base]
+  run:
+    dir: /outputs/hydra/${hydra:job.name}
+defaults:
+  - /dataset: cwb
+  - /model: stochastic_interpolant
+  - /model_size: normal
+  - /training: ${model}
+  - _self_
+dataset:
+  data_path: /data/cwa_dataset/cwa_dataset.zarr
+  out_channels: [0, 1, 2, 3]
+  ds_factor: 1
+model:
+  si:
+    base_type: regression_mean
+    output_channel_names: [maximum_radar_reflectivity, temperature_2m, eastward_wind_10m, northward_wind_10m]
+    base_input_channel_names: [null, temperature_2m, eastward_wind_10m, northward_wind_10m]
+training:
+  hp:
+    training_duration: 2000000
+    total_batch_size: 256
+    batch_size_per_gpu: 4
+    lr: 2.0e-4
+    lr_rampup: 10000
+  io:
+    checkpoint_dir: /checkpoints/stochastic_interpolant/radar_input_study/all4_radar_regression_mean_ds1
+    regression_checkpoint_path: /checkpoints/taiwan_ablation_ds1/radar/regression/checkpoints_regression/UNet.0.2000128.mdlus
+    print_progress_freq: 1024
+    save_checkpoint_freq: 100096
+    save_n_recent_checkpoints: -1
+    validation_freq: 100096
+    validation_steps: 10
+validation:
+  train: false
+  all_times: false
+wandb:
+  mode: online
+  entity: dagewe_team1
+  project: CorrDiff
+  results_dir: /outputs/wandb/${hydra:job.name}
+  watch_model: false
+  group: taiwan_si_radar_input_study
+  tags: [taiwan, stochastic_interpolant, all4, regression_mean, ds1, seed0, exposure2M]

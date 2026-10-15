@@ -398,6 +398,8 @@ def _evaluate_from_file(cfg: DictConfig, predictions_path: str) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
         results_dir=cfg.wandb.get("results_dir", "./wandb"),
     )
+    if cfg.wandb.get("tags"):
+        wandb.run.tags = tuple(OmegaConf.to_container(cfg.wandb.tags, resolve=True))
 
     device = torch.device("cpu")
 
@@ -593,6 +595,8 @@ def _run_single_timestep(
     num_ensembles: int | None = None,
     seed_base: int = 0,
     si_num_steps: int | None = None,
+    si_base_net=None,
+    si_gaussian_base_seed: int | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
     """Run regression + diffusion inference for a single timestep on one GPU.
 
@@ -645,7 +649,9 @@ def _run_single_timestep(
         )
         if si_num_steps is not None:
             diffusion_residuals = sample_si_ensemble(
-                net_res, image_lr, timestep_seed_batches, si_num_steps
+                net_res, image_lr, timestep_seed_batches, si_num_steps,
+                regression_net=si_base_net, gaussian_base_seed=si_gaussian_base_seed,
+                timestamp=timestamp,
             )
         else:
             diffusion_residuals = generate_ensemble(
@@ -830,6 +836,8 @@ def main(cfg: DictConfig) -> None:
             config=OmegaConf.to_container(cfg, resolve=True),
             results_dir=cfg.wandb.get("results_dir", "./wandb"),
         )
+        if cfg.wandb.get("tags"):
+            wandb.run.tags = tuple(OmegaConf.to_container(cfg.wandb.tags, resolve=True))
 
     # ------------------------------------------------------------------
     # Dataset and eval timesteps
@@ -999,6 +1007,7 @@ def main(cfg: DictConfig) -> None:
             dataset,
             cfg.model.si.output_channel_names,
             cfg.model.si.base_input_channel_names,
+            cfg.model.si.base_type,
         )
         si_ckpt = cfg.generation.io.get("si_ckpt_filename")
         if not si_ckpt:
@@ -1010,11 +1019,24 @@ def main(cfg: DictConfig) -> None:
         net_res.validate_dataset(spec)
         if net_res.base_type != cfg.model.si.base_type:
             raise ValueError("SI checkpoint and evaluation config use different base_type values")
+        if net_res.base_type == "gaussian_lowres":
+            if net_res.gaussian_lowres_shape != tuple(cfg.model.si.get("gaussian_lowres_shape", [36, 36])):
+                raise ValueError("SI checkpoint and evaluation config differ in Gaussian low-resolution shape")
+            if cfg.generation.get("gaussian_base_seed") is None:
+                raise ValueError("Gaussian SI evaluation requires generation.gaussian_base_seed")
+        si_base_net = None
+        if net_res.base_type == "regression_mean":
+            base_ckpt = cfg.generation.io.get("si_base_ckpt_filename")
+            if not base_ckpt:
+                raise ValueError("SI regression_mean requires generation.io.si_base_ckpt_filename")
+            si_base_net = load_model(to_absolute_path(base_ckpt), device, cfg.generation.perf)
+            net_res.validate_radar_regression(si_base_net, dataset.image_shape())
         for schedule_name in ("alpha_schedule", "beta_schedule", "sigma_schedule"):
             configured = OmegaConf.to_container(cfg.model.si[schedule_name], resolve=True)
             if getattr(net_res, schedule_name) != configured:
                 raise ValueError(f"SI checkpoint and evaluation config differ in {schedule_name}")
     else:
+        si_base_net = None
         net_reg, net_res = load_models(
             cfg, device,
             load_net_reg=has_regression,
@@ -1250,7 +1272,13 @@ def main(cfg: DictConfig) -> None:
             )
             if si_mode:
                 diffusion_residuals = sample_si_ensemble(
-                    net_res, image_lr, timestep_seed_batches, int(cfg.sampler.num_steps)
+                    net_res, image_lr, timestep_seed_batches, int(cfg.sampler.num_steps),
+                    regression_net=si_base_net,
+                    gaussian_base_seed=(
+                        cfg.generation.get("gaussian_base_seed")
+                        if cfg.model.si.base_type == "gaussian_lowres" else None
+                    ),
+                    timestamp=times[time_idx],
                 )
             else:
                 diffusion_residuals = generate_ensemble(
@@ -1548,6 +1576,11 @@ def main(cfg: DictConfig) -> None:
                     num_ensembles=num_ensembles,
                     seed_base=seed_base,
                     si_num_steps=int(cfg.sampler.num_steps) if si_mode else None,
+                    si_base_net=si_base_net,
+                    si_gaussian_base_seed=(
+                        cfg.generation.get("gaussian_base_seed")
+                        if si_mode and cfg.model.si.base_type == "gaussian_lowres" else None
+                    ),
                 )
 
                 time_label = str(times[time_idx]) if time_idx < len(times) else str(time_idx)

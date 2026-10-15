@@ -1,0 +1,37 @@
+# @package _global_
+hydra:
+  job:
+    name: taiwan_si_radar_regression_mean_ds1_eval
+  searchpath: [pkg://conf/base]
+defaults:
+  - /eval/taiwan/ablation/base
+  - /model: stochastic_interpolant
+  - _self_
+run_tag: taiwan_si_radar_regression_mean_ds1
+wandb:
+  tags: [taiwan, stochastic_interpolant, radar, regression_mean, ds1, eval]
+target: radar
+stage: stochastic_interpolant
+dataset:
+  out_channels: [0]
+  ds_factor: 1
+model:
+  si:
+    base_type: regression_mean
+    output_channel_names: [maximum_radar_reflectivity]
+    base_input_channel_names: [null]
+generation:
+  inference_mode: stochastic_interpolant
+  hr_mean_conditioning: false
+  num_ensembles: 10
+  seed_batch_size: 2
+  io:
+    reg_ckpt_filename: null
+    res_ckpt_filename: null
+    si_base_ckpt_filename: /checkpoints/taiwan_ablation_ds1/radar/regression/checkpoints_regression/UNet.0.2000128.mdlus
+    si_ckpt_filename: /checkpoints/stochastic_interpolant/radar_input_study/radar_regression_mean_ds1/checkpoints_stochastic_interpolant/StochasticInterpolant.0.2000128.mdlus
+sampler:
+  type: euler_maruyama
+  num_steps: 40
+eval:
+  log_regression: false

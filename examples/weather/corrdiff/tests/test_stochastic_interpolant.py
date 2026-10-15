@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from physicsnemo import Module
 from helpers.stochastic_interpolant import (
@@ -75,6 +76,52 @@ class TinyDrift(torch.nn.Module):
         return self.weight * xt
 
 
+class FakeRadarDataset(FakeDataset):
+    in_channels = [0, 17, 18, 19]
+    out_channels = [0, 1, 2, 3]
+
+    def output_channels(self):
+        return [SimpleNamespace(name="maximum_radar_reflectivity", level="")] + super().output_channels()
+
+
+class FakeRadarOnlyDataset(FakeRadarDataset):
+    out_channels = [0]
+
+    def output_channels(self):
+        return super().output_channels()[:1]
+
+
+class FrozenRadarRegression(torch.nn.Module):
+    img_out_channels = 1
+    img_in_channels = 8
+    img_shape_y = 8
+    img_shape_x = 8
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(2.0), requires_grad=False)
+        self.calls = 0
+
+    def forward(self, x, img_lr):
+        self.calls += 1
+        assert x.shape[1] == 1 and torch.count_nonzero(x) == 0
+        assert img_lr.shape[1] == 4  # All ERA5 channels, including matched ones.
+        return self.weight * img_lr[:, :1]
+
+
+def _small_radar_model(spec, base_type, gaussian_lowres_shape=(36, 36)):
+    return StochasticInterpolant(
+        img_resolution=[8, 8], base_type=base_type,
+        gaussian_lowres_shape=gaussian_lowres_shape,
+        alpha_schedule={"type": "linear", "start": 1.0, "end": 0.0},
+        beta_schedule={"type": "polynomial", "power": 2},
+        sigma_schedule={"type": "linear", "start": 1.0, "end": 0.0},
+        model_channels=32, channel_mult=[1, 1], num_blocks=1,
+        attn_resolutions=[], N_grid_channels=4, gridtype="sinusoidal",
+        embedding_type="fourier", **spec,
+    )
+
+
 def test_schedules_match_cdsi_endpoints_and_derivatives():
     t = torch.tensor([0.0, 0.5, 1.0])
     alpha, alpha_dot = _schedule({"type": "linear", "start": 1, "end": 0}, t)
@@ -99,6 +146,126 @@ def test_channel_spec_uses_selected_archive_statistics_and_order():
     assert spec["output_centers"] == [282, 0, 0]
     with pytest.raises(ValueError, match="dataset order"):
         build_channel_spec(FakeDataset(), ["eastward_wind_10m"], ["eastward_wind_10m"])
+
+
+@pytest.mark.parametrize("base_type", ["regression_mean", "gaussian_lowres"])
+def test_radar_channel_spec_and_four_channel_base(base_type):
+    names = ["maximum_radar_reflectivity", "temperature_2m",
+             "eastward_wind_10m", "northward_wind_10m"]
+    spec = build_channel_spec(FakeRadarDataset(), names, [None, *names[1:]], base_type)
+    assert spec["base_input_indices"] == [-1, 1, 2, 3]
+    assert spec["input_centers"] == [0, 280, 1, -2]
+    model = _small_radar_model(spec, base_type, gaussian_lowres_shape=(3, 3)).eval()
+    img_lr = torch.tensor([7.0, 1.0, -0.5, 2.0]).reshape(1, 4, 1, 1).expand(1, 4, 8, 8)
+    regression = FrozenRadarRegression().eval()
+    x0, y_rest = model.conditioning(
+        img_lr, regression_net=regression if base_type == "regression_mean" else None,
+        gaussian_generator=torch.Generator().manual_seed(4),
+    )
+    assert x0.shape == (1, 4, 8, 8) and y_rest.shape == (1, 1, 8, 8)
+    torch.testing.assert_close(x0[0, 1:, 0, 0], torch.tensor([0.375, -0.05, 0.5]))
+    torch.testing.assert_close(y_rest, img_lr[:, :1])
+    if base_type == "regression_mean":
+        torch.testing.assert_close(x0[:, :1], 2 * img_lr[:, :1])
+        assert regression.calls == 1
+    else:
+        assert torch.isfinite(x0[:, :1]).all()
+    with torch.no_grad():
+        assert model(x0, x0, y_rest, torch.tensor([0.5])).shape == x0.shape
+
+
+def test_radar_spec_rejects_mismatched_or_duplicate_bases():
+    with pytest.raises(ValueError, match="radar first"):
+        build_channel_spec(FakeRadarOnlyDataset(), ["maximum_radar_reflectivity"],
+                           ["temperature_2m"], "regression_mean")
+    with pytest.raises(ValueError, match="matching ERA5"):
+        build_channel_spec(FakeRadarDataset(),
+                           ["maximum_radar_reflectivity", "temperature_2m"],
+                           [None, "eastward_wind_10m"], "gaussian_lowres")
+
+
+def test_regression_base_is_frozen_and_never_receives_si_gradient():
+    spec = build_channel_spec(FakeRadarOnlyDataset(), ["maximum_radar_reflectivity"],
+                              [None], "regression_mean")
+    model = _small_radar_model(spec, "regression_mean")
+    regression = FrozenRadarRegression().eval()
+    img_lr = torch.randn(2, 4, 8, 8)
+    target = torch.randn(2, 1, 8, 8)
+    loss = StochasticInterpolantLoss(regression_net=regression)(model, target, img_lr)
+    assert loss.shape == target.shape
+    loss.mean().backward()
+    assert regression.calls == 1
+    assert regression.weight.grad is None
+    assert any(param.grad is not None for param in model.parameters())
+    with pytest.raises(ValueError, match="frozen"):
+        model.conditioning(img_lr, regression_net=FrozenRadarRegression().train())
+
+
+class GaussianSamplingProbe(torch.nn.Module):
+    base_type = "gaussian_lowres"
+
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.seen_bases = []
+
+    def conditioning(self, img_lr, gaussian_generator=None):
+        coarse = torch.randn((1, 1, 36, 36), generator=gaussian_generator)
+        radar = F.interpolate(coarse, size=img_lr.shape[-2:], mode="bilinear", align_corners=False)
+        return radar.expand(1, self.channels, *img_lr.shape[-2:]), img_lr
+
+    def coefficients(self, t):
+        zeros = torch.zeros_like(t)
+        return ((zeros, zeros), (zeros, zeros), (zeros, zeros))
+
+    def forward(self, state, x0, y_rest, t):
+        self.seen_bases.append(x0.clone())
+        return torch.zeros_like(state)
+
+
+def test_gaussian_eval_base_reproducible_across_ensemble_partition_and_channel_count():
+    img_lr = torch.zeros(1, 1, 448, 448)
+    radar = GaussianSamplingProbe(1)
+    all4 = GaussianSamplingProbe(4)
+    kwargs = {"gaussian_base_seed": 17, "timestamp": "2020-01-02T03:00:00"}
+    split = sample_ensemble(radar, img_lr, [[11], [12]], 1, **kwargs)
+    together = sample_ensemble(radar, img_lr, [[11, 12]], 1, **kwargs)
+    four = sample_ensemble(all4, img_lr, [[1]], 1, **kwargs)
+    torch.testing.assert_close(split, together)
+    torch.testing.assert_close(split[0], split[1])
+    torch.testing.assert_close(split[0], four[0, :1])
+    torch.testing.assert_close(radar.seen_bases[0][0], radar.seen_bases[1][0])
+    changed = sample_ensemble(radar, img_lr, [[11]], 1,
+                              gaussian_base_seed=17, timestamp="2020-01-02T04:00:00")
+    assert not torch.allclose(split[0], changed[0])
+    with pytest.raises(ValueError, match="timestamp"):
+        sample_ensemble(radar, img_lr, [[11]], 1, gaussian_base_seed=17)
+
+
+def test_gaussian_base_is_exact_bilinear_resize_without_variance_correction():
+    spec = build_channel_spec(FakeRadarOnlyDataset(), ["maximum_radar_reflectivity"],
+                              [None], "gaussian_lowres")
+    model = _small_radar_model(spec, "gaussian_lowres")
+    img_lr = torch.zeros(1, 4, 448, 448)
+    actual, y_rest = model.conditioning(
+        img_lr, gaussian_generator=torch.Generator().manual_seed(123)
+    )
+    coarse = torch.randn(1, 1, 36, 36, generator=torch.Generator().manual_seed(123))
+    expected = F.interpolate(coarse, size=(448, 448), mode="bilinear", align_corners=False)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(y_rest, img_lr)
+
+
+def test_radar_checkpoint_preserves_base_selection(tmp_path):
+    spec = build_channel_spec(FakeRadarOnlyDataset(), ["maximum_radar_reflectivity"],
+                              [None], "gaussian_lowres")
+    model = _small_radar_model(spec, "gaussian_lowres", gaussian_lowres_shape=(3, 3))
+    path = str(tmp_path / "si_radar.mdlus")
+    model.save(path)
+    loaded = Module.from_checkpoint(path, override_args={"use_apex_gn": False})
+    loaded.validate_dataset(spec)
+    assert loaded.base_type == "gaussian_lowres"
+    assert loaded.gaussian_lowres_shape == (3, 3)
 
 
 def test_matching_conditioning_converts_units_and_removes_duplicate_channels():

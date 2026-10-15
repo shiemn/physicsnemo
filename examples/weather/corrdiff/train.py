@@ -395,6 +395,7 @@ def main(cfg: DictConfig) -> None:
             dataset,
             cfg.model.si.output_channel_names,
             cfg.model.si.base_input_channel_names,
+            cfg.model.si.base_type,
         )
         si_kwargs = model_args.copy()
         for key in ("img_resolution", "img_out_channels", "use_fp16"):
@@ -406,6 +407,7 @@ def main(cfg: DictConfig) -> None:
             alpha_schedule=OmegaConf.to_container(cfg.model.si.alpha_schedule, resolve=True),
             beta_schedule=OmegaConf.to_container(cfg.model.si.beta_schedule, resolve=True),
             sigma_schedule=OmegaConf.to_container(cfg.model.si.sigma_schedule, resolve=True),
+            gaussian_lowres_shape=list(cfg.model.si.get("gaussian_lowres_shape", [36, 36])),
             **spec,
             **si_kwargs,
         )
@@ -713,9 +715,10 @@ def main(cfg: DictConfig) -> None:
 
     # Instantiate the loss function
     if cfg.model.name == "stochastic_interpolant":
-        if regression_net is not None:
-            raise ValueError("First SI path does not use a regression checkpoint")
-        loss_fn = StochasticInterpolantLoss()
+        needs_regression = cfg.model.si.base_type == "regression_mean"
+        if needs_regression != (regression_net is not None):
+            raise ValueError("SI regression_mean requires a frozen radar regression checkpoint; other bases must not load one")
+        loss_fn = StochasticInterpolantLoss(regression_net=regression_net)
     elif cfg.model.name in (
         "diffusion",
         "patched_diffusion",

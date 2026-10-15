@@ -1,0 +1,38 @@
+# @package _global_
+hydra:
+  job:
+    name: taiwan_si_all4_radar_gaussian_lowres_ds1_eval
+  searchpath: [pkg://conf/base]
+defaults:
+  - /eval/taiwan/ablation/base
+  - /model: stochastic_interpolant
+  - _self_
+run_tag: taiwan_si_all4_radar_gaussian_lowres_ds1
+wandb:
+  tags: [taiwan, stochastic_interpolant, all4, gaussian_lowres, ds1, eval]
+target: all4
+stage: stochastic_interpolant
+dataset:
+  out_channels: [0, 1, 2, 3]
+  ds_factor: 1
+model:
+  si:
+    base_type: gaussian_lowres
+    gaussian_lowres_shape: [36, 36]
+    output_channel_names: [maximum_radar_reflectivity, temperature_2m, eastward_wind_10m, northward_wind_10m]
+    base_input_channel_names: [null, temperature_2m, eastward_wind_10m, northward_wind_10m]
+generation:
+  inference_mode: stochastic_interpolant
+  hr_mean_conditioning: false
+  num_ensembles: 10
+  seed_batch_size: 2
+  gaussian_base_seed: 0
+  io:
+    reg_ckpt_filename: null
+    res_ckpt_filename: null
+    si_ckpt_filename: /checkpoints/stochastic_interpolant/radar_input_study/all4_radar_gaussian_lowres_ds1/checkpoints_stochastic_interpolant/StochasticInterpolant.0.2000128.mdlus
+sampler:
+  type: euler_maruyama
+  num_steps: 40
+eval:
+  log_regression: false
