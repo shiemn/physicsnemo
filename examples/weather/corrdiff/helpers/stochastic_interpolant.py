@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import weakref
 from collections.abc import Mapping, Sequence
 
 import numpy as np
@@ -173,6 +174,7 @@ class StochasticInterpolant(Module):
         self.output_channel_names = tuple(output_channel_names)
         self.base_input_channel_names = tuple(base_input_channel_names)
         self.use_fp16 = bool(use_fp16)
+        self._validated_regression = None
         self.gaussian_lowres_shape = tuple(int(value) for value in gaussian_lowres_shape)
         if len(self.gaussian_lowres_shape) != 2 or min(self.gaussian_lowres_shape) < 1:
             raise ValueError("Gaussian low-resolution shape must contain two positive dimensions")
@@ -245,13 +247,20 @@ class StochasticInterpolant(Module):
         """Check the fixed DS1 radar-only regression before using its target-normalized output."""
         if regression_net is None:
             raise ValueError("regression_mean requires the frozen radar regression network")
-        if regression_net.training or any(param.requires_grad for param in regression_net.parameters()):
+        if regression_net.training:
+            raise ValueError("Radar regression must be eval-only with frozen parameters")
+        if self._validated_regression is not None:
+            model_ref, checked_shape = self._validated_regression
+            if model_ref() is regression_net and checked_shape == tuple(img_shape):
+                return
+        if any(param.requires_grad for param in regression_net.parameters()):
             raise ValueError("Radar regression must be eval-only with frozen parameters")
         if (getattr(regression_net, "img_out_channels", None) != 1
                 or getattr(regression_net, "img_in_channels", None) != self.img_in_channels + 4):
             raise ValueError("Radar regression requires one output and the complete ERA5 stack plus four grid channels")
         if (getattr(regression_net, "img_shape_y", None), getattr(regression_net, "img_shape_x", None)) != tuple(img_shape):
             raise ValueError("Radar regression checkpoint and SI target grid have different shapes")
+        self._validated_regression = (weakref.ref(regression_net), tuple(img_shape))
 
     def conditioning(self, img_lr: torch.Tensor, regression_net=None,
                      gaussian_generator=None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -276,8 +285,10 @@ class StochasticInterpolant(Module):
                             device=img_lr.device, generator=gaussian_generator),
                 size=img_lr.shape[2:], mode="bilinear", align_corners=False,
             )
-        if radar.shape != (img_lr.shape[0], 1, *img_lr.shape[2:]) or not torch.isfinite(radar).all():
-            raise ValueError("Radar base must be finite and have one target-grid channel")
+        if radar.shape != (img_lr.shape[0], 1, *img_lr.shape[2:]):
+            raise ValueError("Radar base must have one target-grid channel")
+        if not torch.is_grad_enabled() and not torch.isfinite(radar).all():
+            raise ValueError("Radar base must be finite")
         matched = self.base_input_indices[1:]
         if matched:
             other = img_lr[:, matched].float()

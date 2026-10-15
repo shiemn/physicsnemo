@@ -101,6 +101,11 @@ class FrozenRadarRegression(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(2.0), requires_grad=False)
         self.calls = 0
+        self.parameter_checks = 0
+
+    def parameters(self, recurse=True):
+        self.parameter_checks += 1
+        return super().parameters(recurse=recurse)
 
     def forward(self, x, img_lr):
         self.calls += 1
@@ -197,8 +202,20 @@ def test_regression_base_is_frozen_and_never_receives_si_gradient():
     assert regression.calls == 1
     assert regression.weight.grad is None
     assert any(param.grad is not None for param in model.parameters())
+    model.conditioning(img_lr, regression_net=regression)
+    assert regression.parameter_checks == 1  # Static compatibility is cached.
     with pytest.raises(ValueError, match="frozen"):
-        model.conditioning(img_lr, regression_net=FrozenRadarRegression().train())
+        model.conditioning(img_lr, regression_net=regression.train())
+
+
+def test_radar_base_finite_check_remains_active_for_evaluation():
+    spec = build_channel_spec(FakeRadarOnlyDataset(), ["maximum_radar_reflectivity"],
+                              [None], "regression_mean")
+    model = _small_radar_model(spec, "regression_mean").eval()
+    regression = FrozenRadarRegression().eval()
+    regression.forward = lambda x, img_lr: torch.full_like(x, float("nan"))
+    with torch.no_grad(), pytest.raises(ValueError, match="finite"):
+        model.conditioning(torch.zeros(1, 4, 8, 8), regression_net=regression)
 
 
 class GaussianSamplingProbe(torch.nn.Module):

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import random
 import signal
@@ -1005,6 +1006,8 @@ def main(cfg: DictConfig) -> None:
                                 loss_sum, op=torch.distributed.ReduceOp.SUM
                             )
                         average_loss = (loss_sum / dist.world_size).cpu().item()
+                        if cfg.model.name == "stochastic_interpolant" and not math.isfinite(average_loss):
+                            raise FloatingPointError("SI training loss is non-finite; stopping before the optimizer step")
                         averaged_loss_components = _reduce_component_values(
                             loss_component_accum
                         )
